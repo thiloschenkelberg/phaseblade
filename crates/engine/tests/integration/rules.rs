@@ -1,0 +1,463 @@
+// Integration test entry point for rules correctness tests.
+// Common imports re-exported for all rule test modules via `use super::*`.
+#![allow(unused_imports)]
+
+pub use engine::game::apply;
+pub use engine::game::combat::AttackTarget;
+pub use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+pub use engine::types::actions::GameAction;
+pub use engine::types::events::GameEvent;
+pub use engine::types::game_state::{
+    ActionResult, CastPaymentMode, CostResume, DamageSlot, PayCostKind, WaitingFor,
+};
+pub use engine::types::identifiers::ObjectId;
+pub use engine::types::keywords::Keyword;
+pub use engine::types::phase::Phase;
+pub use engine::types::player::PlayerId;
+pub use engine::types::zones::{ExileCostSourceZone, Zone};
+
+use engine::types::ability::TargetRef;
+
+/// An instant `player` casts at `target` the first time they hold priority
+/// while the spell or ability [`drive_with_response`] drives is on the stack.
+pub struct PriorityResponse {
+    pub player: PlayerId,
+    pub instant: ObjectId,
+    pub target: ObjectId,
+}
+
+/// The action casting `spell` with automatic payment; its targets are answered
+/// at the prompts [`drive_with_response`] drives.
+pub fn cast_spell_action(runner: &GameRunner, spell: ObjectId) -> GameAction {
+    GameAction::CastSpell {
+        object_id: spell,
+        card_id: runner.state().objects[&spell].card_id,
+        targets: vec![],
+        payment_mode: CastPaymentMode::Auto,
+    }
+}
+
+/// Submit `action` (a cast or an activation) and drive until the stack is
+/// empty, answering target prompts with `targets` in order and passing every
+/// other priority. `response` is cast above the driven object, so it resolves
+/// first; its own target prompt is answered with its `target`. Returns every
+/// event emitted.
+pub fn drive_with_response(
+    runner: &mut GameRunner,
+    action: GameAction,
+    targets: &[ObjectId],
+    response: Option<PriorityResponse>,
+) -> Vec<GameEvent> {
+    drive_modal_with_response(runner, action, &[], targets, response)
+}
+
+/// [`drive_with_response`] with no response, for a spell or ability whose
+/// targets include players: `targets` are answered as given.
+pub fn drive_with_target_refs(
+    runner: &mut GameRunner,
+    action: GameAction,
+    targets: &[TargetRef],
+) -> Vec<GameEvent> {
+    drive_targets_with_response(runner, action, &[], targets, None)
+}
+
+/// [`drive_with_response`] for a modal spell (CR 700.2): `modes` answers the
+/// `WaitingFor::ModeChoice` window that precedes target selection, as printed
+/// indices. The two share one loop so a driven modal cast reaches the same
+/// windows, in the same order, as every other driven cast.
+pub fn drive_modal_with_response(
+    runner: &mut GameRunner,
+    action: GameAction,
+    modes: &[usize],
+    targets: &[ObjectId],
+    response: Option<PriorityResponse>,
+) -> Vec<GameEvent> {
+    let targets: Vec<TargetRef> = targets.iter().copied().map(TargetRef::Object).collect();
+    drive_targets_with_response(runner, action, modes, &targets, response)
+}
+
+/// The one loop behind the drivers above: targets are `TargetRef`s, so a
+/// player target is answered the same way as an object.
+fn drive_targets_with_response(
+    runner: &mut GameRunner,
+    action: GameAction,
+    modes: &[usize],
+    targets: &[TargetRef],
+    mut response: Option<PriorityResponse>,
+) -> Vec<GameEvent> {
+    let mut events = runner.act(action).expect("submit the driven action").events;
+
+    // The targets still to choose for the spell or ability being put on the stack.
+    let mut pending = targets.to_vec();
+    for _ in 0..60 {
+        let action = match &runner.state().waiting_for {
+            WaitingFor::ModeChoice { .. } => GameAction::SelectModes {
+                indices: modes.to_vec(),
+            },
+            WaitingFor::ManaPayment { .. } => GameAction::PassPriority,
+            WaitingFor::TargetSelection { .. } => GameAction::ChooseTarget {
+                target: Some(pending.remove(0)),
+            },
+            WaitingFor::Priority { player } => {
+                if runner.state().stack.is_empty() {
+                    return events;
+                }
+                match response.take_if(|queued| queued.player == *player) {
+                    Some(PriorityResponse {
+                        instant, target, ..
+                    }) => {
+                        pending = vec![TargetRef::Object(target)];
+                        cast_spell_action(runner, instant)
+                    }
+                    None => GameAction::PassPriority,
+                }
+            }
+            other => panic!("unexpected window: {other:?}"),
+        };
+        events.extend(runner.act(action).expect("drive window").events);
+    }
+    panic!("the stack did not empty within the window budget");
+}
+
+/// Shared damage fixture: a non-combat source dealing `amount` to `target`,
+/// controlled by P1 (the opponent of the shield controller in the CR 614.9
+/// redirection fixtures). Shared by `heroic_sacrifice_redirect`,
+/// `pariah_attached_redirect`, and `palisade_giant_redirect`, which previously
+/// each carried a byte-identical private copy.
+pub fn damage_ability(
+    source_id: ObjectId,
+    target: engine::types::ability::TargetRef,
+    amount: i32,
+) -> engine::types::ability::ResolvedAbility {
+    engine::types::ability::ResolvedAbility::new(
+        engine::types::ability::Effect::DealDamage {
+            amount: engine::types::ability::QuantityExpr::Fixed { value: amount },
+            target: engine::types::ability::TargetFilter::Any,
+            damage_source: None,
+            excess: None,
+        },
+        vec![target],
+        source_id,
+        P1,
+    )
+}
+
+/// Shared combat helper: drives the engine from DeclareAttackers through damage resolution.
+///
+/// Assumes the runner is at a phase where passing priority twice will reach DeclareAttackers
+/// (i.e., the scenario started at `Phase::PreCombatMain`). All attackers target P1.
+///
+/// Drives through BOTH combat damage steps when the window after the first step
+/// is empty (CR 510.4 + CR 510.3: each step ends with a priority window, and the
+/// harness passes an empty one). A window with something on the stack (a
+/// first-strike damage trigger) is left open for the test. A test that must stop
+/// at an empty window uses [`run_combat_first_damage_step`].
+///
+/// `run_combat*` and [`run_combat_first_damage_step`] are 2-seat only: they open
+/// with `pass_both_players()` (two passes) and use it again after the attackers
+/// and blockers steps, which in a 3+ seat game leaves a later seat holding
+/// priority. A multi-seat test drives combat by hand (see
+/// `love_on_the_battlefield_combat_counters.rs`).
+pub fn run_combat(
+    runner: &mut GameRunner,
+    attacker_ids: Vec<ObjectId>,
+    blocker_assignments: Vec<(ObjectId, ObjectId)>,
+) {
+    run_combat_with_blocker_divisions(runner, attacker_ids, blocker_assignments, &[]);
+}
+
+/// [`run_combat`] with the `GameEvent`s emitted by the combat actions.
+pub fn run_combat_and_collect_events(
+    runner: &mut GameRunner,
+    attacker_ids: Vec<ObjectId>,
+    blocker_assignments: Vec<(ObjectId, ObjectId)>,
+) -> Vec<GameEvent> {
+    run_combat_with_blocker_divisions_and_events(runner, attacker_ids, blocker_assignments, &[])
+}
+
+/// Banding-aware variant of [`run_combat`] (CR 702.22k): drives the same
+/// DeclareAttackers → damage path but also resolves the interactive
+/// `WaitingFor::AssignBlockerDamage` prompt the engine raises when a blocker is
+/// blocking a banding attacker (the active player divides that blocker's damage
+/// among the attackers it blocks).
+///
+/// `blocker_divisions` maps a `blocker_id` to the `(attacker_id, damage)` split
+/// the test wants submitted for that blocker. Any blocker not listed (or when an
+/// `AssignBlockerDamage` prompt names attackers none of the divisions cover) is
+/// resolved with an even auto-split that sums to the blocker's power, so callers
+/// that don't care about a specific division still resolve cleanly.
+pub fn run_combat_with_blocker_divisions(
+    runner: &mut GameRunner,
+    attacker_ids: Vec<ObjectId>,
+    blocker_assignments: Vec<(ObjectId, ObjectId)>,
+    blocker_divisions: &[(ObjectId, Vec<(ObjectId, u32)>)],
+) {
+    drop(run_combat_with_blocker_divisions_and_events(
+        runner,
+        attacker_ids,
+        blocker_assignments,
+        blocker_divisions,
+    ));
+}
+
+/// Event-returning implementation shared by the legacy and event-inspecting
+/// combat helpers so every caller follows the same combat progression.
+fn run_combat_with_blocker_divisions_and_events(
+    runner: &mut GameRunner,
+    attacker_ids: Vec<ObjectId>,
+    blocker_assignments: Vec<(ObjectId, ObjectId)>,
+    blocker_divisions: &[(ObjectId, Vec<(ObjectId, u32)>)],
+) -> Vec<GameEvent> {
+    let mut events =
+        drive_to_first_damage_window(runner, attacker_ids, blocker_assignments, blocker_divisions);
+
+    // CR 510.4 + CR 510.3: the first combat damage step ended with an empty
+    // priority window; pass it (a non-empty stack leaves the window open), then
+    // answer the regular step's prompts.
+    events.extend(runner.pass_combat_damage_window());
+    answer_combat_damage_prompts(runner, blocker_divisions, &mut events);
+    events
+}
+
+/// [`run_combat_with_blocker_divisions`] up to the first priority window after
+/// the first combat damage step (or the only one, without first strike): the
+/// harness stops there, so a test can act inside the CR 510.3 window between the
+/// two steps of a first-strike combat. 2-seat only (see [`run_combat`]).
+///
+/// The prompt loop answers an `AssignCombatDamage` prompt itself with the
+/// lethal-minimum split, so this returns only at a `Priority` window or a later
+/// non-prompt state; a test that must submit that prompt by hand cannot use it.
+pub fn run_combat_first_damage_step(
+    runner: &mut GameRunner,
+    attacker_ids: Vec<ObjectId>,
+    blocker_assignments: Vec<(ObjectId, ObjectId)>,
+    blocker_divisions: &[(ObjectId, Vec<(ObjectId, u32)>)],
+) {
+    drop(drive_to_first_damage_window(
+        runner,
+        attacker_ids,
+        blocker_assignments,
+        blocker_divisions,
+    ));
+}
+
+/// Shared progression of the combat helpers: declare attackers and blockers, then
+/// answer damage prompts until the first priority window after the first (or only)
+/// combat damage step. Returns the `GameEvent`s emitted on the way.
+fn drive_to_first_damage_window(
+    runner: &mut GameRunner,
+    attacker_ids: Vec<ObjectId>,
+    blocker_assignments: Vec<(ObjectId, ObjectId)>,
+    blocker_divisions: &[(ObjectId, Vec<(ObjectId, u32)>)],
+) -> Vec<GameEvent> {
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        events.extend(
+            runner
+                .act(GameAction::PassPriority)
+                .expect("PassPriority should succeed")
+                .events,
+        );
+    }
+
+    let attacks: Vec<_> = attacker_ids
+        .iter()
+        .map(|&id| (id, AttackTarget::Player(P1)))
+        .collect();
+
+    events.extend(
+        runner
+            .act(GameAction::DeclareAttackers {
+                attacks,
+                bands: vec![],
+            })
+            .expect("DeclareAttackers should succeed")
+            .events,
+    );
+
+    // CR 603.3b: same-controller attack triggers (e.g. Stonehoof Chieftain with
+    // many attackers) may surface an ordering prompt before priority.
+    while matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+        let n = if let WaitingFor::OrderTriggers { triggers, .. } = &runner.state().waiting_for {
+            triggers.len()
+        } else {
+            0
+        };
+        events.extend(
+            runner
+                .act(GameAction::OrderTriggers {
+                    order: (0..n).collect(),
+                })
+                .expect("OrderTriggers should succeed")
+                .events,
+        );
+    }
+
+    // CR 508.2 + CR 603.3b: attack triggers (Stonehoof Chieftain #5335) must
+    // resolve before declare blockers — a single priority pass is not enough
+    // when many identical per-attacker triggers stacked.
+    if !runner.state().stack.is_empty() {
+        runner.advance_until_stack_empty();
+    }
+
+    // CR 508.2: Active player gets priority after attackers — pass through it.
+    if matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+        for _ in 0..2 {
+            events.extend(
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("PassPriority should succeed")
+                    .events,
+            );
+        }
+    }
+
+    // CR 509.1: Interactive blocker declaration only when the defender has legal
+    // blockers. When none exist, the engine auto-submits empty blockers internally
+    // (CR 509.1 + CR 117.1c — the step still runs and AP still gets priority).
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::DeclareBlockers { .. }
+    ) {
+        events.extend(
+            runner
+                .act(GameAction::DeclareBlockers {
+                    assignments: blocker_assignments,
+                })
+                .expect("DeclareBlockers should succeed")
+                .events,
+        );
+    }
+
+    // CR 509.2 + CR 117.1c: Active player receives priority during the declare
+    // blockers step — always, even when no blockers were declared. Pass through.
+    if matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+        for _ in 0..2 {
+            events.extend(
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("PassPriority should succeed")
+                    .events,
+            );
+        }
+    }
+
+    answer_combat_damage_prompts(runner, blocker_divisions, &mut events);
+    events
+}
+
+/// CR 510.1c / CR 510.1d + CR 702.22j/k: Handle interactive damage assignment.
+/// The engine raises `AssignCombatDamage` for an attacker dividing its damage
+/// among multiple blockers, and `AssignBlockerDamage` for a blocker dividing
+/// its damage among multiple banded attackers. Both can appear (and re-appear
+/// across the first-strike/regular sub-steps), so loop until neither remains.
+fn answer_combat_damage_prompts(
+    runner: &mut GameRunner,
+    blocker_divisions: &[(ObjectId, Vec<(ObjectId, u32)>)],
+    events: &mut Vec<GameEvent>,
+) {
+    loop {
+        match &runner.state().waiting_for {
+            WaitingFor::AssignCombatDamage {
+                blockers,
+                total_damage,
+                trample,
+                ..
+            } => {
+                let mut remaining = *total_damage;
+                let mut assignments: Vec<(ObjectId, u32)> = Vec::new();
+                for slot in blockers {
+                    let assign = remaining.min(slot.lethal_minimum);
+                    assignments.push((slot.blocker_id, assign));
+                    remaining = remaining.saturating_sub(assign);
+                }
+                // Non-trample: dump remainder to last blocker so total == power.
+                if trample.is_none() && remaining > 0 {
+                    if let Some(last) = assignments.last_mut() {
+                        last.1 += remaining;
+                        remaining = 0;
+                    }
+                }
+                let trample_damage = if trample.is_some() { remaining } else { 0 };
+                events.extend(
+                    runner
+                        .act(GameAction::AssignCombatDamage {
+                            mode: engine::types::game_state::CombatDamageAssignmentMode::Normal,
+                            assignments,
+                            trample_damage,
+                            controller_damage: 0,
+                        })
+                        .expect("AssignCombatDamage should succeed")
+                        .events,
+                );
+            }
+            WaitingFor::AssignBlockerDamage {
+                blocker_id,
+                total_damage,
+                attackers,
+                ..
+            } => {
+                // Use a caller-provided division for this blocker if present,
+                // else fall back to an even auto-split (first attacker gets the
+                // remainder) so the total equals the blocker's power (CR 510.1e).
+                let assignments: Vec<(ObjectId, u32)> = blocker_divisions
+                    .iter()
+                    .find(|(bid, _)| bid == blocker_id)
+                    .map(|(_, div)| div.clone())
+                    .unwrap_or_else(|| even_split(*total_damage, attackers));
+                events.extend(
+                    runner
+                        .act(GameAction::AssignBlockerDamage { assignments })
+                        .expect("AssignBlockerDamage should succeed")
+                        .events,
+                );
+            }
+            _ => break,
+        }
+    }
+}
+
+pub use crate::support::{
+    advance_until_stack_empty_and_collect_events, assert_damage_dealt, assert_no_damage_to,
+};
+
+/// Evenly divide `total` damage among `targets` (first target absorbs the
+/// remainder) so the assignment sums to `total` (CR 510.1e). Used as the
+/// harness's default when a test doesn't dictate a specific banded division.
+fn even_split(total: u32, targets: &[ObjectId]) -> Vec<(ObjectId, u32)> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let n = targets.len() as u32;
+    let base = total / n;
+    let remainder = total % n;
+    targets
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, base + if (i as u32) < remainder { 1 } else { 0 }))
+        .collect()
+}
+
+// Mechanic test modules (stubs -- populated in Plans 02 and 03)
+mod attractions;
+mod battle;
+#[path = "rules/casting.rs"]
+mod casting;
+#[path = "rules/combat.rs"]
+mod combat;
+#[path = "rules/etb.rs"]
+mod etb;
+#[path = "rules/keywords.rs"]
+mod keywords;
+#[path = "rules/layers.rs"]
+mod layers;
+#[path = "rules/replacement.rs"]
+mod replacement;
+#[path = "rules/sba.rs"]
+mod sba;
+#[path = "rules/stack.rs"]
+mod stack;
+#[path = "rules/targeting.rs"]
+mod targeting;
+#[path = "rules/tribute.rs"]
+mod tribute;

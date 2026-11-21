@@ -1,0 +1,578 @@
+import { useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+
+import type { GameFormat, MatchType } from "../../adapter/types";
+import { formatSuppliesDeck } from "../../data/formatRegistry";
+import { AI_DIFFICULTIES, type AIDifficulty } from "../../constants/ai";
+import type { AiDeckCandidate } from "../../services/aiDeckCatalog";
+import { useAiDeckCatalog, type UseAiDeckCatalogResult } from "../../services/aiDeckCatalog";
+import {
+  resolveBracketDrawBase,
+  resolveEffectiveAiRandomPool,
+  restrictAiPoolByBracket,
+} from "../../services/aiRandomPool";
+import {
+  summarizePoolSelection,
+  withCatalogSavedNames,
+} from "../../services/randomPoolSelection";
+import { usePoolFolderIndex } from "../../hooks/usePoolFolderIndex";
+import { isCommanderFamilyFormat } from "../../types/bracket";
+import {
+  AI_DECK_RANDOM,
+  usePreferencesStore,
+  type AiArchetypeFilter,
+  type AiDeckSelection,
+} from "../../stores/preferencesStore";
+import { isProfileUsable, profileForSeat, useLlmStore } from "../../stores/llmStore";
+import { useLlmProviderCatalog } from "../../hooks/useLlmProviderCatalog";
+import { MenuSelect } from "../ui/MenuSelect";
+import type { DeckArchetype } from "../../services/engineRuntime";
+import { AiDeckPicker } from "./AiDeckPicker";
+import { BracketFilter } from "./BracketFilter";
+import { RandomPoolTree } from "./RandomPoolTree";
+
+const AI_MENU_CLASS =
+  "min-h-[44px] rounded-lg border border-gray-700 bg-gray-800/60 px-2 py-1.5 text-sm sm:min-h-0";
+const AI_MENU_LAYOUT = "dropdown" as const;
+const AI_MENU_WRAPPER = "w-full min-w-0";
+
+interface Props {
+  selectedFormat?: GameFormat | null;
+  selectedMatchType?: MatchType;
+  /** Number of AI opponents to configure (i.e. playerCount - 1). Defaults to 1
+   *  so the component still renders sensibly when mounted outside the setup
+   *  page's player-count context. */
+  opponentCount?: number;
+  onCandidateCountChange?: (count: number | null) => void;
+  /**
+   * Hoisted catalog from the setup page, which shares one analysis between
+   * the AI seats and the human pool's bracket base. When absent the component
+   * runs its own analysis (other mounts, tests).
+   */
+  catalog?: UseAiDeckCatalogResult;
+}
+
+/** Sentinel for "this seat is driven by the built-in engine AI". */
+const ENGINE_BRAIN = "__engine__";
+
+const ARCHETYPE_OPTIONS: AiArchetypeFilter[] = [
+  "Any",
+  "Aggro",
+  "Midrange",
+  "Control",
+  "Combo",
+  "Ramp",
+];
+
+function archetypeAccent(a: DeckArchetype | null): string {
+  switch (a) {
+    case "Aggro":
+      return "text-red-300";
+    case "Control":
+      return "text-sky-300";
+    case "Midrange":
+      return "text-emerald-300";
+    case "Combo":
+      return "text-fuchsia-300";
+    case "Ramp":
+      return "text-amber-300";
+    default:
+      return "text-slate-400";
+  }
+}
+
+export function AiOpponentConfig({
+  selectedFormat,
+  selectedMatchType,
+  opponentCount = 1,
+  onCandidateCountChange,
+  catalog,
+}: Props) {
+  const { t } = useTranslation("menu");
+  const aiSeats = usePreferencesStore((s) => s.aiSeats);
+  const cedhMode = usePreferencesStore((s) => s.cedhMode);
+  const setCedhMode = usePreferencesStore((s) => s.setCedhMode);
+  const setAiSeatDifficulty = usePreferencesStore((s) => s.setAiSeatDifficulty);
+  const setAiSeatDeckId = usePreferencesStore((s) => s.setAiSeatDeckId);
+  const ensureAiSeatCount = usePreferencesStore((s) => s.ensureAiSeatCount);
+  const archetypeFilter = usePreferencesStore((s) => s.aiArchetypeFilter);
+  const setArchetypeFilter = usePreferencesStore((s) => s.setAiArchetypeFilter);
+  const coverageFloor = usePreferencesStore((s) => s.aiCoverageFloor);
+  const setCoverageFloor = usePreferencesStore((s) => s.setAiCoverageFloor);
+  const bracketFilter = usePreferencesStore((s) => s.aiBracketFilter);
+  const setBracketFilter = usePreferencesStore((s) => s.setAiBracketFilter);
+  const aiPoolSelection = usePreferencesStore((s) => s.aiPoolSelection);
+  // Reactive folder revision: the preview memos below resolve through this
+  // index so a deck moved between folders recomputes instead of serving
+  // stale membership.
+  const poolFolderIndex = usePoolFolderIndex();
+  const isCedhFormat = isCommanderFamilyFormat(selectedFormat);
+  const effectiveCedhMode = cedhMode && isCedhFormat;
+  // Fixed-deck formats (Momir's Madness) have the engine supply every AI seat's
+  // deck, so there is no AI deck catalog, no deck picker, and no "no legal
+  // decks" condition — only the per-seat difficulty matters. Drives off the
+  // engine-derived registry flag, never a format literal.
+  const suppliesDeck = selectedFormat ? formatSuppliesDeck(selectedFormat) : false;
+
+  // Keep the persisted seat list in sync with the setup page's player count.
+  useEffect(() => {
+    ensureAiSeatCount(opponentCount);
+  }, [opponentCount, ensureAiSeatCount]);
+
+  // cEDH mode is a persisted preference read directly at game start
+  // (GameProvider → effectiveAiDifficulty). When the format is known to be a
+  // non-Commander variant the toggle is hidden, so clear any stale enabled
+  // state to stop it silently forcing cEDH difficulty on non-Commander tables.
+  // Guard on a truthy format so the brief format-loading window doesn't clobber
+  // a legitimate flag.
+  useEffect(() => {
+    if (selectedFormat && !isCedhFormat && cedhMode) {
+      setCedhMode(false);
+    }
+  }, [selectedFormat, isCedhFormat, cedhMode, setCedhMode]);
+
+  const fallbackCatalog = useAiDeckCatalog({
+    selectedFormat,
+    selectedMatchType,
+    enabled: catalog === undefined,
+  });
+  const { candidates, allCandidates, loading, error } = catalog ?? fallbackCatalog;
+
+  useEffect(() => {
+    onCandidateCountChange?.(loading ? null : candidates.length);
+  }, [candidates.length, loading, onCandidateCountChange]);
+
+  // The archetype + coverage filters only affect the *Random* pool. They are
+  // global across all AI seats because they describe which decks are worth
+  // considering, not which deck ends up assigned — a concept that doesn't
+  // vary per seat.
+  // The bracket/cEDH restriction is shared with game start
+  // (`restrictAiPoolByBracket`) so both sides apply the same rule;
+  // archetype + coverage apply within that pool.
+  const bracketPool = useMemo(
+    () =>
+      restrictAiPoolByBracket(candidates, {
+        bracketFilter,
+        cedhMode,
+        selectedFormat: selectedFormat ?? null,
+      }),
+    [candidates, bracketFilter, cedhMode, selectedFormat],
+  );
+  // The "Random (N)" counts resolve the full production layering — bracket
+  // with catalog fallback, curation with bracket-pool fallback, soft
+  // preferences with draw-pool fallback — through the same authority game
+  // start uses, so the preview matches what seats can actually draw. The raw
+  // bracket pool above stays separate for the empty-bracket diagnostic below.
+  const filteredDecks = useMemo(
+    () =>
+      resolveEffectiveAiRandomPool(
+        withCatalogSavedNames(candidates),
+        {
+          bracketFilter,
+          cedhMode,
+          selectedFormat: selectedFormat ?? null,
+          poolSelection: aiPoolSelection,
+          archetypeFilter,
+          coverageFloor,
+        },
+        poolFolderIndex,
+      ),
+    [
+      candidates,
+      bracketFilter,
+      cedhMode,
+      selectedFormat,
+      aiPoolSelection,
+      archetypeFilter,
+      coverageFloor,
+      poolFolderIndex,
+    ],
+  );
+  // The tree lists the full legal catalog (the curation is format-global),
+  // but reports playable counts against the draw base — the same base
+  // `pickAiSeatDecks` draws from — so a selection the bracket filter empties
+  // warns instead of silently falling back.
+  const poolTreeItems = useMemo(() => withCatalogSavedNames(candidates), [candidates]);
+  // Group toggles clear overrides against the complete raw universe: the
+  // curation is format-global, so an override on a currently-unlisted deck
+  // must not survive a folder-wide unselect.
+  const poolToggleItems = useMemo(() => withCatalogSavedNames(allCandidates), [allCandidates]);
+  const poolBaseIds = useMemo(
+    () =>
+      new Set(
+        resolveBracketDrawBase(candidates, {
+          bracketFilter,
+          cedhMode,
+          selectedFormat: selectedFormat ?? null,
+        }).map((candidate) => candidate.id),
+      ),
+    [candidates, bracketFilter, cedhMode, selectedFormat],
+  );
+  // Decks are selected but none survive the bracket restriction, so Random
+  // seats silently fall back to the full bracket pool. Say so next to the
+  // seats (the tree warns too) — the "Random (N)" count alone hides the why.
+  const poolConflict = useMemo(() => {
+    const summary = summarizePoolSelection(poolTreeItems, aiPoolSelection, poolBaseIds, poolFolderIndex);
+    return summary.selected > 0 && summary.playable === 0 && summary.baseSize > 0 ? summary : null;
+  }, [poolTreeItems, aiPoolSelection, poolBaseIds, poolFolderIndex]);
+  // Soft gate: the catalog is non-empty but the bracket constraint matched
+  // nothing, so game start will fall back to the full legal catalog. Warn
+  // here (Start stays enabled) rather than failing the game.
+  const bracketPoolEmpty = !loading && candidates.length > 0 && bracketPool.length === 0;
+
+  // Render exactly `opponentCount` panels regardless of how many slots the
+  // store currently holds — the effect above will catch the store up on the
+  // next tick, but the UI must not flash the wrong count in the meantime.
+  const seatsToRender = useMemo(() => {
+    const fallback = aiSeats[0];
+    return Array.from({ length: opponentCount }, (_, i) =>
+      aiSeats[i] ?? fallback ?? { difficulty: "Medium" as AIDifficulty, deckId: AI_DECK_RANDOM },
+    );
+  }, [aiSeats, opponentCount]);
+
+  const isMulti = opponentCount > 1;
+
+  // Track which seat panel is expanded in multi-AI mode. Single-AI mode
+  // always renders the controls inline (no collapsing needed).
+  const [expandedIndex, setExpandedIndex] = useState<number | null>(isMulti ? null : 0);
+
+  // When switching between single and multi modes, reset the expansion state
+  // so the UI starts in the canonical "single expanded / multi all collapsed"
+  // configuration rather than inheriting a stale index.
+  useEffect(() => {
+    setExpandedIndex(isMulti ? null : 0);
+  }, [isMulti]);
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-between">
+        <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-indigo-200">
+          {isMulti ? t("aiOpponent.headingMulti", { count: opponentCount }) : t("aiOpponent.heading")}
+        </span>
+        {loading && <span className="text-[10px] text-slate-500">{t("aiOpponent.analyzingDecks")}</span>}
+      </div>
+
+      {/* Table-wide cEDH toggle. cEDH is a table property (every deck bracket 5),
+          not a per-seat difficulty — enabling it makes all AI play cEDH without
+          touching each opponent's remembered difficulty. Commander-only. */}
+      {isCedhFormat && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-rose-500/25 bg-rose-500/5 px-3 py-2">
+          <div className="flex min-w-0 flex-col">
+            <span className="text-xs font-semibold text-rose-200">{t("aiOpponent.cedhToggle.label")}</span>
+            <span className="text-[10px] text-slate-400">{t("aiOpponent.cedhToggle.hint")}</span>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={cedhMode}
+            aria-label={t("aiOpponent.cedhToggle.label")}
+            onClick={() => setCedhMode(!cedhMode)}
+            className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/60 ${
+              cedhMode ? "bg-rose-500" : "bg-white/15"
+            }`}
+          >
+            <span
+              className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+                cedhMode ? "translate-x-5" : "translate-x-0.5"
+              }`}
+            />
+          </button>
+        </div>
+      )}
+
+      <div className="flex flex-col gap-1.5">
+        {seatsToRender.map((seat, i) => (
+          <AiSeatPanel
+            key={i}
+            index={i}
+            seat={seat}
+            cedhMode={effectiveCedhMode}
+            candidates={candidates}
+            filteredDecks={filteredDecks}
+            hideDeckPicker={suppliesDeck}
+            expanded={!isMulti || expandedIndex === i}
+            collapsible={isMulti}
+            onToggle={() => setExpandedIndex((cur) => (cur === i ? null : i))}
+            onDeckChange={(id) => setAiSeatDeckId(i, id)}
+            onDifficultyChange={(d) => setAiSeatDifficulty(i, d)}
+          />
+        ))}
+      </div>
+
+      {!loading && candidates.length === 0 && !suppliesDeck && (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          {t("aiOpponent.noLegalDecks")}
+        </div>
+      )}
+
+      {error && (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          {t("aiOpponent.catalogUnavailable", { error })}
+        </div>
+      )}
+
+      {/* Global pool filters — apply to every seat set to Random. Hidden for
+          fixed-deck formats, where the engine supplies every AI deck and there
+          is no Random pool to filter. */}
+      {!suppliesDeck && (
+      <div className="mt-1 flex flex-col gap-3 rounded-lg border border-white/5 bg-black/20 px-3 py-2.5">
+        <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+          {t("aiOpponent.randomPoolFilters")}
+        </div>
+        <label className="flex flex-col gap-1">
+          <span className="text-xs text-slate-400">{t("aiOpponent.archetype")}</span>
+          <MenuSelect
+            ariaLabel={t("aiOpponent.archetype")}
+            label={archetypeFilter}
+            selectedValue={archetypeFilter}
+            items={ARCHETYPE_OPTIONS.map((opt) => ({ value: opt, label: opt }))}
+            onSelect={(value) => setArchetypeFilter(value as AiArchetypeFilter)}
+            menuLayout={AI_MENU_LAYOUT}
+            fitContainer
+            wrapperClassName={AI_MENU_WRAPPER}
+            className={`${AI_MENU_CLASS} font-medium ${archetypeAccent(
+              archetypeFilter === "Any" ? null : (archetypeFilter as DeckArchetype),
+            )}`}
+          />
+        </label>
+
+        <label className="flex flex-col gap-1">
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-slate-400">{t("aiOpponent.cardCoverage")}</span>
+            <span className="text-sm font-medium text-white">{coverageFloor}%</span>
+          </div>
+          <input
+            type="range"
+            min={50}
+            max={100}
+            step={5}
+            value={coverageFloor}
+            onChange={(e) => setCoverageFloor(Number(e.target.value))}
+            className="w-full"
+          />
+          <span className="text-[10px] text-slate-500">
+            {t("aiOpponent.coverageThresholdHint")}
+          </span>
+        </label>
+
+        {isCedhFormat && (
+          <div className="flex flex-col gap-1">
+            <span className="text-xs text-slate-400">{t("aiOpponent.bracket")}</span>
+            <BracketFilter selected={bracketFilter} onChange={setBracketFilter} />
+            <span className="text-[10px] text-slate-500">
+              {t("aiOpponent.bracketHint")}
+            </span>
+            {bracketPoolEmpty && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                {effectiveCedhMode ? t("aiOpponent.cedhPoolEmpty") : t("aiOpponent.bracketPoolEmpty")}
+              </div>
+            )}
+          </div>
+        )}
+
+        <RandomPoolTree pool="ai" items={poolTreeItems} allItems={poolToggleItems} baseIds={poolBaseIds} />
+        {poolConflict !== null && (
+          <div role="status" className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+            {t("aiOpponent.poolBracketConflict", { selected: poolConflict.selected, total: poolConflict.baseSize })}
+          </div>
+        )}
+      </div>
+      )}
+    </div>
+  );
+}
+
+interface AiSeatPanelProps {
+  index: number;
+  seat: { difficulty: AIDifficulty; deckId: AiDeckSelection };
+  /** Table-wide cEDH mode. When on, the per-seat difficulty is overridden by
+   *  cEDH, so the dropdown is disabled and badged (the remembered value is kept
+   *  for when cEDH is turned back off). */
+  cedhMode: boolean;
+  candidates: AiDeckCandidate[];
+  filteredDecks: AiDeckCandidate[];
+  /** When true (fixed-deck formats), the engine supplies this seat's deck — the
+   *  deck picker is hidden and only the difficulty selector is shown. */
+  hideDeckPicker: boolean;
+  expanded: boolean;
+  collapsible: boolean;
+  onToggle: () => void;
+  onDeckChange: (name: AiDeckSelection) => void;
+  onDifficultyChange: (d: AIDifficulty) => void;
+}
+
+function AiSeatPanel({
+  index,
+  seat,
+  cedhMode,
+  candidates,
+  filteredDecks,
+  hideDeckPicker,
+  expanded,
+  collapsible,
+  onToggle,
+  onDeckChange,
+  onDifficultyChange,
+}: AiSeatPanelProps) {
+  const { t } = useTranslation("menu");
+  const isRandom = seat.deckId === AI_DECK_RANDOM;
+  const selectedCandidate = candidates.find((d) => d.id === seat.deckId);
+  const summaryDeck = isRandom
+    ? t("aiOpponent.deckRandomCount", { count: filteredDecks.length })
+    : (selectedCandidate?.name ?? t("aiOpponent.deckRandom"));
+  const summaryDifficulty = cedhMode
+    ? t("aiOpponent.cedhToggle.badge")
+    : t(`aiDifficulty.levels.${seat.difficulty}`);
+
+  const difficultyItems = useMemo(
+    () =>
+      AI_DIFFICULTIES.map((item) => ({
+        value: item.id,
+        label: t(`aiDifficulty.levels.${item.id}`),
+      })),
+    [t],
+  );
+  const selectedDifficultyLabel =
+    difficultyItems.find((item) => item.value === seat.difficulty)?.label ??
+    t(`aiDifficulty.levels.${seat.difficulty}`);
+
+  const body = (
+    <div className="flex flex-col gap-2.5 px-3 pb-3 pt-1">
+      {!hideDeckPicker && (
+      <label className="flex flex-col gap-1">
+        <span className="text-xs text-slate-400">{t("aiOpponent.deck")}</span>
+        <AiDeckPicker
+          value={seat.deckId}
+          candidates={candidates}
+          randomPool={filteredDecks}
+          onChange={onDeckChange}
+          wrapperClassName={AI_MENU_WRAPPER}
+          className={`${AI_MENU_CLASS} text-white`}
+        />
+      </label>
+      )}
+
+      <AiBrainPicker index={index} />
+
+      <label className="flex flex-col gap-1">
+        <span className="text-xs text-slate-400">{t("aiOpponent.difficulty")}</span>
+        <div className="relative">
+          <MenuSelect
+            ariaLabel={t("aiOpponent.difficulty")}
+            label={selectedDifficultyLabel}
+            selectedValue={seat.difficulty}
+            items={difficultyItems}
+            onSelect={(value) => onDifficultyChange(value as AIDifficulty)}
+            disabled={cedhMode}
+            menuLayout={AI_MENU_LAYOUT}
+            fitContainer
+            wrapperClassName={AI_MENU_WRAPPER}
+            className={`${AI_MENU_CLASS} text-white ${cedhMode ? "cursor-not-allowed opacity-50" : ""}`}
+          />
+          {cedhMode && (
+            <span
+              aria-label="cEDH"
+              className="absolute -top-2 left-2 rounded bg-rose-500/80 px-1 py-0.5 text-[9px] font-bold uppercase tracking-wider text-white"
+            >
+              {t("aiOpponent.cedhToggle.badge")}
+            </span>
+          )}
+        </div>
+      </label>
+    </div>
+  );
+
+  if (!collapsible) {
+    return <div className="rounded-lg border border-white/8 bg-black/12">{body}</div>;
+  }
+
+  return (
+    <div className="overflow-hidden rounded-lg border border-white/8 bg-black/12">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={expanded}
+        className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left transition-colors hover:bg-white/4"
+      >
+        <div className="flex min-w-0 flex-col">
+          <span className="text-xs font-semibold text-slate-200">{t("aiOpponent.opponentLabel", { number: index + 1 })}</span>
+          <span className="truncate text-[11px] text-slate-400">
+            {summaryDeck} · {summaryDifficulty}
+          </span>
+        </div>
+        <Chevron expanded={expanded} />
+      </button>
+      {expanded && body}
+    </div>
+  );
+}
+
+/**
+ * Choose what drives this seat: the built-in engine AI, or a configured LLM
+ * provider.
+ *
+ * Renders nothing at all when no usable LLM provider exists, which is the
+ * default state — a player who has not set one up never sees this control, and
+ * the seat is engine-driven exactly as before. Difficulty still applies either
+ * way: it shapes the LLM's persona and how much of the position it is shown.
+ */
+function AiBrainPicker({ index }: { index: number }) {
+  const { t } = useTranslation("menu");
+  const catalog = useLlmProviderCatalog();
+  const profiles = useLlmStore((s) => s.profiles);
+  const bindSeat = useLlmStore((s) => s.bindSeat);
+  // The same lookup the game loop uses, so a seat that inherits the default
+  // opponent shows it here rather than "built-in engine".
+  const driver = useLlmStore((s) => profileForSeat(s, index, catalog));
+
+  const usable = useMemo(
+    () => profiles.filter((profile) => isProfileUsable(profile, catalog)),
+    [profiles, catalog],
+  );
+  if (usable.length === 0) return null;
+
+  const selected = driver?.id ?? ENGINE_BRAIN;
+  const items = [
+    { value: ENGINE_BRAIN, label: t("aiOpponent.brainEngine") },
+    ...usable.map((profile) => ({
+      value: profile.id,
+      label: profile.name.trim() || profile.model,
+    })),
+  ];
+
+  return (
+    <label className="flex flex-col gap-1">
+      <span className="text-xs text-slate-400">{t("aiOpponent.brain")}</span>
+      <MenuSelect
+        ariaLabel={t("aiOpponent.brain")}
+        label={items.find((item) => item.value === selected)?.label ?? t("aiOpponent.brainEngine")}
+        selectedValue={selected}
+        items={items}
+        onSelect={(value) => bindSeat(index, value === ENGINE_BRAIN ? null : value)}
+        menuLayout={AI_MENU_LAYOUT}
+        fitContainer
+        wrapperClassName={AI_MENU_WRAPPER}
+        className={`${AI_MENU_CLASS} text-white`}
+      />
+    </label>
+  );
+}
+
+function Chevron({ expanded }: { expanded: boolean }) {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 20 20"
+      className={`h-4 w-4 flex-shrink-0 text-slate-500 transition-transform ${
+        expanded ? "rotate-180" : ""
+      }`}
+      fill="currentColor"
+    >
+      <path
+        fillRule="evenodd"
+        d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.06l3.71-3.83a.75.75 0 1 1 1.08 1.04l-4.25 4.39a.75.75 0 0 1-1.08 0L5.21 8.27a.75.75 0 0 1 .02-1.06Z"
+        clipRule="evenodd"
+      />
+    </svg>
+  );
+}

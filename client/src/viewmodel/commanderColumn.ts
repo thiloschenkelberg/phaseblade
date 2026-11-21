@@ -1,0 +1,91 @@
+import type { GameObject, GameState, PlayerId } from "../adapter/types.ts";
+
+/**
+ * Single source of truth for the command-zone cards (commanders and
+ * Oathbreaker signature spells) that the command-zone card rail renders.
+ *
+ * These selectors exist because the visibility predicate was previously
+ * duplicated across PlayerArea (the wrapper gate), CommanderCardZone, and
+ * CommanderDamage — and the copies drifted: an earlier wrapper gate required
+ * the Commander-format flag, while CommanderDamage renders on damage alone
+ * (using a fallback threshold for non-Commander formats that produced
+ * commander damage). The wrapper then suppressed a render path its child
+ * supported. Routing all three through these helpers keeps them in lockstep.
+ */
+
+/**
+ * Command-zone leaders this player owns that are currently in the command
+ * zone — the exact set CommanderCardZone renders. A signature spell shares
+ * commander tax and command-zone casting rules but is not itself a commander.
+ */
+export function commandZoneLeaders(gameState: GameState, playerId: PlayerId): GameObject[] {
+  return (gameState.command_zone ?? [])
+    .map((id) => gameState.objects[id])
+    .filter(
+      (obj): obj is GameObject =>
+        obj != null &&
+        (obj.is_commander === true || obj.signature_spell != null) &&
+        obj.owner === playerId &&
+        obj.zone === "Command",
+    );
+}
+
+/**
+ * Command-zone conspiracies this player owns that are currently in the command
+ * zone (CR 905). Conspiracies are not commanders and do not carry commander tax.
+ */
+export function commandZoneConspiracies(gameState: GameState, playerId: PlayerId): GameObject[] {
+  return (gameState.command_zone ?? [])
+    .map((id) => gameState.objects[id])
+    .filter(
+      (obj): obj is GameObject =>
+        obj != null &&
+        obj.is_conspiracy === true &&
+        obj.owner === playerId &&
+        obj.zone === "Command",
+    );
+}
+
+/**
+ * Deployed Bosses this player owns, in the engine's command-zone order — the
+ * exact set BossCardZone renders. The engine SELECTS the set
+ * (`derived.horde.deployed_boss_ids`, face-up Boss cards only — the face-down
+ * Boss pile is never listed); this only splits it per owning seat the way
+ * `commandZoneLeaders` does, and drops ids whose objects are missing from a
+ * partial snapshot rather than guessing.
+ */
+export function commandZoneBosses(gameState: GameState, playerId: PlayerId): GameObject[] {
+  return (gameState.derived?.horde?.deployed_boss_ids ?? [])
+    .map((id) => gameState.objects[id])
+    .filter(
+      (obj): obj is GameObject => obj != null && obj.owner === playerId,
+    );
+}
+
+/** One attacker's commander-damage badges inflicted on a given victim. */
+export interface CommanderDamageEntry {
+  /** Attacking commander's controller (PlayerId as string key). */
+  attacker: string;
+  /** Per-commander damage badges, already filtered to this victim. */
+  views: { commander: number; damage: number }[];
+}
+
+/**
+ * Commander-damage entries inflicted on this player, grouped by attacker — the
+ * exact set CommanderDamage renders. Gated on `damage > 0` alone, with no
+ * format-flag check: the child uses a fallback threshold so non-Commander
+ * formats that somehow produced commander damage still display. Used both
+ * there and by PlayerArea's column-visibility gate (`.length > 0`).
+ */
+export function commanderDamageEntriesFor(
+  gameState: GameState,
+  playerId: PlayerId,
+): CommanderDamageEntry[] {
+  const byAttacker = gameState.derived?.commander_damage_by_attacker ?? {};
+  const entries: CommanderDamageEntry[] = [];
+  for (const [attacker, views] of Object.entries(byAttacker)) {
+    const forVictim = views.filter((view) => view.victim === playerId && view.damage > 0);
+    if (forVictim.length > 0) entries.push({ attacker, views: forVictim });
+  }
+  return entries;
+}

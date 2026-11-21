@@ -1,0 +1,242 @@
+import { act } from "react";
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  GROUPED_DAMAGE_FLURRY_IMPACT_DELAY_MS,
+  type AnimationStep,
+} from "../../../animation/types.ts";
+import { type QueuedStep, useAnimationStore } from "../../../stores/animationStore.ts";
+import { useGameStore } from "../../../stores/gameStore.ts";
+import { usePreferencesStore } from "../../../stores/preferencesStore.ts";
+import { buildGameState } from "../../../test/factories/gameStateFactory.ts";
+import { LifeTotal } from "../LifeTotal.tsx";
+
+function setLife(playerId: number, life: number) {
+  useGameStore.setState((s) => {
+    const prev = s.gameState ?? buildGameState();
+    const players = prev.players.map((p, i) => (i === playerId ? { ...p, life } : p));
+    return { gameState: { ...prev, players } };
+  });
+}
+
+// A combat step that damages `playerId` for `amount` (LifeChanged + DamageDealt).
+function combatDamageStep(playerId: number, amount: number): QueuedStep {
+  return {
+    duration: 900,
+    snapshotSeq: 1,
+    effects: [
+      {
+        event: { type: "LifeChanged", data: { player_id: playerId, amount } },
+        duration: 300,
+      } as AnimationStep["effects"][number],
+      {
+        event: {
+          type: "DamageDealt",
+          data: {
+            source_id: 1,
+            target: { Player: playerId },
+            amount: -amount,
+            is_combat: true,
+          },
+        },
+        duration: 900,
+      } as AnimationStep["effects"][number],
+    ],
+  };
+}
+
+function groupedDamageStep(playerId: number, lifeAmount?: number, lifePlayerId = playerId): QueuedStep {
+  return {
+    duration: 900,
+    snapshotSeq: 1,
+    effects: [
+      {
+        event: {
+          type: "GroupedDamageFlurry",
+          data: { player_id: playerId, source_ids: [1, 2, 3], total_damage: 3, hit_count: 3 },
+        },
+        duration: 900,
+      },
+      ...(lifeAmount == null
+        ? []
+        : [{
+            event: { type: "LifeChanged" as const, data: { player_id: lifePlayerId, amount: lifeAmount } },
+            duration: 300,
+            displayOnly: true as const,
+          }]),
+    ],
+  };
+}
+
+describe("LifeTotal", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    useGameStore.setState({
+      gameState: buildGameState(),
+    });
+    useAnimationStore.setState({ activeStep: null });
+    usePreferencesStore.setState({ animationSpeedMultiplier: 1 });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("renders the current life total", () => {
+    render(<LifeTotal playerId={0} />);
+    expect(screen.getByText("20")).toBeInTheDocument();
+  });
+
+  it("always renders the snapshot life while a stale damage animation is active", () => {
+    render(<LifeTotal playerId={0} />);
+    act(() => {
+      setLife(0, 38);
+    });
+    expect(screen.getByText("38")).toBeInTheDocument();
+
+    // This models a late LifeChanged(-2) event arriving after the full snapshot
+    // has already established the authoritative value of 38.
+    act(() => {
+      useAnimationStore.setState({ activeStep: combatDamageStep(0, -2) });
+      vi.advanceTimersByTime(900);
+    });
+
+    expect(screen.getByText("38")).toBeInTheDocument();
+    expect(screen.queryByText("36")).not.toBeInTheDocument();
+  });
+
+  it("updates when the snapshot life changes without an animation step", () => {
+    render(<LifeTotal playerId={0} />);
+    expect(screen.getByText("20")).toBeInTheDocument();
+
+    act(() => {
+      setLife(0, 15);
+    });
+
+    expect(screen.getByText("15")).toBeInTheDocument();
+  });
+
+  it("does not derive a grouped flurry life total from its display event", () => {
+    render(<LifeTotal playerId={0} />);
+    expect(screen.getByText("20")).toBeInTheDocument();
+
+    act(() => {
+      useAnimationStore.setState({ activeStep: groupedDamageStep(0, -3) });
+    });
+
+    act(() => {
+      vi.advanceTimersByTime(GROUPED_DAMAGE_FLURRY_IMPACT_DELAY_MS);
+    });
+    expect(screen.getByText("20")).toBeInTheDocument();
+  });
+
+  it("does not move life for grouped flurry without a consumed LifeChanged effect", () => {
+    render(<LifeTotal playerId={0} />);
+
+    act(() => {
+      useAnimationStore.setState({ activeStep: groupedDamageStep(0) });
+      vi.advanceTimersByTime(GROUPED_DAMAGE_FLURRY_IMPACT_DELAY_MS);
+    });
+
+    expect(screen.getByText("20")).toBeInTheDocument();
+  });
+
+  it("renders the engine's unbounded life as ∞ and still flashes a life change", () => {
+    useGameStore.setState({
+      gameState: buildGameState({ derived: { life_magnitude: { 1: "Unbounded" } } }),
+    });
+    render(
+      <>
+        <LifeTotal playerId={0} hideLabel />
+        <LifeTotal playerId={1} hideLabel />
+      </>,
+    );
+
+    const readout = screen.getByText("∞");
+    expect(readout).toHaveAttribute("title", "Unbounded life (∞)");
+    expect(readout).toHaveAttribute("aria-label", "Unbounded life (∞)");
+    expect(readout).toHaveClass("text-green-400");
+    expect(screen.getByText("20")).not.toHaveAttribute("title");
+
+    act(() => {
+      useAnimationStore.setState({
+        activeStep: {
+          duration: 300,
+          snapshotSeq: 1,
+          effects: [{ event: { type: "LifeChanged", data: { player_id: 1, amount: 3 } }, duration: 300 }],
+        },
+      });
+    });
+    expect(screen.getByText("∞")).toHaveClass("bg-green-500/30");
+  });
+
+  it("does not derive a lifelink gain from a grouped flurry display event", () => {
+    render(<LifeTotal playerId={1} />);
+    expect(screen.getByText("20")).toBeInTheDocument();
+
+    act(() => {
+      useAnimationStore.setState({ activeStep: groupedDamageStep(0, 3, 1) });
+    });
+
+    act(() => {
+      vi.advanceTimersByTime(GROUPED_DAMAGE_FLURRY_IMPACT_DELAY_MS);
+    });
+    expect(screen.getByText("20")).toBeInTheDocument();
+  });
+
+  describe("a seat with no life total (the Horde)", () => {
+    function setHordeSeat(playerId: number, libraryLength: number) {
+      useGameStore.setState((s) => {
+        const prev = s.gameState ?? buildGameState();
+        const players = prev.players.map((p, i) =>
+          i === playerId
+            ? {
+                ...p,
+                has_no_life_total: true,
+                // Life stays at its frozen starting value — that's exactly the
+                // number we must NOT show.
+                life: 20,
+                library: Array.from({ length: libraryLength }, (_, n) => n + 1),
+              }
+            : p,
+        );
+        return { gameState: { ...prev, players } };
+      });
+    }
+
+    it("shows the library count instead of the frozen life total", () => {
+      setHordeSeat(0, 287);
+      render(<LifeTotal playerId={0} />);
+
+      expect(screen.getByText("287")).toBeInTheDocument();
+      // The whole point: the meaningless life total must not be rendered.
+      expect(screen.queryByText("20")).not.toBeInTheDocument();
+    });
+
+    it("tracks the library shrinking as the Horde is milled", () => {
+      setHordeSeat(0, 300);
+      render(<LifeTotal playerId={0} />);
+      expect(screen.getByText("300")).toBeInTheDocument();
+
+      // Damage/life loss on the Horde is redirected into milling, so progress
+      // shows up as the library dropping.
+      act(() => {
+        setHordeSeat(0, 296);
+      });
+      expect(screen.getByText("296")).toBeInTheDocument();
+    });
+
+    it("leaves normal seats rendering their life total", () => {
+      // Positive control: the branch must be scoped to flagged seats only, not
+      // applied to every player.
+      setHordeSeat(0, 287);
+      render(<LifeTotal playerId={1} />);
+
+      expect(screen.getByText("20")).toBeInTheDocument();
+      expect(screen.queryByText("287")).not.toBeInTheDocument();
+    });
+  });
+});

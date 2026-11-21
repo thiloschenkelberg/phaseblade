@@ -1,0 +1,342 @@
+// Centralized registry of every WaitingFor variant the frontend can present
+// to the active player. Used by the unhandled-state safety net: if the engine
+// emits a WaitingFor whose `type` is not in this set, the diagnostic modal
+// surfaces a fail-loud prompt so the user can concede out instead of
+// silently hanging on an orphan state.
+//
+// Adding a new player-facing WaitingFor variant on the engine side REQUIRES
+// adding it here and wiring a corresponding modal/overlay in GamePage. Variants
+// present in the TS WaitingFor union but absent from this set deliberately
+// surface the diagnostic modal instead of silently hanging.
+
+import type { GameState, WaitingFor } from "../adapter/types";
+
+/**
+ * CR 601.2g + CR 107.4f: WaitingFor variants resolved by the single
+ * `ManaPaymentUI` overlay. The generic `ManaPayment` prompt, the per-shard
+ * `PhyrexianPayment` prompt, and a mana ability's own payment window
+ * (`ManaAbilityManaPayment`, CR 605.3a) share one panel because all are
+ * caster-only cost decisions — `ManaPaymentUI` discriminates internally.
+ *
+ * This set is the single source of truth: `GamePage` gates the overlay's
+ * mount on it, and `HANDLED_WAITING_FOR_TYPES` spreads it. Wiring the overlay
+ * and registering it as "handled" therefore cannot drift apart.
+ */
+export const MANA_PAYMENT_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
+  new Set<WaitingFor["type"]>(["ManaPayment", "PhyrexianPayment", "ManaAbilityManaPayment"]);
+
+/**
+ * Discriminator strings the frontend has a user-facing UI handler for.
+ * Every entry must correspond to a rendered modal, overlay, or in-line
+ * affordance that resolves the prompt.
+ */
+export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
+  new Set<WaitingFor["type"]>([
+    // Active priority — passes via PassButton / mana payment / cast.
+    "Priority",
+    // Resolve All's explicit standing-pass authorization. The final Grant
+    // materializes the shared engine session directly; there is no client-side
+    // Ready hand-off to drive.
+    "ResolveAllConsent",
+    // CR 701.42 / CR 508.4: meld pair and attacking-entry destination dialogs.
+    "MeldPairChoice",
+    "MeldAttackTargetChoice",
+    "EntryAttackTargetChoice",
+    // Cast / activation chain — ManaPayment + PhyrexianPayment share ManaPaymentUI.
+    ...MANA_PAYMENT_WAITING_FOR_TYPES,
+    "ManaSourceSelection",
+    "ChooseXValue",
+    "PayAmountChoice",
+    "TargetSelection",
+    "TriggerTargetSelection",
+    "OptionalCostChoice",
+    "ActivationCostOneOfChoice",
+    "DefilerPayment",
+    // CR 601.2f: caster-elected cost-reduction ordering
+    // (CostReductionOrderModal).
+    "OrderCostReductions",
+    "ModeChoice",
+    "AbilityModeChoice",
+    "ModalFaceChoice",
+    "AlternativeCastChoice",
+    "SpliceOffer",
+    // CR 702.140c + CR 730.2a: mutate top/bottom merge choice (MutateMergeChoiceModal).
+    "MutateMergeChoice",
+    // CR 702.99a: cipher encode-on-resolve choice (CipherEncodeChoiceModal).
+    "CipherEncodeChoice",
+    "CastingVariantChoice",
+    "ChoosePermanentTypeSlot",
+    // CR 118.3 + CR 601.2b + CR 605.3b: unified cost-payment selection
+    // (replaces the 11 old per-cost variants; dispatches on `kind`).
+    "PayCost",
+    "BlightChoice",
+    "HarmonizeTapChoice",
+    "CollectEvidenceChoice",
+    // Multi-step target / offer choices rendered by CardChoiceModal.
+    "MultiTargetSelection", // verified rendered: CardChoiceModal.tsx:216 case → :218 → MultiTargetSelectionModal (:1448)
+    // CR 715.3a + CR 702.94a + CR 702.35a + CR 702.85a + CR 701.57a + CR 702.xxx:
+    // unified special-cast offer (Adventure / Miracle / Madness / Cascade /
+    // Discover / Paradigm); dispatches on `data.kind.type`.
+    "CastOffer",
+    // CR 701.36a: choose a creature token to copy (board click via TargetingOverlay).
+    "PopulateChoice",
+    // Mana abilities (cost-selection prompts now route through PayCost above).
+    "PayManaAbilityMana",
+    "ChooseManaColor",
+    // Combat
+    "DeclareAttackers",
+    "DeclareBlockers",
+    "AssignCombatDamage",
+    // CR 702.22k: active player divides a banded blocker's combat damage
+    // (BlockerDamageAssignmentModal, rendered via CardChoiceModal).
+    "AssignBlockerDamage",
+    "CombatTaxPayment",
+    // Triggers / resolution-time choices
+    "OrderTriggers",
+    // CR 732.2a/b/c: interactive loop-shortcut declare + accept-or-shorten
+    // (DeclareShortcutModal / RespondToShortcutModal).
+    "LoopShortcut",
+    "RespondToShortcut",
+    "PrecastCopyShortcutOffer",
+    "RespondToPrecastCopyShortcut",
+    "ReplacementChoice",
+    "EntryControllerChoice",
+    "CopyTargetChoice",
+    "CopyRetarget",
+    "ExploreChoice",
+    // CR 303.4 + CR 115.1: return-as-Aura / non-spell Aura entry host pick.
+    // Resolved on the board (object hosts) or via player HUD glow (Curse /
+    // enchant-player Auras). Legal picks come from `getWaitingForClickTargetRefs`
+    // (viewmodel/gameStateView.ts), which every click surface reads.
+    "ReturnAsAuraTarget",
+    // Digital-only Alchemy (no CR entry): batch boon "one of them" token-host
+    // pick. Same board/HUD click route as ReturnAsAuraTarget above.
+    "ChooseTokenHost",
+    "EquipTarget",
+    "CrewVehicle",
+    "StationTarget",
+    "SaddleMount",
+    "ScryChoice",
+    "RippleRevealChoice",
+    "RippleBottomOrder",
+    "RevealUntilBottomOrder",
+    "DigBottomOrder",
+    "ArrangePlanarDeckTopChoice",
+    "CoinFlipKeepChoice",
+    "DieKeepChoice",
+    "DigChoice",
+    "DigRestSplitChoice",
+    "SurveilChoice",
+    "RevealChoice",
+    "SearchChoice",
+    "SearchPartitionChoice",
+    "OutsideGameChoice",
+    "ChooseFromZoneChoice",
+    // CR 701.4a: behold a [quality] — single-pick from a mixed-zone candidate
+    // list (BeholdChoiceModal, rendered via CardChoiceModal).
+    "BeholdChoice",
+    // CR 701.71a: empower Jace N — single-pick among the controller's Jace
+    // planeswalker tokens (EmpowerJaceChoiceModal, rendered via CardChoiceModal).
+    "EmpowerJaceChoice",
+    // CR 608.2f + CR 405.3: pick the member processed next — a spell copy, or a
+    // per-member instruction whose iterations pause for a payment
+    // (MemberOrderChoiceModal, rendered via CardChoiceModal).
+    "MemberOrderChoice",
+    "ChooseOneOfBranch",
+    "ConniveDiscard",
+    "DiscardChoice",
+    // Turtle Team-Up hero-choice Events (HeroEventModal, rendered via CardChoiceModal).
+    "HeroEventChoice",
+    "EffectZoneChoice",
+    "DrawnThisTurnTopdeckChoice",
+    "LearnChoice",
+    "SpellbookDraft",
+    "ManifestDreadChoice",
+    "ClashChooseOpponent",
+    // CR 608.2d: "an opponent chooses" from a zone — the controller picks the
+    // choosing opponent (ZoneOpponentChooserModal).
+    "ChooseFromZoneOpponentChooser",
+    "ChooseAnnouncingOpponent",
+    "ChooseGiftRecipient",
+    "ClashCardPlacement",
+    // Eye to Eye / Mouth to Mouth: real-time clicking contest (ContestOverlay).
+    "PhysicalContest",
+    // CR 702.132a: Assist — caster picks a helper (AssistChoosePlayerModal),
+    // then the helper commits generic mana (AssistPaymentUI).
+    "AssistChoosePlayer",
+    "AssistPayment",
+    "TopOrBottomChoice",
+    "ProliferateChoice",
+    "TimeTravelChoice",
+    "ChooseObjectsSelection",
+    "CategoryChoice",
+    "EachPlayerCopyChosenSelection",
+    "KeepWithinTotalPowerChoice",
+    "KeepExactPermanentsChoice",
+    "DistributeAmong",
+    // CR 119.7 + CR 119.8: controller-chosen life-total redistribution permutation
+    // (Reverse the Sands, The Doctor's Tomb) — rendered by LifeRedistributionModal.
+    "RedistributeLifeTotals",
+    "MoveCountersDistribution",
+    // CR 107.1c: "remove any number of counters" (Rhys, Tetravus) — rendered by
+    // MoveCountersDistributionModal in no-destination removal mode.
+    "RemoveCountersChoice",
+    "RetargetChoice",
+    "CopyRetarget",
+    "DamageSourceChoice",
+    "DiscardToHandSize",
+    "MiracleReveal",
+    "TributeChoice",
+    "PairChoice",
+    "OpponentMayChoice",
+    "OptionalEffectChoice",
+    "ResolutionOptionalPaymentChoice",
+    "UnlessPayment",
+    "UnlessPaymentChooseCost",
+    "WardDiscardChoice",
+    "WardSacrificeChoice",
+    "UnlessBounceChoice",
+    "RevealUntilKeptChoice",
+    "RepeatDecision",
+    "VoteChoice",
+    "SeparatePilesChooseOpponent",
+    "SeparatePilesPartition",
+    "SeparatePilesChoice",
+    "ChooseRingBearer",
+    "ChooseDungeon",
+    "ChooseDungeonRoom",
+    "SpecializeColor",
+    // CR 709.5f-g: lock/unlock-door resolution choice (RoomDoorChoiceModal).
+    "ChooseRoomDoor",
+    "ChooseLegend",
+    "CommanderZoneChoice",
+    "BattleProtectorChoice",
+    "NamedChoice",
+    "OpponentGuess",
+    "CostTypeChoice",
+    "UntapChoice",
+    "ChooseUntapSubset",
+    "ExertChoice",
+    "EnlistChoice",
+    "SecretAgendaChoice",
+    "CompanionReveal",
+    // Game lifecycle
+    "GameOver",
+    "MulliganDecision",
+    "OpeningHandBottomCards",
+    "BetweenGamesSideboard",
+    "BetweenGamesChoosePlayDraw",
+    "ChooseStartingPlayer",
+  ]);
+
+/**
+ * Return true if `waitingFor.type` has a UI handler. Used by the safety-net
+ * diagnostic modal to detect orphan WaitingFor states that would otherwise
+ * silently hang the game.
+ */
+export function isWaitingForHandled(
+  waitingFor: WaitingFor | null | undefined,
+): boolean {
+  if (!waitingFor) return true;
+  return HANDLED_WAITING_FOR_TYPES.has(waitingFor.type);
+}
+
+/** A waiting-reason id: the shared suffix of its `status.reason.*` and `status.seat.*` keys. */
+export type WaitingReasonId =
+  | "declareAttackers"
+  | "declareBlockers"
+  | "assigningDamage"
+  | "choosingTargets"
+  | "payingCost"
+  | "mulligan"
+  | "discarding"
+  | "orderingTriggers"
+  | "orderingCostReductions"
+  | "respondingToStack"
+  | "priorityCombat"
+  | "priorityMain"
+  | "priority"
+  | "thinking";
+
+/** A localized-reason descriptor: a reason id plus optional interpolation params. */
+export interface WaitingReason {
+  id: WaitingReasonId;
+  params?: Record<string, unknown>;
+}
+
+/**
+ * Map a pending decision to a human-readable *reason* (an id naming its
+ * `status.reason.*` key) describing WHY the game is waiting. This is display
+ * formatting over engine-provided facts (the `waiting_for` variant, plus
+ * `phase` / `stack` for the generic priority window) — it labels a state the
+ * engine already decided; it never infers game state.
+ *
+ * Returns `null` when there is nothing to narrate (no pending decision or the
+ * game is over). Unknown variants fall through to a generic reason so a new
+ * engine `WaitingFor` variant degrades gracefully instead of breaking the
+ * build (coverage of the common variants is asserted in tests, not via a
+ * compile-time exhaustiveness check).
+ */
+export function waitingForReason(
+  waitingFor: WaitingFor | null,
+  gameState: GameState | null,
+): WaitingReason | null {
+  if (!waitingFor || waitingFor.type === "GameOver") return null;
+
+  switch (waitingFor.type) {
+    case "DeclareAttackers":
+      return { id: "declareAttackers" };
+    case "DeclareBlockers":
+      return { id: "declareBlockers" };
+    case "AssignCombatDamage":
+    case "AssignBlockerDamage":
+    case "DistributeAmong":
+      return { id: "assigningDamage" };
+    case "TargetSelection":
+    case "TriggerTargetSelection":
+    case "MultiTargetSelection":
+    case "CopyRetarget":
+    case "RetargetChoice":
+      return { id: "choosingTargets" };
+    case "ManaPayment":
+    case "ManaSourceSelection":
+    case "PhyrexianPayment":
+    case "PayCost":
+    case "PayManaAbilityMana":
+    case "ManaAbilityManaPayment":
+    case "UnlessPayment":
+      return { id: "payingCost" };
+    case "MulliganDecision":
+    case "OpeningHandBottomCards":
+      return { id: "mulligan" };
+    case "DiscardToHandSize":
+    case "DiscardChoice":
+      return { id: "discarding" };
+    case "OrderTriggers":
+      return { id: "orderingTriggers" };
+    case "OrderCostReductions":
+      return { id: "orderingCostReductions" };
+    case "Priority": {
+      // CR 117: the priority window. The engine-provided stack depth and phase
+      // tell us what kind of window this is — purely descriptive labeling.
+      if ((gameState?.stack.length ?? 0) > 0) {
+        return { id: "respondingToStack" };
+      }
+      switch (gameState?.phase) {
+        case "BeginCombat":
+        case "DeclareAttackers":
+        case "DeclareBlockers":
+        case "CombatDamage":
+        case "EndCombat":
+          return { id: "priorityCombat" };
+        case "PreCombatMain":
+        case "PostCombatMain":
+          return { id: "priorityMain" };
+        default:
+          return { id: "priority" };
+      }
+    }
+    default:
+      return { id: "thinking" };
+  }
+}

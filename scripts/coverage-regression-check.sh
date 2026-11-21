@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+#
+# Compare a current coverage-data.json against a baseline and partition
+# per-card support changes into three buckets:
+#
+#   REGRESSED (engine) — card flipped supported:true -> false AND gained
+#                        at least one non-ParseWarning gap handler
+#                        (Effect:*, Trigger:*, Static:*, Keyword:*, ...).
+#                        These are the only flips that fail CI by default:
+#                        the engine no longer handles something it used to.
+#
+#   REGRESSED (coverage honesty)
+#                      — card flipped true -> false, but no previously parsed
+#                        supported handler was lost. This covers ParseWarning:*
+#                        and a `Keyword:CumulativeUpkeep` finding: typed
+#                        cumulative-upkeep costs expose a pre-existing green
+#                        that lacked a faithful typed representation. Listed
+#                        but non-fatal.
+#
+#   GAINED             — card flipped false -> true. Informational.
+#
+#   ORACLE CHANGED     — card flipped true -> false AND its oracle_text
+#                        changed vs baseline. Treated as informational: the
+#                        card wording itself was errata'd/reprinted in an
+#                        MTGJSON refresh, so new gaps don't indicate an
+#                        engine regression. Surfaced so reviewers can spot
+#                        unexpected wording changes.
+#
+# Usage:
+#   scripts/coverage-regression-check.sh <baseline> <current> [options]
+#
+#   <baseline>  path OR https URL to main-branch coverage-data.json
+#   <current>   path to the newly produced coverage-data.json
+#   --fail-on-engine  exit 1 if REGRESSED (engine) bucket is non-empty
+#
+#   --self-test       run this script's own fixture suite
+#                     (scripts/lib/coverage_crlf_tests.sh) and exit with its status
+#
+# The coverage-data.json layout comes from `coverage-report` (see
+# crates/engine/src/bin/coverage_report.rs): .cards[] with .card_name,
+# .supported, and .gap_details[].handler.
+
+set -euo pipefail
+
+# Self-test entry, before the argument guard: the suite needs no arguments.
+if [[ "${1:-}" == "--self-test" ]]; then
+    exec /bin/bash "$(dirname "$0")/lib/coverage_crlf_tests.sh"
+fi
+
+if [[ $# -lt 2 ]]; then
+    sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' >&2
+    exit 2
+fi
+
+# Native Windows jq terminates every line it prints with CRLF, so a value read from it carries a
+# CR into arithmetic: `net=$((cur_supported - base_supported))` then reports "invalid arithmetic
+# operator" and the comparison does not decide at all (#10549). Normalize at the boundary, and
+# fail with a named message when the value is still not a number — a threshold that silently does
+# not evaluate is the defect, so this must never fall through to a false "clean" verdict.
+jq_num() {
+    local value
+    value="$(jq "$@")"
+    value="${value%$'\r'}"
+    # A sign is allowed; anything else that is not a digit is refused. Testing the whole value
+    # against `[!0-9-]` let `-`, `--` and `1-2` through, and those fail inside `[[ ]]`'s CONDITION
+    # context silently — no verdict, exit 0 — which is the false clean this boundary exists to stop.
+    case "${value#-}" in
+        '' | *[!0-9]*)
+            echo "ERROR: jq produced a non-numeric value where a count was required: jq $*" >&2
+            echo "       got '$value' — refusing to compare against a value that is not a number" >&2
+            return 2
+            ;;
+    esac
+    printf '%s\n' "$value"
+}
+
+BASELINE="$1"
+CURRENT="$2"
+FAIL_ON_ENGINE=0
+shift 2
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --fail-on-engine)
+            FAIL_ON_ENGINE=1
+            shift
+            ;;
+        *)
+            echo "unknown option: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+if [[ "$BASELINE" == http*://* ]]; then
+    echo "Fetching baseline: $BASELINE" >&2
+    if ! curl -sSL --fail --retry 3 --max-time 120 "$BASELINE" -o "$tmpdir/baseline.json"; then
+        echo "WARNING: baseline unavailable — skipping regression check." >&2
+        echo "         (Expected on the first main build; otherwise check R2 upload.)" >&2
+        exit 0
+    fi
+    BASELINE="$tmpdir/baseline.json"
+fi
+
+if [[ ! -s "$BASELINE" ]]; then
+    echo "WARNING: baseline file missing or empty: $BASELINE — skipping." >&2
+    exit 0
+fi
+if [[ ! -s "$CURRENT" ]]; then
+    echo "Current file missing or empty: $CURRENT" >&2
+    exit 2
+fi
+
+# A support/diagnostic comparison is only meaningful when both files were
+# generated from the same raw card-data corpus. `coverage-report` emits this
+# identity from the exact MTGJSON bytes it consumes, keeping every caller on
+# one authority. Never compare mixed epochs (Oracle churn would read as parser
+# regressions), and never skip silently: a corpus mismatch warns and skips, an
+# unstamped legacy baseline warns and compares, and a missing or malformed
+# identity fails closed.
+#
+# `source_corpus_hash` is read as: absent/null -> "" (no identity recorded);
+# a lowercase SHA-256 string -> itself; anything else (including "") -> a
+# `malformed:` marker, which the SHA-256 shape check below rejects. The shape
+# is decided inside jq, on the decoded string, so the only raw CR left in the
+# output is native Windows jq's line ending, dropped as in `jq_num` (#10549).
+# `\A`/`\z` anchor the whole string: jq's `$` also matches before a final
+# newline.
+read_source_corpus_hash() {
+    local value
+    value="$(jq -r '.source_corpus_hash
+        | if . == null then ""
+          elif type == "string" and test("\\A[0-9a-f]{64}\\z") then .
+          else "malformed:" + tojson
+          end' "$1")" || return
+    printf '%s\n' "${value%$'\r'}"
+}
+is_sha256_hex() {
+    [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+BASELINE_SOURCE_CORPUS_HASH="$(read_source_corpus_hash "$BASELINE")"
+CURRENT_SOURCE_CORPUS_HASH="$(read_source_corpus_hash "$CURRENT")"
+# The current artifact always comes from this checkout's `coverage-report`,
+# which refuses to run without verified provenance, so a missing or malformed
+# current identity is a pipeline defect and never a bootstrap state.
+if [[ -z "$CURRENT_SOURCE_CORPUS_HASH" ]]; then
+    echo "CORPUS_IDENTITY_MISSING: current has no source_corpus_hash; refusing cross-corpus comparison." >&2
+    echo "CARD DATA DRIFT: refusing comparison without a current corpus identity." >&2
+    exit 2
+fi
+if ! is_sha256_hex "$CURRENT_SOURCE_CORPUS_HASH"; then
+    echo "CORPUS_IDENTITY_MALFORMED: current source_corpus_hash is not a lowercase SHA-256: $CURRENT_SOURCE_CORPUS_HASH" >&2
+    exit 2
+fi
+if [[ -z "$BASELINE_SOURCE_CORPUS_HASH" ]]; then
+    # Legacy-baseline bootstrap. Baselines published before corpus stamping
+    # carry no identity, and stamping one after the fact would be a guess.
+    # Compare exactly as the gate did before corpus identity existed, and say
+    # so loudly. The trusted main publisher uploads the coverage-report output,
+    # which carries the provenance-verified identity of the raw AtomicCards
+    # bytes it consumed, so the fence below engages on its own with the first
+    # stamped baseline. A baseline that records a malformed identity is not
+    # legacy and still fails closed.
+    echo "::warning title=Coverage corpus identity unverified::CORPUS_IDENTITY_UNVERIFIED: baseline has no source_corpus_hash (published before corpus stamping); comparing without corpus identity against current corpus $CURRENT_SOURCE_CORPUS_HASH. The corpus fence engages once main publishes a stamped baseline."
+    echo "CORPUS_IDENTITY_UNVERIFIED: legacy baseline without source_corpus_hash; corpus identity could not be compared." >&2
+elif ! is_sha256_hex "$BASELINE_SOURCE_CORPUS_HASH"; then
+    echo "CORPUS_IDENTITY_MALFORMED: baseline source_corpus_hash is not a lowercase SHA-256: $BASELINE_SOURCE_CORPUS_HASH" >&2
+    echo "CARD DATA DRIFT: refusing comparison against a malformed baseline corpus identity." >&2
+    exit 2
+elif [[ "$BASELINE_SOURCE_CORPUS_HASH" != "$CURRENT_SOURCE_CORPUS_HASH" ]]; then
+    # Different corpora: a support/diagnostic delta would mix Oracle churn
+    # with parser changes, so the comparison is not meaningful and is skipped.
+    # This is deliberately non-blocking. Corpus drift is routine (weekly
+    # MTGJSON rollover, per-branch caches, local inputs), and failing here
+    # would wedge the merge queue: nothing merges, so main never republishes
+    # a baseline for the new corpus. Only producer/publisher defects
+    # (missing or malformed identities above) fail closed.
+    echo "::warning title=Coverage corpus mismatch::CORPUS_MISMATCH: baseline corpus $BASELINE_SOURCE_CORPUS_HASH != current corpus $CURRENT_SOURCE_CORPUS_HASH; coverage comparison skipped (not meaningful across corpora). It resumes once main publishes a baseline for this corpus."
+    echo "CARD DATA DRIFT: baseline and current were generated from different corpora; skipping coverage comparison." >&2
+    exit 0
+fi
+
+# Emit one JSON object per card that flipped, with categorized new gaps.
+# Cards absent from the baseline are skipped (new cards don't count as regressions).
+jq -n --slurpfile base "$BASELINE" --slurpfile curr "$CURRENT" '
+  def flatten_items(items):
+    (items // [])
+    | map(
+        . as $item
+        | [$item] + flatten_items($item.children)
+      )
+    | add // [];
+
+  def item_handler:
+    if .category == "keyword" then "Keyword:\(.label)"
+    elif .category == "ability" then "Effect:\(.label)"
+    elif .category == "trigger" then "Trigger:\(.label)"
+    elif .category == "static" then "Static:\(.label)"
+    elif .category == "cost" then "Cost:\(.label)"
+    elif .category == "replacement" then empty
+    else empty end;
+
+  # The coverage report labels an unsupported typed cumulative-upkeep cost at
+  # the keyword node. Before typed deserialization, every cumulative-upkeep
+  # cost was represented by a placeholder zero-mana cost and appeared green.
+  # That makes these newly surfaced gaps coverage honesty, not a lost handler.
+  def structured_unsupported_cumulative_upkeep:
+    . == "Keyword:CumulativeUpkeep";
+
+  ($base[0].cards // []) as $bcards |
+  ($curr[0].cards // []) as $ccards |
+  ($bcards | map({key: (.card_name | ascii_downcase), value: .}) | from_entries) as $bmap |
+  $ccards
+  | map(
+      . as $c
+      | ($bmap[$c.card_name | ascii_downcase]) as $b
+      | select($b != null and $b.supported != $c.supported)
+      | (flatten_items($b.parse_details)
+          | map(select(.supported == true) | item_handler | ascii_downcase)
+          | unique) as $baseline_supported_handlers
+      | {
+          name: $c.card_name,
+          was: $b.supported,
+          now: $c.supported,
+          oracle_changed: (($b.oracle_text // "") != ($c.oracle_text // "")),
+          new_handlers: (
+            ([$c.gap_details[]?.handler] | unique)
+            - ([$b.gap_details[]?.handler] | unique)
+          ),
+        }
+      | .new_parser = [.new_handlers[] | select(startswith("ParseWarning:"))]
+      | .new_engine = [.new_handlers[] | select(startswith("ParseWarning:") | not)]
+      | .new_engine_lost = [
+          .new_engine[]
+          | select((structured_unsupported_cumulative_upkeep | not)
+              and (. as $handler | $baseline_supported_handlers | index($handler | ascii_downcase)))
+        ]
+      | .new_honesty = (.new_parser + (.new_engine - .new_engine_lost))
+      | .bucket = (
+          if .was and (.now | not) then
+            if .oracle_changed then "oracle_changed"
+            elif (.new_engine_lost | length) > 0 then "engine_regress"
+            else "parser_regress" end
+          elif (.was | not) and .now then "gained"
+          else "other" end
+        )
+    )
+' > "$tmpdir/flips.json"
+
+engine_count=$(jq_num '[.[] | select(.bucket=="engine_regress")] | length' "$tmpdir/flips.json")
+parser_count=$(jq_num '[.[] | select(.bucket=="parser_regress")] | length' "$tmpdir/flips.json")
+oracle_count=$(jq_num '[.[] | select(.bucket=="oracle_changed")] | length' "$tmpdir/flips.json")
+gained_count=$(jq_num '[.[] | select(.bucket=="gained")] | length' "$tmpdir/flips.json")
+
+cur_total=$(jq_num '.total_cards' "$CURRENT")
+cur_supported=$(jq_num '.supported_cards' "$CURRENT")
+base_supported=$(jq_num '.supported_cards' "$BASELINE")
+net=$((cur_supported - base_supported))
+
+echo "== Card support delta vs baseline =="
+printf "  Baseline supported: %d\n" "$base_supported"
+printf "  Current  supported: %d (net %+d)\n" "$cur_supported" "$net"
+printf "  Total cards:        %d\n" "$cur_total"
+echo
+
+# Cap line counts inside `jq` (via array slice) rather than piping through
+# `head`. With `set -o pipefail` a truncating `head` causes SIGPIPE on the
+# upstream `jq`, which `pipefail` then surfaces as a script failure even
+# when every bucket was within expected bounds.
+printf "REGRESSED (engine) — %d cards — engine handler lost for a previously-supported card:\n" "$engine_count"
+jq -r '[.[] | select(.bucket=="engine_regress")][:30][] | "  \(.name)  [\(.new_engine_lost | join(", "))]"' \
+    "$tmpdir/flips.json"
+if [[ "$engine_count" -gt 30 ]]; then
+    echo "  ... $((engine_count - 30)) more"
+fi
+echo
+
+printf "REGRESSED (coverage honesty) — %d cards — newly surfaced parser gaps without a lost baseline handler:\n" "$parser_count"
+jq -r '[.[] | select(.bucket=="parser_regress")][:10][] | "  \(.name)  [\(.new_honesty | join(", "))]"' \
+    "$tmpdir/flips.json"
+if [[ "$parser_count" -gt 10 ]]; then
+    echo "  ... $((parser_count - 10)) more"
+fi
+echo
+
+printf "ORACLE CHANGED — %d cards flipped true->false with edited oracle_text (MTGJSON rewording, not an engine regression):\n" "$oracle_count"
+jq -r '[.[] | select(.bucket=="oracle_changed")][:10][] | "  \(.name)  [\(.new_handlers | join(", "))]"' \
+    "$tmpdir/flips.json"
+if [[ "$oracle_count" -gt 10 ]]; then
+    echo "  ... $((oracle_count - 10)) more"
+fi
+echo
+
+printf "GAINED — %d cards newly supported:\n" "$gained_count"
+jq -r '[.[] | select(.bucket=="gained")][:10][] | "  \(.name)"' "$tmpdir/flips.json"
+if [[ "$gained_count" -gt 10 ]]; then
+    echo "  ... $((gained_count - 10)) more"
+fi
+echo
+
+if [[ "$FAIL_ON_ENGINE" -eq 1 && "$engine_count" -gt 0 ]]; then
+    echo "FAIL: $engine_count cards regressed with new engine-level gaps." >&2
+    echo "      Either restore the handler or update the baseline if intentional." >&2
+    exit 1
+fi
+
+# Diagnostic count ratchet (D-09): flag regressions in diagnostic categories.
+# Tolerates proportional increases when total_cards grew (new MTGJSON cards with
+# pre-existing gap patterns are not a parser regression).
+# Skip entirely when the baseline has no diagnostics field (first measurement).
+baseline_has_diag=0
+if jq -e '.diagnostics | keys | length > 0' "$BASELINE" > /dev/null 2>&1; then
+    baseline_has_diag=1
+fi
+
+diag_fail=0
+if [[ "$baseline_has_diag" -eq 1 ]]; then
+    base_total=$(jq_num -r '.total_cards // 0' "$BASELINE")
+    curr_total=$(jq_num -r '.total_cards // 0' "$CURRENT")
+    new_cards=$((curr_total - base_total))
+    if [[ "$new_cards" -lt 0 ]]; then
+        new_cards=0
+    fi
+
+    # Per-category honesty analysis (D-09 extension): for each diagnostic
+    # category that increased, partition newly-affected cards into
+    # "honesty-only" (parse_details unchanged — silent fallback newly
+    # surfaced) vs "real_regress" (parse_details changed — true semantic
+    # regression). Honesty-only emissions count toward the "REGRESSED
+    # (coverage honesty)" bucket and do NOT fail the ratchet.
+    #
+    # Cards that were NOT supported in the baseline are excluded from the
+    # newly-affected set entirely — mirroring the support-delta guard above
+    # ("Cards absent from the baseline are skipped"). A diagnostic emitted by a
+    # card that was already unsupported (or absent — e.g. a brand-new preview-set
+    # card during heavy MTGJSON churn) cannot be a *regression*: there is no
+    # supported baseline to regress from. Without this guard, a new card whose
+    # total-count delta is masked by churn (cards swapped, total flat) gets a
+    # null baseline parse_details, reads as "changed", and is miscounted as a
+    # real regression. The genuine "supported -> unsupported" case is still
+    # caught here (was_supported true) and by the engine bucket above.
+    jq -n --slurpfile base "$BASELINE" --slurpfile curr "$CURRENT" '
+      def cards_emitting($cat):
+        [.cards[]? | select(tostring | contains($cat)) | .card_name];
+      ($base[0]) as $b |
+      ($curr[0]) as $c |
+      ($b.cards // [] | map({key: .card_name, value: .parse_details}) | from_entries) as $bpd |
+      ($c.cards // [] | map({key: .card_name, value: .parse_details}) | from_entries) as $cpd |
+      ($b.cards // [] | map({key: .card_name, value: (.supported == true)}) | from_entries) as $bsup |
+      [
+        ($c.diagnostics // {} | keys[]) as $cat |
+        ($c.diagnostics[$cat] // 0) as $cc |
+        ($b.diagnostics[$cat] // 0) as $bc |
+        select($cc > $bc) |
+        ($b | cards_emitting($cat)) as $base_cards |
+        ($c | cards_emitting($cat)) as $curr_cards |
+        # Only cards supported in the baseline can regress (see comment above):
+        # absent / already-unsupported cards are skipped, not counted.
+        (($curr_cards - $base_cards) | unique | map(select($bsup[.] // false))) as $newly |
+        {
+          category: $cat,
+          newly_affected: [
+            $newly[] | {
+              name: .,
+              parse_details_unchanged: (($bpd[.] // null) == ($cpd[.] // null))
+            }
+          ],
+        } |
+        .honesty_only = [.newly_affected[] | select(.parse_details_unchanged) | .name] |
+        .real_regress = [.newly_affected[] | select(.parse_details_unchanged | not) | .name]
+      ]
+    ' > "$tmpdir/honesty.json" 2>/dev/null
+
+    while IFS='=' read -r cat count; do
+        count="${count%$'\r'}"
+        case "${count#-}" in
+            '' | *[!0-9]*)
+                echo "ERROR: non-numeric diagnostic count for '$cat': '$count'" >&2
+                echo "       refusing to compare against a value that is not a number" >&2
+                exit 2
+                ;;
+        esac
+        base_count=$(jq_num -r ".diagnostics[\"$cat\"] // 0" "$BASELINE")
+        if [[ "$count" -gt "$base_count" ]]; then
+            increase=$((count - base_count))
+            honesty_only=$(jq_num -r --arg cat "$cat" '
+              [.[] | select(.category == $cat) | .honesty_only | length] | add // 0
+            ' "$tmpdir/honesty.json")
+            honesty_names=$(jq -r --arg cat "$cat" '
+              [.[] | select(.category == $cat) | .honesty_only[]] | join(", ")
+            ' "$tmpdir/honesty.json")
+            real_count=$(jq_num -r --arg cat "$cat" '
+              [.[] | select(.category == $cat) | .real_regress | length] | add // 0
+            ' "$tmpdir/honesty.json")
+            if [[ "$honesty_only" -gt 0 ]]; then
+                echo "REGRESSED (coverage honesty): $cat +$honesty_only newly surfaced silent fallback(s) — parse_details unchanged: $honesty_names"
+            fi
+            # Allow up to (new_cards) remaining increase per category — each new
+            # card can contribute at most 1 diagnostic per category. If the
+            # adjusted increase exceeds what new cards explain, it's a real
+            # parser regression.
+            if [[ "$real_count" -gt "$new_cards" ]]; then
+                echo "DIAGNOSTIC REGRESSION: $cat increased from $base_count to $count (+$real_count real, exceeds new-card allowance of +$new_cards)" >&2
+                diag_fail=1
+            elif [[ "$real_count" -gt 0 ]]; then
+                echo "DIAGNOSTIC NOTE: $cat increased from $base_count to $count (+$real_count real, within new-card allowance of +$new_cards)"
+            else
+                echo "DIAGNOSTIC NOTE: $cat increased from $base_count to $count (+$increase, all honesty-only — non-fatal)"
+            fi
+        elif [[ "$count" -lt "$base_count" ]]; then
+            echo "DIAGNOSTIC IMPROVEMENT: $cat decreased from $base_count to $count"
+        fi
+    done < <(jq -r '.diagnostics // {} | to_entries[] | "\(.key)=\(.value)"' "$CURRENT" 2>/dev/null)
+
+    # Also check for new categories not in baseline
+    while IFS='=' read -r cat count; do
+        count="${count%$'\r'}"
+        case "${count#-}" in
+            '' | *[!0-9]*)
+                echo "ERROR: non-numeric diagnostic count for '$cat': '$count'" >&2
+                echo "       refusing to compare against a value that is not a number" >&2
+                exit 2
+                ;;
+        esac
+        if ! jq -e ".diagnostics[\"$cat\"]" "$BASELINE" > /dev/null 2>&1; then
+            echo "DIAGNOSTIC REGRESSION: new category $cat with count $count (not in baseline)" >&2
+            diag_fail=1
+        fi
+    done < <(jq -r '.diagnostics // {} | to_entries[] | "\(.key)=\(.value)"' "$CURRENT" 2>/dev/null)
+else
+    echo "INFO: baseline has no diagnostics field — seeding ratchet with current counts." >&2
+    jq -r '.diagnostics // {} | to_entries[] | "  \(.key): \(.value)"' "$CURRENT" 2>/dev/null >&2
+fi
+
+if [[ "$diag_fail" -eq 1 ]]; then
+    echo "FAIL: one or more diagnostic categories regressed." >&2
+    exit 1
+fi
+
+exit 0

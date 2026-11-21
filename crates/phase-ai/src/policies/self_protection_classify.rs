@@ -1,0 +1,3083 @@
+//! Shared building blocks for reactive self-protection policies.
+//!
+//! Classifies "save yourself / your permanents" effect signatures and assesses
+//! whether an immediate threat justifies spending a cost now. Consumed by
+//! `ReactiveSelfProtectionPolicy` (spells + activations) and
+//! `SacrificeLandProtectionPolicy` (land-sacrifice defensive outlets such as
+//! Sylvan Safekeeper — issue #771).
+
+use engine::types::ability::{
+    AbilityCost, AbilityDefinition, ContinuousModification, ControllerRef, Effect,
+    StaticDefinition, TargetFilter,
+};
+use engine::types::game_state::GameState;
+use engine::types::identifiers::ObjectId;
+use engine::types::keywords::Keyword;
+use engine::types::phase::Phase;
+use engine::types::player::PlayerId;
+use engine::types::statics::{ProhibitionScope, StaticMode};
+
+use engine::game::ability_utils::declared_targets_in_chain;
+use engine::game::combat::get_valid_block_targets_for_player;
+use engine::game::combat_damage::participates_in_pending_combat_damage_substep;
+use engine::game::effects::effect::generic_effect_application_filter;
+use engine::game::filter::{matches_target_filter, FilterContext};
+use engine::game::keywords::{object_has_effective_keyword_kind, source_matches_protection_target};
+use engine::game::static_abilities::prohibition_scope_matches_player_anchored;
+use engine::game::targeting::find_legal_targets;
+use engine::types::ability::TargetRef;
+use engine::types::keywords::{HexproofFilter, KeywordKind, ProtectionTarget};
+
+use crate::ability_chain::collect_chain_effects;
+use crate::eval::threat_level;
+use crate::features::landfall::ability_searches_library_for_land;
+use crate::features::mana_ramp::target_filter_references_land;
+use crate::policies::effect_classify::{
+    effect_polarity, extract_target_filter, lethal_to_creature, EffectPolarity,
+};
+use crate::policies::stack_awareness::{
+    damage_kills, is_creature_permanent_controlled_by, is_damage, is_harmful, judged_reaches,
+    node_damage, nodes_acting_on,
+};
+
+/// Threat-level threshold above which protection casts/activations are unblocked.
+pub(crate) const THREAT_FLOOR: f64 = 0.45;
+
+/// Returns true if any of four threat signals is present:
+///   - Stack contains an opponent-controlled object whose targets include
+///     the AI player or any AI-controlled permanent (CR 117.1a).
+///   - Stack contains an opponent-controlled untargeted mass-removal effect.
+///   - The AI's own life total is below 40% of starting life.
+///   - On the opponent's turn, some opponent's `threat_level` is at or above
+///     `THREAT_FLOOR` (board pressure that can attack this turn).
+pub(crate) fn any_immediate_threat(state: &GameState, ai_player: PlayerId) -> bool {
+    if any_stack_targets_ai_or_ai_permanent(state, ai_player) {
+        return true;
+    }
+    if any_stack_has_untargeted_mass_threat(state, ai_player) {
+        return true;
+    }
+    let starting_life = state.format_config.starting_life.max(1) as f64;
+    let life_ratio = state.players[ai_player.0 as usize].life as f64 / starting_life;
+    if life_ratio < 0.4 {
+        return true;
+    }
+    if state.active_player == ai_player {
+        return false;
+    }
+    state.players.iter().any(|p| {
+        if p.id == ai_player || p.is_eliminated {
+            return false;
+        }
+        threat_level(state, ai_player, p.id) >= THREAT_FLOOR
+    })
+}
+
+/// CR 508/509/510: protective grants have a real payoff during combat steps
+/// where creatures are attacking, blocking, or dealing damage.
+pub(crate) fn combat_step_allows_protection(state: &GameState) -> bool {
+    matches!(
+        state.phase,
+        Phase::DeclareAttackers | Phase::DeclareBlockers | Phase::CombatDamage
+    )
+}
+
+/// Effect-signature classifier: returns true when an `Effect` represents
+/// "save yourself / your permanents."
+pub(crate) fn is_self_protection_effect(effect: &Effect) -> bool {
+    match effect {
+        Effect::PhaseOut { target } => target_filter_self_scoped(target),
+        Effect::PreventDamage { .. } => true,
+        Effect::GenericEffect {
+            static_abilities,
+            target,
+            ..
+        } => static_abilities
+            .iter()
+            .any(|sd| static_definition_is_self_protection(sd, target.as_ref())),
+        _ => false,
+    }
+}
+
+/// True when any effect in the ability chain is a self-protection grant.
+pub(crate) fn ability_grants_self_protection(ability: &AbilityDefinition) -> bool {
+    collect_chain_effects(ability)
+        .iter()
+        .any(|effect| is_self_protection_effect(effect))
+}
+
+/// CR 701.21: activated ability sacrifices a land (not a fetchland) to grant
+/// self-protection — Sylvan Safekeeper and the whole "sacrifice a land: target
+/// creature you control gains shroud until end of turn" class (issue #771).
+pub(crate) fn is_land_sacrifice_self_protection_activation(ability: &AbilityDefinition) -> bool {
+    use engine::types::ability::CostCategory;
+
+    if !ability
+        .cost_categories()
+        .contains(&CostCategory::SacrificesPermanent)
+    {
+        return false;
+    }
+    if !cost_sacrifices_land(ability.cost.as_ref()) {
+        return false;
+    }
+    if ability_searches_library_for_land(ability) {
+        return false;
+    }
+    ability_grants_self_protection(ability)
+}
+
+fn static_definition_is_self_protection(
+    sd: &StaticDefinition,
+    parent_target: Option<&TargetFilter>,
+) -> bool {
+    let affects_self = match sd.affected.as_ref() {
+        Some(TargetFilter::ParentTarget) => parent_target.is_some_and(target_filter_self_scoped),
+        Some(f) => target_filter_self_scoped(f),
+        None => false,
+    };
+    if !affects_self {
+        return false;
+    }
+    if static_mode_is_defensive(&sd.mode) {
+        return true;
+    }
+    sd.modifications.iter().any(modification_is_defensive)
+}
+
+fn static_mode_is_defensive(mode: &StaticMode) -> bool {
+    matches!(
+        mode,
+        StaticMode::CantBeTargeted { .. }
+            | StaticMode::CantBeBlocked
+            | StaticMode::CantLoseLife
+            | StaticMode::Protection
+            | StaticMode::Shroud
+            | StaticMode::Hexproof
+    )
+}
+
+fn modification_is_defensive(m: &ContinuousModification) -> bool {
+    match m {
+        ContinuousModification::AddKeyword { keyword } => keyword_is_defensive(keyword),
+        ContinuousModification::AddStaticMode { mode } => static_mode_is_defensive(mode),
+        // CR 613.1f: Layer 6 applies ability-adding effects — inner static defs often
+        // omit `affected` because the granted payload applies to ~.
+        ContinuousModification::GrantAbility { definition } => {
+            ability_has_defensive_payload(definition)
+        }
+        _ => false,
+    }
+}
+
+fn static_definition_has_defensive_payload(sd: &StaticDefinition) -> bool {
+    if static_mode_is_defensive(&sd.mode) {
+        return true;
+    }
+    sd.modifications
+        .iter()
+        .any(modification_has_defensive_payload)
+}
+
+fn modification_has_defensive_payload(m: &ContinuousModification) -> bool {
+    match m {
+        ContinuousModification::AddKeyword { keyword } => keyword_is_defensive(keyword),
+        ContinuousModification::AddStaticMode { mode } => static_mode_is_defensive(mode),
+        ContinuousModification::GrantAbility { definition } => {
+            ability_has_defensive_payload(definition)
+        }
+        _ => false,
+    }
+}
+
+fn ability_has_defensive_payload(ability: &AbilityDefinition) -> bool {
+    collect_chain_effects(ability)
+        .iter()
+        .any(|effect| effect_has_defensive_payload(effect))
+}
+
+/// CR 702.11b + CR 702.12b + CR 702.16b + CR 702.18a: a hexproof, indestructible,
+/// protection or shroud grant stops removal from targeting or destroying what it affects,
+/// and CR 615.1a: a prevention effect stops damage. Also true for the other static modes
+/// `static_mode_is_defensive` lists and for a granted ability carrying such a payload.
+/// Read off the effect alone, whoever it
+/// affects — `is_self_protection_effect` adds the "does it protect the AI's own" scope that
+/// ReactiveSelfProtection's payoff needs.
+pub(crate) fn effect_has_defensive_payload(effect: &Effect) -> bool {
+    match effect {
+        Effect::PreventDamage { .. } => true,
+        Effect::GenericEffect {
+            static_abilities, ..
+        } => static_abilities
+            .iter()
+            .any(static_definition_has_defensive_payload),
+        _ => false,
+    }
+}
+
+fn keyword_is_defensive(keyword: &Keyword) -> bool {
+    matches!(
+        keyword,
+        Keyword::Indestructible
+            | Keyword::Hexproof
+            | Keyword::HexproofFrom(_)
+            | Keyword::Shroud
+            | Keyword::Protection(_)
+    )
+}
+
+pub(crate) fn target_filter_self_scoped(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Controller | TargetFilter::SelfRef => true,
+        TargetFilter::Typed(tf) => matches!(tf.controller, Some(ControllerRef::You)),
+        _ => false,
+    }
+}
+
+fn cost_sacrifices_land(cost: Option<&AbilityCost>) -> bool {
+    match cost {
+        None => false,
+        Some(AbilityCost::Sacrifice(sacrifice)) => target_filter_references_land(&sacrifice.target),
+        Some(AbilityCost::Composite { costs }) => {
+            costs.iter().any(|c| cost_sacrifices_land(Some(c)))
+        }
+        _ => false,
+    }
+}
+
+fn any_stack_has_untargeted_mass_threat(state: &GameState, ai_player: PlayerId) -> bool {
+    use engine::types::zones::Zone;
+    state.stack.iter().any(|entry| {
+        if entry.controller == ai_player {
+            return false;
+        }
+        let Some(ability) = entry.ability() else {
+            return false;
+        };
+        matches!(
+            &ability.effect,
+            Effect::DestroyAll { .. }
+                | Effect::DamageAll { .. }
+                | Effect::BounceAll { .. }
+                | Effect::ChangeZoneAll {
+                    destination: Zone::Exile | Zone::Graveyard | Zone::Hand,
+                    ..
+                }
+        )
+    })
+}
+
+fn any_stack_targets_ai_or_ai_permanent(state: &GameState, ai_player: PlayerId) -> bool {
+    use engine::types::ability::TargetRef;
+    state.stack.iter().any(|entry| {
+        if entry.controller == ai_player {
+            return false;
+        }
+        let Some(ability) = entry.ability() else {
+            return false;
+        };
+        ability.targets.iter().any(|t| match t {
+            TargetRef::Player(pid) => *pid == ai_player,
+            TargetRef::Object(obj_id) => state
+                .objects
+                .get(obj_id)
+                .is_some_and(|obj| obj.controller == ai_player),
+        })
+    })
+}
+
+/// Defensive quality an activation would grant — used to match stack threats the
+/// grant can actually answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DefensiveGrant {
+    /// CR 702.18a / CR 702.11b / CR 109.5: a restriction on being targeted by
+    /// the players `who` names, read relative to `anchor` (the player the grant
+    /// is for, whose "your opponents" it means; CR 102.3 makes that team-aware).
+    /// Shroud names every player; hexproof and Vines of Vastwood name only the
+    /// anchor's opponents, so a teammate's targeted effect is not answered.
+    CantBeTargeted {
+        who: ProhibitionScope,
+        anchor: PlayerId,
+    },
+    /// CR 702.11d: hexproof from a specific quality.
+    HexproofFrom(HexproofFilter),
+    /// CR 702.16: protection from a specific quality.
+    Protection(ProtectionTarget),
+    /// CR 702.12a: indestructible.
+    Indestructible,
+    /// CR 615.1a: Effects that use "prevent" are prevention effects.
+    PreventDamage,
+}
+
+fn extract_defensive_grants(ability: &AbilityDefinition, anchor: PlayerId) -> Vec<DefensiveGrant> {
+    let mut grants = Vec::new();
+    for effect in collect_chain_effects(ability) {
+        match effect {
+            Effect::PreventDamage { .. } => grants.push(DefensiveGrant::PreventDamage),
+            Effect::GenericEffect {
+                static_abilities,
+                target,
+                ..
+            } => {
+                for sd in static_abilities {
+                    if !static_definition_affects_self_grant(sd, target.as_ref()) {
+                        continue;
+                    }
+                    grants.extend(grant_from_static_mode(&sd.mode, anchor));
+                    for m in &sd.modifications {
+                        grants.extend(grants_from_modification(m, anchor));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    grants
+}
+
+fn static_definition_affects_self_grant(
+    sd: &StaticDefinition,
+    parent_target: Option<&TargetFilter>,
+) -> bool {
+    match sd.affected.as_ref() {
+        Some(TargetFilter::ParentTarget) => parent_target.is_some_and(target_filter_self_scoped),
+        Some(f) => target_filter_self_scoped(f),
+        None => false,
+    }
+}
+
+fn grant_from_static_mode(mode: &StaticMode, anchor: PlayerId) -> Vec<DefensiveGrant> {
+    match mode {
+        StaticMode::CantBeTargeted { who } => vec![DefensiveGrant::CantBeTargeted {
+            who: who.clone(),
+            anchor,
+        }],
+        StaticMode::Shroud => vec![shroud_grant(anchor)],
+        StaticMode::Hexproof => vec![hexproof_grant(anchor)],
+        StaticMode::Protection => Vec::new(),
+        _ => Vec::new(),
+    }
+}
+
+/// CR 702.18a: shroud means the object can't be the target of any spell or ability.
+fn shroud_grant(anchor: PlayerId) -> DefensiveGrant {
+    DefensiveGrant::CantBeTargeted {
+        who: ProhibitionScope::AllPlayers,
+        anchor,
+    }
+}
+
+/// CR 702.11b: hexproof means the object can't be the target of spells or
+/// abilities opponents control.
+fn hexproof_grant(anchor: PlayerId) -> DefensiveGrant {
+    DefensiveGrant::CantBeTargeted {
+        who: ProhibitionScope::Opponents,
+        anchor,
+    }
+}
+
+fn grants_from_modification(m: &ContinuousModification, anchor: PlayerId) -> Vec<DefensiveGrant> {
+    match m {
+        ContinuousModification::AddKeyword { keyword } => grant_from_keyword(keyword, anchor),
+        ContinuousModification::AddStaticMode { mode } => grant_from_static_mode(mode, anchor),
+        ContinuousModification::GrantAbility { definition } => {
+            extract_defensive_payload_grants(definition, anchor)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Extract defensive grants from a granted ability without re-requiring self-scope
+/// on inner static definitions (see `modification_is_defensive` GrantAbility arm).
+fn extract_defensive_payload_grants(
+    ability: &AbilityDefinition,
+    anchor: PlayerId,
+) -> Vec<DefensiveGrant> {
+    let mut grants = Vec::new();
+    for effect in collect_chain_effects(ability) {
+        match effect {
+            Effect::PreventDamage { .. } => grants.push(DefensiveGrant::PreventDamage),
+            Effect::GenericEffect {
+                static_abilities, ..
+            } => {
+                for sd in static_abilities {
+                    grants.extend(grant_from_static_mode(&sd.mode, anchor));
+                    for m in &sd.modifications {
+                        grants.extend(grants_from_modification(m, anchor));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    grants
+}
+
+fn grant_from_keyword(keyword: &Keyword, anchor: PlayerId) -> Vec<DefensiveGrant> {
+    match keyword {
+        Keyword::Shroud => vec![shroud_grant(anchor)],
+        Keyword::Hexproof => vec![hexproof_grant(anchor)],
+        Keyword::HexproofFrom(filter) => vec![DefensiveGrant::HexproofFrom(filter.clone())],
+        Keyword::Protection(pt) => vec![DefensiveGrant::Protection(pt.clone())],
+        Keyword::Indestructible => vec![DefensiveGrant::Indestructible],
+        _ => Vec::new(),
+    }
+}
+
+/// CR 702.18a / CR 702.11b: targeting immunity answers only harmful effects
+/// that select the protected permanent as a target — not player burn, beneficial
+/// buffs, or untargeted mass removal.
+fn any_stack_harmful_answerable_by_grants(
+    state: &GameState,
+    ai_player: PlayerId,
+    grants: &[DefensiveGrant],
+) -> bool {
+    if grants.is_empty() {
+        return false;
+    }
+    state.stack.iter().any(|entry| {
+        if entry.controller == ai_player {
+            return false;
+        }
+        // Only a harmful node is answered (`harmful_effect_answerable_by_grants`),
+        // so only the harmful nodes are read: an entry without one is skipped
+        // before its reach is built.
+        let harmful = judged_reaches(state, entry, is_harmful);
+        if harmful.is_empty() {
+            return false;
+        }
+        let declared_targets = entry
+            .ability()
+            .map(declared_targets_in_chain)
+            .unwrap_or_default();
+        harmful.iter().any(|reach| {
+            reach.acted_on.iter().any(|t| {
+                let TargetRef::Object(obj_id) = t else {
+                    return false;
+                };
+                let Some(obj) = state.objects.get(obj_id) else {
+                    return false;
+                };
+                // CR 109.2 + CR 400.7 + CR 702.26b: a grant reaches only a
+                // creature permanent the AI controls, not the card of one that
+                // left the battlefield or one that is phased out.
+                if !is_creature_permanent_controlled_by(obj, ai_player) {
+                    return false;
+                }
+                // Whether the stack's damage kills the creature: `None` when a
+                // damage node's amount is not fixed.
+                let lethal = nodes_acting_on(state, *obj_id, is_damage)
+                    .iter()
+                    .map(|other| node_damage(state, other.node, obj))
+                    .collect::<Option<Vec<_>>>()
+                    .map(|dealt| damage_kills(obj, &dealt, 0));
+                harmful_effect_answerable_by_grants(
+                    state,
+                    &reach.node.effect,
+                    grants,
+                    obj,
+                    entry,
+                    lethal,
+                    &declared_targets,
+                )
+            })
+        })
+    })
+}
+
+/// Whether a grant `protected` does not already have answers the harmful
+/// `effect`. A prevention grant answers damage unless `lethal` says the damage
+/// does not kill `protected`. `declared_targets` are the targets of the stack
+/// entry `effect` belongs to.
+/// Its caller passes only harmful nodes
+/// ([`judged_reaches`](crate::policies::stack_awareness::judged_reaches)); its
+/// own `is_harmful` check keeps that contract without relying on the caller.
+fn harmful_effect_answerable_by_grants(
+    state: &GameState,
+    effect: &Effect,
+    grants: &[DefensiveGrant],
+    protected: &engine::game::game_object::GameObject,
+    entry: &engine::types::game_state::StackEntry,
+    lethal: Option<bool>,
+    declared_targets: &[TargetRef],
+) -> bool {
+    if !is_harmful(effect) {
+        return false;
+    }
+    let source = state.objects.get(&entry.source_id);
+    let threat_controller = entry.controller;
+    grants
+        .iter()
+        .filter(|grant| {
+            !grant_already_effective(state, protected.id, grant, Some(threat_controller))
+        })
+        .filter(|grant| !matches!(grant, DefensiveGrant::PreventDamage) || lethal != Some(false))
+        .any(|grant| {
+            grant_answers_harmful_effect(
+                state,
+                grant,
+                effect,
+                protected,
+                source,
+                declared_targets,
+                threat_controller,
+            )
+        })
+}
+
+fn grant_answers_harmful_effect(
+    state: &GameState,
+    grant: &DefensiveGrant,
+    effect: &Effect,
+    protected: &engine::game::game_object::GameObject,
+    source: Option<&engine::game::game_object::GameObject>,
+    declared_targets: &[TargetRef],
+    threat_controller: PlayerId,
+) -> bool {
+    let targeted = effect_targets(effect, protected.id, declared_targets);
+    match grant {
+        DefensiveGrant::CantBeTargeted { who, anchor } => {
+            targeted
+                && cant_be_targeted_covers_threat(state, who, *anchor, protected, threat_controller)
+        }
+        DefensiveGrant::HexproofFrom(filter) => {
+            targeted
+                && source.is_some_and(|src| hexproof_from_blocks_source(filter, protected, src))
+        }
+        DefensiveGrant::Protection(pt) => {
+            source.is_some_and(|src| source_matches_protection_target(pt, protected, src))
+                && protection_stops(effect, targeted)
+        }
+        DefensiveGrant::Indestructible => matches!(effect, Effect::Destroy { .. }),
+        DefensiveGrant::PreventDamage => matches!(effect, Effect::DealDamage { .. }),
+    }
+}
+
+/// CR 109.5 + CR 102.3: whether a `CantBeTargeted` grant (`who`, read from
+/// `anchor`) prohibits `threat_controller` from targeting `protected`, decided by
+/// the engine's scope authority so a teammate in a team game is not an opponent.
+fn cant_be_targeted_covers_threat(
+    state: &GameState,
+    who: &ProhibitionScope,
+    anchor: PlayerId,
+    protected: &engine::game::game_object::GameObject,
+    threat_controller: PlayerId,
+) -> bool {
+    prohibition_scope_matches_player_anchored(who, threat_controller, protected, anchor, state)
+}
+
+/// CR 115.10a: an object the effect acts on is a target only if the entry
+/// declared it as one.
+fn effect_targets(effect: &Effect, object: ObjectId, declared_targets: &[TargetRef]) -> bool {
+    declared_targets.contains(&TargetRef::Object(object))
+        && harmful_effect_uses_object_targeting(effect)
+}
+
+/// True for a targeted effect (CR 702.16b) and for a `DealDamage` its own source deals, targeted or not (CR 702.16e).
+fn protection_stops(effect: &Effect, targeted: bool) -> bool {
+    targeted
+        || matches!(
+            effect,
+            Effect::DealDamage {
+                damage_source: None,
+                ..
+            }
+        )
+}
+
+/// Whether `effect` has a target filter that is not `Player`. A filter does
+/// not make an object a target: `SelfRef` and event references pass.
+fn harmful_effect_uses_object_targeting(effect: &Effect) -> bool {
+    !matches!(extract_target_filter(effect), Some(TargetFilter::Player))
+        && extract_target_filter(effect).is_some()
+}
+
+fn hexproof_from_blocks_source(
+    filter: &HexproofFilter,
+    protected: &engine::game::game_object::GameObject,
+    source: &engine::game::game_object::GameObject,
+) -> bool {
+    use engine::game::keywords::{source_matches_card_type, source_matches_quality};
+
+    match filter {
+        HexproofFilter::Color(color) => source.color.contains(color),
+        HexproofFilter::CardType(type_name) => source_matches_card_type(source, type_name),
+        HexproofFilter::Quality(quality) => source_matches_quality(source, quality),
+        HexproofFilter::ChosenColor => protected
+            .chosen_color()
+            .is_some_and(|color| source.color.contains(&color)),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DefensiveOpportunity {
+    grant: DefensiveGrant,
+    recipients: Vec<ObjectId>,
+}
+
+/// Exact, effect-specific payoff for an object-scoped defensive grant.
+///
+/// `None` is deliberate: the classifier cannot prove the recipient or outcome,
+/// so callers must preserve the existing fail-open behavior. This keeps player
+/// protection, conditional grants, and other unsupported shapes playable while
+/// allowing exact gating for the self-indestructible/shroud/hexproof/protection
+/// family.
+pub(crate) fn self_protection_effect_payoff(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    effect: &Effect,
+) -> Option<bool> {
+    let opportunities = defensive_opportunities(state, ai_player, source_id, effect)?;
+    let mut ambiguous = false;
+
+    for opportunity in &opportunities {
+        match stack_payoff_for_opportunity(state, ai_player, opportunity) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => ambiguous = true,
+        }
+        match combat_payoff_for_opportunity(state, opportunity) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => ambiguous = true,
+        }
+    }
+
+    if ambiguous {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// Exact activation payoff when every effect in the linear primary/sub-ability
+/// chain is a supported object-scoped self-protection effect. Alternate and
+/// unsupported branches fail open because the activation candidate has not yet
+/// selected which branch will resolve.
+pub(crate) fn self_protection_activation_payoff(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    ability: &AbilityDefinition,
+) -> Option<bool> {
+    let mut node = Some(ability);
+    while let Some(current) = node {
+        if current.else_ability.is_some()
+            || current.modal.is_some()
+            || !current.mode_abilities.is_empty()
+        {
+            return None;
+        }
+        node = current.sub_ability.as_deref();
+    }
+
+    let effects = collect_chain_effects(ability);
+    if effects.is_empty()
+        || effects
+            .iter()
+            .any(|effect| !is_self_protection_effect(effect))
+    {
+        return None;
+    }
+
+    let mut ambiguous = false;
+    for effect in effects {
+        match self_protection_effect_payoff(state, ai_player, source_id, effect) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => ambiguous = true,
+        }
+    }
+    if ambiguous {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+fn defensive_opportunities(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    effect: &Effect,
+) -> Option<Vec<DefensiveOpportunity>> {
+    let Effect::GenericEffect {
+        static_abilities,
+        target,
+        ..
+    } = effect
+    else {
+        return None;
+    };
+    if static_abilities.is_empty() {
+        return None;
+    }
+
+    let mut opportunities = Vec::new();
+    for static_def in static_abilities {
+        if static_def.condition.is_some() || static_def.per_player_condition.is_some() {
+            return None;
+        }
+        if !static_definition_is_self_protection(static_def, target.as_ref()) {
+            return None;
+        }
+        if !matches!(
+            &static_def.mode,
+            StaticMode::Continuous
+                | StaticMode::CantBeTargeted { .. }
+                | StaticMode::Shroud
+                | StaticMode::Hexproof
+        ) && static_mode_is_defensive(&static_def.mode)
+        {
+            return None;
+        }
+        if static_def
+            .modifications
+            .iter()
+            .any(|modification| !modification_is_defensive(modification))
+        {
+            return None;
+        }
+
+        let recipients = generic_effect_object_recipients(
+            state,
+            ai_player,
+            source_id,
+            target.as_ref(),
+            static_def.affected.as_ref(),
+        )?;
+        let mut grants = grant_from_static_mode(&static_def.mode, ai_player);
+        for modification in &static_def.modifications {
+            grants.extend(grants_from_modification(modification, ai_player));
+        }
+        if grants.is_empty() {
+            return None;
+        }
+        opportunities.extend(grants.into_iter().map(|grant| DefensiveOpportunity {
+            grant,
+            recipients: recipients.clone(),
+        }));
+    }
+    Some(opportunities)
+}
+
+fn generic_effect_object_recipients(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    target: Option<&TargetFilter>,
+    affected: Option<&TargetFilter>,
+) -> Option<Vec<ObjectId>> {
+    let application = generic_effect_application_filter(target, affected)?;
+
+    if let Some(selection) = target.filter(|filter| !filter.is_context_ref()) {
+        let legal = find_legal_targets(state, selection, ai_player, source_id);
+        if legal
+            .iter()
+            .any(|target| matches!(target, TargetRef::Player(_)))
+        {
+            return None;
+        }
+        return Some(
+            legal
+                .into_iter()
+                .filter_map(|target| match target {
+                    TargetRef::Object(id) => Some(id),
+                    TargetRef::Player(_) => None,
+                })
+                .collect(),
+        );
+    }
+
+    match application {
+        TargetFilter::SelfRef => Some(vec![source_id]),
+        TargetFilter::SpecificObject { id } => Some(vec![*id]),
+        TargetFilter::Typed(typed)
+            if typed.controller.as_ref() == Some(&ControllerRef::You)
+                && (!typed.type_filters.is_empty() || !typed.properties.is_empty()) =>
+        {
+            let ctx = FilterContext::from_source_with_controller(source_id, ai_player);
+            Some(
+                state
+                    .battlefield
+                    .iter()
+                    .copied()
+                    .filter(|id| matches_target_filter(state, *id, application, &ctx))
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn stack_payoff_for_opportunity(
+    state: &GameState,
+    ai_player: PlayerId,
+    opportunity: &DefensiveOpportunity,
+) -> Option<bool> {
+    let mut ambiguous = false;
+    for entry in &state.stack {
+        if entry.controller == ai_player {
+            continue;
+        }
+        let Some(root) = entry.ability() else {
+            continue;
+        };
+        let declared_targets = declared_targets_in_chain(root);
+        let source = state.objects.get(&entry.source_id);
+        let mut node = Some(root);
+        while let Some(ability) = node {
+            if ability.condition.is_some() || ability.else_ability.is_some() {
+                ambiguous = true;
+            } else {
+                for target in &ability.targets {
+                    let TargetRef::Object(recipient_id) = target else {
+                        continue;
+                    };
+                    if !opportunity.recipients.contains(recipient_id)
+                        || grant_already_effective(
+                            state,
+                            *recipient_id,
+                            &opportunity.grant,
+                            Some(entry.controller),
+                        )
+                    {
+                        continue;
+                    }
+                    match grant_answers_targeted_effect(
+                        state,
+                        &opportunity.grant,
+                        &ability.effect,
+                        *recipient_id,
+                        source,
+                        &declared_targets,
+                        entry.controller,
+                    ) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => ambiguous = true,
+                    }
+                }
+
+                if let Some(filter) = harmful_mass_filter(&ability.effect) {
+                    let ctx = FilterContext::from_source_with_controller(
+                        entry.source_id,
+                        entry.controller,
+                    );
+                    for recipient_id in &opportunity.recipients {
+                        if grant_already_effective(
+                            state,
+                            *recipient_id,
+                            &opportunity.grant,
+                            Some(entry.controller),
+                        ) || !matches_target_filter(state, *recipient_id, filter, &ctx)
+                        {
+                            continue;
+                        }
+                        match grant_answers_mass_effect(
+                            state,
+                            &opportunity.grant,
+                            &ability.effect,
+                            *recipient_id,
+                            source,
+                        ) {
+                            Some(true) => return Some(true),
+                            Some(false) => {}
+                            None => ambiguous = true,
+                        }
+                    }
+                }
+            }
+            node = ability.sub_ability.as_deref();
+        }
+    }
+    if ambiguous {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+fn grant_answers_targeted_effect(
+    state: &GameState,
+    grant: &DefensiveGrant,
+    effect: &Effect,
+    recipient_id: ObjectId,
+    source: Option<&engine::game::game_object::GameObject>,
+    declared_targets: &[TargetRef],
+    threat_controller: PlayerId,
+) -> Option<bool> {
+    if matches!(
+        effect,
+        Effect::Fight { .. }
+            | Effect::EachDealsDamageEqualToPower { .. }
+            | Effect::EachSourceDealsDamage { .. }
+    ) {
+        return None;
+    }
+    let protected = state.objects.get(&recipient_id)?;
+    match effect_polarity(effect) {
+        EffectPolarity::Beneficial => return Some(false),
+        EffectPolarity::Contextual => {
+            let source = source?;
+            // CR 303.4a + CR 702.18a: an Aura spell targets, so shroud (and
+            // matching hexproof/protection) can make its announced target illegal.
+            if !source
+                .card_types
+                .subtypes
+                .iter()
+                .any(|subtype| subtype == "Aura")
+            {
+                return None;
+            }
+            let aimed = declared_targets.contains(&TargetRef::Object(recipient_id));
+            return match grant {
+                DefensiveGrant::CantBeTargeted { who, anchor } => Some(
+                    aimed
+                        && cant_be_targeted_covers_threat(
+                            state,
+                            who,
+                            *anchor,
+                            protected,
+                            threat_controller,
+                        ),
+                ),
+                DefensiveGrant::HexproofFrom(filter) => {
+                    Some(aimed && hexproof_from_blocks_source(filter, protected, source))
+                }
+                DefensiveGrant::Protection(protection) => {
+                    Some(aimed && source_matches_protection_target(protection, protected, source))
+                }
+                DefensiveGrant::Indestructible | DefensiveGrant::PreventDamage => None,
+            };
+        }
+        EffectPolarity::Harmful => {}
+    }
+    let targeted = effect_targets(effect, recipient_id, declared_targets);
+    match grant {
+        DefensiveGrant::CantBeTargeted { who, anchor } => Some(
+            targeted
+                && cant_be_targeted_covers_threat(
+                    state,
+                    who,
+                    *anchor,
+                    protected,
+                    threat_controller,
+                ),
+        ),
+        DefensiveGrant::HexproofFrom(filter) => Some(
+            targeted
+                && source
+                    .is_some_and(|source| hexproof_from_blocks_source(filter, protected, source)),
+        ),
+        DefensiveGrant::Protection(protection) => {
+            let answer = protection_stops(effect, targeted)
+                && source.is_some_and(|source| {
+                    source_matches_protection_target(protection, protected, source)
+                });
+            if answer {
+                Some(true)
+            } else if matches!(
+                effect,
+                Effect::DealDamage {
+                    damage_source: Some(_),
+                    ..
+                }
+            ) {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        DefensiveGrant::Indestructible => match effect {
+            Effect::Destroy { .. } => Some(true),
+            Effect::DealDamage {
+                damage_source: Some(_),
+                ..
+            } => None,
+            Effect::DealDamage { .. } => {
+                if damage_becomes_marked(state, source) == Some(false) {
+                    return if source_has_effective_deathtouch(state, source) {
+                        None
+                    } else {
+                        Some(false)
+                    };
+                }
+                match lethal_to_creature(state, recipient_id, &[effect]) {
+                    Some(true) if damage_becomes_marked(state, source) == Some(true) => Some(true),
+                    Some(true) | Some(false) | None => None,
+                }
+            }
+            _ => Some(false),
+        },
+        DefensiveGrant::PreventDamage => None,
+    }
+}
+
+/// CR 702.2b + CR 704.5h: damage from a deathtouch source destroys a
+/// positive-toughness creature as an SBA, which indestructible can prevent.
+pub(super) fn source_has_effective_deathtouch(
+    state: &GameState,
+    source: Option<&engine::game::game_object::GameObject>,
+) -> bool {
+    source.is_some_and(|source| {
+        object_has_effective_keyword_kind(state, source.id, KeywordKind::Deathtouch)
+    })
+}
+
+fn damage_may_make_indestructible_relevant(
+    state: &GameState,
+    source: Option<&engine::game::game_object::GameObject>,
+) -> bool {
+    damage_becomes_marked(state, source) != Some(false)
+        || source_has_effective_deathtouch(state, source)
+}
+
+/// Whether damage from this source uses ordinary marked-damage semantics.
+///
+/// CR 120.3d-e: wither/infect damage to creatures becomes -1/-1 counters;
+/// other creature damage is marked. CR 702.12b does not let indestructible
+/// prevent a creature from dying for having toughness 0 or less.
+pub(super) fn damage_becomes_marked(
+    state: &GameState,
+    source: Option<&engine::game::game_object::GameObject>,
+) -> Option<bool> {
+    let source = source?;
+    Some(
+        !object_has_effective_keyword_kind(state, source.id, KeywordKind::Wither)
+            && !object_has_effective_keyword_kind(state, source.id, KeywordKind::Infect),
+    )
+}
+
+fn harmful_mass_filter(effect: &Effect) -> Option<&TargetFilter> {
+    use engine::types::zones::Zone;
+    match effect {
+        Effect::DestroyAll { target, .. }
+        | Effect::DamageAll { target, .. }
+        | Effect::BounceAll { target, .. } => Some(target),
+        Effect::ChangeZoneAll {
+            destination: Zone::Exile | Zone::Graveyard | Zone::Hand,
+            target,
+            ..
+        } => Some(target),
+        _ => None,
+    }
+}
+
+fn grant_answers_mass_effect(
+    state: &GameState,
+    grant: &DefensiveGrant,
+    effect: &Effect,
+    recipient_id: ObjectId,
+    source: Option<&engine::game::game_object::GameObject>,
+) -> Option<bool> {
+    let protected = state.objects.get(&recipient_id)?;
+    match (grant, effect) {
+        (DefensiveGrant::Indestructible, Effect::DestroyAll { .. }) => Some(true),
+        (
+            DefensiveGrant::Indestructible,
+            Effect::DamageAll {
+                damage_source: Some(_),
+                ..
+            },
+        ) => None,
+        (DefensiveGrant::Indestructible, Effect::DamageAll { .. }) => {
+            if damage_becomes_marked(state, source) == Some(false) {
+                return if source_has_effective_deathtouch(state, source) {
+                    None
+                } else {
+                    Some(false)
+                };
+            }
+            match lethal_to_creature(state, recipient_id, &[effect]) {
+                Some(true) if damage_becomes_marked(state, source) == Some(true) => Some(true),
+                Some(true) | Some(false) | None => None,
+            }
+        }
+        (
+            DefensiveGrant::Protection(_),
+            Effect::DamageAll {
+                damage_source: Some(_),
+                ..
+            },
+        ) => None,
+        (DefensiveGrant::Protection(protection), Effect::DamageAll { .. }) => {
+            source.map(|source| source_matches_protection_target(protection, protected, source))
+        }
+        (DefensiveGrant::PreventDamage, Effect::DamageAll { .. }) => None,
+        _ => Some(false),
+    }
+}
+
+/// Whether `recipient_id` already has `grant`'s protection against the threat.
+///
+/// `threat_controller` is the controller of the stack object (or other source)
+/// that threatens the recipient. A scoped `StaticMode::CantBeTargeted` (Vines
+/// of Vastwood: "your opponents" anchored to the granting controller, CR 109.5)
+/// protects only against the controllers it actually names, so it counts as
+/// already-effective only when the engine's targeting authority says it
+/// prohibits `threat_controller`. With no known threat controller the check
+/// fails open (not protected). Shroud and hexproof keywords are unchanged.
+fn grant_already_effective(
+    state: &GameState,
+    recipient_id: ObjectId,
+    grant: &DefensiveGrant,
+    threat_controller: Option<PlayerId>,
+) -> bool {
+    let Some(object) = state.objects.get(&recipient_id) else {
+        return false;
+    };
+    match grant {
+        DefensiveGrant::CantBeTargeted { .. } => {
+            object.has_keyword(&Keyword::Shroud)
+                || object.has_keyword(&Keyword::Hexproof)
+                || restriction_blocks_threat(state, object, threat_controller)
+        }
+        DefensiveGrant::HexproofFrom(filter) => {
+            object.has_keyword(&Keyword::Shroud)
+                || object.has_keyword(&Keyword::Hexproof)
+                || object
+                    .keywords
+                    .contains(&Keyword::HexproofFrom(filter.clone()))
+                || restriction_blocks_threat(state, object, threat_controller)
+        }
+        DefensiveGrant::Protection(protection) => object.keywords.iter().any(|keyword| {
+            matches!(
+                keyword,
+                Keyword::Protection(existing)
+                    if existing == protection || *existing == ProtectionTarget::Everything
+            )
+        }),
+        DefensiveGrant::Indestructible => object.has_keyword(&Keyword::Indestructible),
+        DefensiveGrant::PreventDamage => false,
+    }
+}
+
+/// CR 702.18a + CR 109.5: whether a `CantBeTargeted` restriction on `object`
+/// prohibits targeting by `threat_controller`, decided by the engine's targeting
+/// authority. Fails open when the threat's controller is unknown.
+fn restriction_blocks_threat(
+    state: &GameState,
+    object: &engine::game::game_object::GameObject,
+    threat_controller: Option<PlayerId>,
+) -> bool {
+    threat_controller.is_some_and(|controller| {
+        engine::game::targeting::own_cant_be_targeted_prohibits(object, controller, state)
+    })
+}
+
+fn combat_pair_ids(
+    combat: &engine::game::combat::CombatState,
+    recipient_id: ObjectId,
+) -> Vec<ObjectId> {
+    combat
+        .blocker_assignments
+        .get(&recipient_id)
+        .into_iter()
+        .flatten()
+        .chain(
+            combat
+                .blocker_to_attacker
+                .get(&recipient_id)
+                .into_iter()
+                .flatten(),
+        )
+        .copied()
+        .collect()
+}
+
+fn combat_payoff_for_opportunity(
+    state: &GameState,
+    opportunity: &DefensiveOpportunity,
+) -> Option<bool> {
+    let Some(combat) = state.combat.as_ref() else {
+        return Some(false);
+    };
+    match state.phase {
+        // CR 509.1a-b: before blockers are declared, protection can remove a
+        // genuinely legal blocker from the defending player's choices.
+        Phase::DeclareAttackers => {
+            let DefensiveGrant::Protection(protection) = &opportunity.grant else {
+                return Some(false);
+            };
+            for recipient_id in &opportunity.recipients {
+                if grant_already_effective(state, *recipient_id, &opportunity.grant, None) {
+                    continue;
+                }
+                let Some(attacker) = combat
+                    .attackers
+                    .iter()
+                    .find(|attacker| attacker.object_id == *recipient_id)
+                else {
+                    continue;
+                };
+                let blockers = get_valid_block_targets_for_player(state, attacker.defending_player);
+                for (blocker_id, targets) in blockers {
+                    if !targets.contains(recipient_id) {
+                        continue;
+                    }
+                    let Some(protected) = state.objects.get(recipient_id) else {
+                        continue;
+                    };
+                    if state.objects.get(&blocker_id).is_some_and(|blocker| {
+                        source_matches_protection_target(protection, protected, blocker)
+                    }) {
+                        return Some(true);
+                    }
+                }
+            }
+            Some(false)
+        }
+        // CR 509.1g + CR 510.1: after declaration, only actual attacker/blocker
+        // pairs can create a combat payoff. Indestructible lethality is not
+        // derivable from pairing alone, so that case deliberately fails open.
+        Phase::DeclareBlockers => {
+            let mut saw_indestructible_pair = false;
+            for recipient_id in &opportunity.recipients {
+                if grant_already_effective(state, *recipient_id, &opportunity.grant, None) {
+                    continue;
+                }
+                let paired_ids = combat_pair_ids(combat, *recipient_id);
+                if paired_ids.is_empty() {
+                    continue;
+                }
+                match &opportunity.grant {
+                    DefensiveGrant::Protection(protection) => {
+                        let Some(protected) = state.objects.get(recipient_id) else {
+                            continue;
+                        };
+                        if paired_ids.iter().any(|paired_id| {
+                            state.objects.get(paired_id).is_some_and(|paired| {
+                                source_matches_protection_target(protection, protected, paired)
+                            })
+                        }) {
+                            return Some(true);
+                        }
+                    }
+                    DefensiveGrant::Indestructible => {
+                        saw_indestructible_pair |= paired_ids.iter().any(|paired_id| {
+                            damage_may_make_indestructible_relevant(
+                                state,
+                                state.objects.get(paired_id),
+                            )
+                        });
+                    }
+                    DefensiveGrant::CantBeTargeted { .. }
+                    | DefensiveGrant::HexproofFrom(_)
+                    | DefensiveGrant::PreventDamage => {}
+                }
+            }
+            if saw_indestructible_pair {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        // CR 510.4: before regular damage completes, first/double-strike
+        // participation is source-specific. Fail open only for a protected
+        // combatant whose grant could matter against an actual paired source.
+        Phase::CombatDamage if !combat.regular_damage_done => {
+            let mut ambiguous = false;
+            for recipient_id in &opportunity.recipients {
+                if grant_already_effective(state, *recipient_id, &opportunity.grant, None) {
+                    continue;
+                }
+                let paired_ids: Vec<_> = combat_pair_ids(combat, *recipient_id)
+                    .into_iter()
+                    .filter(|paired_id| {
+                        participates_in_pending_combat_damage_substep(state, *paired_id)
+                    })
+                    .collect();
+                if paired_ids.is_empty() {
+                    continue;
+                }
+                match &opportunity.grant {
+                    DefensiveGrant::Protection(protection) => {
+                        let Some(protected) = state.objects.get(recipient_id) else {
+                            continue;
+                        };
+                        if paired_ids.iter().any(|paired_id| {
+                            state.objects.get(paired_id).is_some_and(|paired| {
+                                source_matches_protection_target(protection, protected, paired)
+                            })
+                        }) {
+                            return Some(true);
+                        }
+                    }
+                    DefensiveGrant::Indestructible => {
+                        ambiguous |= paired_ids.iter().any(|paired_id| {
+                            damage_may_make_indestructible_relevant(
+                                state,
+                                state.objects.get(paired_id),
+                            )
+                        });
+                    }
+                    DefensiveGrant::PreventDamage => ambiguous = true,
+                    DefensiveGrant::CantBeTargeted { .. } | DefensiveGrant::HexproofFrom(_) => {}
+                }
+            }
+            if ambiguous {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        Phase::CombatDamage => Some(false),
+        _ => Some(false),
+    }
+}
+
+/// Whether a land-sacrifice self-protection activation has a concrete payoff
+/// right now. Requires a harmful stack effect answerable by the actual grant;
+/// protection also has combat-step payoff (CR 509.1b color dodge). Deliberately
+/// excludes low life, board pressure, and untargeted mass effects — sacrificing
+/// a land to shroud one creature does not answer those threats.
+pub(crate) fn any_land_sacrifice_protection_payoff(
+    state: &GameState,
+    ai_player: PlayerId,
+    ability: &AbilityDefinition,
+) -> bool {
+    let grants = extract_defensive_grants(ability, ai_player);
+    if any_stack_harmful_answerable_by_grants(state, ai_player, &grants) {
+        return true;
+    }
+    if ability_grants_combat_step_protection(ability) && combat_step_allows_protection(state) {
+        return true;
+    }
+    false
+}
+
+/// Protection-from-color grants can matter during combat (dodge a blocker).
+fn ability_grants_combat_step_protection(ability: &AbilityDefinition) -> bool {
+    collect_chain_effects(ability)
+        .iter()
+        .any(|effect| match effect {
+            Effect::GenericEffect {
+                static_abilities,
+                target,
+                ..
+            } => static_abilities.iter().any(|sd| {
+                let affects_self = match sd.affected.as_ref() {
+                    Some(TargetFilter::ParentTarget) => {
+                        target.as_ref().is_some_and(target_filter_self_scoped)
+                    }
+                    Some(f) => target_filter_self_scoped(f),
+                    None => false,
+                };
+                affects_self
+                    && sd.modifications.iter().any(|m| {
+                        matches!(
+                            m,
+                            ContinuousModification::AddKeyword {
+                                keyword: Keyword::Protection(_)
+                            }
+                        )
+                    })
+            }),
+            _ => false,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine::types::ability::{AbilityKind, ControllerRef, TypedFilter};
+    use engine::types::card_type::CoreType;
+    use engine::types::keywords::ProtectionTarget;
+
+    fn grant_effect(
+        affected: Option<TargetFilter>,
+        target: Option<TargetFilter>,
+        keyword: Keyword,
+    ) -> Effect {
+        use engine::types::ability::StaticDefinition;
+        Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(affected.unwrap_or(TargetFilter::ParentTarget))
+                .modifications(vec![ContinuousModification::AddKeyword { keyword }])],
+            target,
+            duration: None,
+            end_cost: None,
+        }
+    }
+
+    #[test]
+    fn classifier_recognises_parent_target_shroud_grant() {
+        assert!(is_self_protection_effect(&grant_effect(
+            Some(TargetFilter::ParentTarget),
+            Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::You)
+            )),
+            Keyword::Shroud,
+        )));
+    }
+
+    #[test]
+    fn classifier_recognises_static_mode_shroud() {
+        use engine::types::ability::StaticDefinition;
+        let effect = Effect::GenericEffect {
+            static_abilities: vec![
+                StaticDefinition::new(StaticMode::Shroud).affected(TargetFilter::ParentTarget)
+            ],
+            target: Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::You),
+            )),
+            duration: None,
+            end_cost: None,
+        };
+        assert!(is_self_protection_effect(&effect));
+    }
+
+    #[test]
+    fn classifier_recognises_grant_ability_wrapped_shroud() {
+        use engine::types::ability::{AbilityDefinition, StaticDefinition};
+        let inner = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::GenericEffect {
+                static_abilities: vec![StaticDefinition::continuous().modifications(vec![
+                    ContinuousModification::AddKeyword {
+                        keyword: Keyword::Shroud,
+                    },
+                ])],
+                target: None,
+                duration: None,
+                end_cost: None,
+            },
+        );
+        let effect = Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(TargetFilter::ParentTarget)
+                .modifications(vec![ContinuousModification::GrantAbility {
+                    definition: Box::new(inner),
+                }])],
+            target: Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::You),
+            )),
+            duration: None,
+            end_cost: None,
+        };
+        assert!(is_self_protection_effect(&effect));
+    }
+
+    #[test]
+    fn land_sacrifice_classifier_matches_safekeeper_shape() {
+        use engine::types::ability::{SacrificeCost, SacrificeRequirement};
+        let mut ability = AbilityDefinition::new(
+            AbilityKind::Activated,
+            grant_effect(
+                Some(TargetFilter::ParentTarget),
+                Some(TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::You),
+                )),
+                Keyword::Shroud,
+            ),
+        );
+        ability.cost = Some(AbilityCost::Sacrifice(SacrificeCost {
+            target: TargetFilter::Typed(TypedFilter::new(engine::types::ability::TypeFilter::Land)),
+            requirement: SacrificeRequirement::count(1),
+        }));
+        assert!(is_land_sacrifice_self_protection_activation(&ability));
+    }
+
+    #[test]
+    fn land_sacrifice_classifier_rejects_fetchland() {
+        use engine::types::ability::{
+            ControllerRef, QuantityExpr, SacrificeCost, SearchSelectionConstraint,
+        };
+        use engine::types::zones::Zone;
+        let search = Effect::SearchLibrary {
+            filter: TargetFilter::Typed(TypedFilter::land()),
+            count: QuantityExpr::Fixed { value: 1 },
+            reveal: false,
+            target_player: None,
+            selection_constraint: SearchSelectionConstraint::None,
+            split: None,
+            source_zones: vec![Zone::Library],
+        };
+        let put_in_play = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::ChangeZone {
+                actor: engine::types::ability::LibraryInstructionActor::Controller,
+                library_shuffle: Default::default(),
+                origin: Some(Zone::Library),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Typed(TypedFilter::land()),
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: Some(ControllerRef::You),
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+        );
+        let mut ability = AbilityDefinition::new(AbilityKind::Activated, search);
+        ability.cost = Some(AbilityCost::Sacrifice(SacrificeCost::count(
+            TargetFilter::SelfRef,
+            1,
+        )));
+        ability.sub_ability = Some(Box::new(put_in_play));
+        assert!(!is_land_sacrifice_self_protection_activation(&ability));
+    }
+
+    #[test]
+    fn protection_keyword_grant_is_self_scoped() {
+        assert!(is_self_protection_effect(&grant_effect(
+            Some(TargetFilter::ParentTarget),
+            Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::You)
+            )),
+            Keyword::Protection(ProtectionTarget::ChosenColor),
+        )));
+    }
+
+    #[test]
+    fn shroud_payoff_requires_harmful_creature_target_not_player_burn() {
+        use engine::types::ability::{
+            ResolvedAbility, SacrificeCost, SacrificeRequirement, TargetRef, TypeFilter,
+        };
+        use engine::types::game_state::{StackEntry, StackEntryKind};
+        use engine::types::identifiers::{CardId, ObjectId};
+
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let opp = PlayerId(1);
+        state.players[ai.0 as usize].life = 5;
+
+        let safekeeper = AbilityDefinition::new(
+            AbilityKind::Activated,
+            grant_effect(
+                Some(TargetFilter::ParentTarget),
+                Some(TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::You),
+                )),
+                Keyword::Shroud,
+            ),
+        );
+        let mut safekeeper = safekeeper;
+        safekeeper.cost = Some(AbilityCost::Sacrifice(SacrificeCost {
+            target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)),
+            requirement: SacrificeRequirement::count(1),
+        }));
+
+        let spell_id = ObjectId(99);
+        let ability = ResolvedAbility::new(
+            Effect::DealDamage {
+                amount: engine::types::ability::QuantityExpr::Fixed { value: 3 },
+                target: TargetFilter::Player,
+                damage_source: None,
+                excess: None,
+            },
+            vec![TargetRef::Player(ai)],
+            spell_id,
+            opp,
+        );
+        state.stack.push_back(StackEntry {
+            id: spell_id,
+            source_id: spell_id,
+            controller: opp,
+            kind: StackEntryKind::Spell {
+                card_id: CardId(99),
+                ability: Some(Box::new(ability)),
+                casting_variant: Default::default(),
+                actual_mana_spent: 0,
+            },
+        });
+
+        assert!(!any_land_sacrifice_protection_payoff(
+            &state,
+            ai,
+            &safekeeper
+        ));
+    }
+
+    #[test]
+    fn shroud_payoff_rejects_beneficial_pump_on_ai_creature() {
+        use engine::types::ability::{
+            PtValue, ResolvedAbility, SacrificeCost, SacrificeRequirement, TargetRef, TypeFilter,
+        };
+        use engine::types::game_state::{StackEntry, StackEntryKind};
+        use engine::types::identifiers::{CardId, ObjectId};
+
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let opp = PlayerId(1);
+
+        let safekeeper = {
+            let mut ability = AbilityDefinition::new(
+                AbilityKind::Activated,
+                grant_effect(
+                    Some(TargetFilter::ParentTarget),
+                    Some(TargetFilter::Typed(
+                        TypedFilter::default().controller(ControllerRef::You),
+                    )),
+                    Keyword::Shroud,
+                ),
+            );
+            ability.cost = Some(AbilityCost::Sacrifice(SacrificeCost {
+                target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)),
+                requirement: SacrificeRequirement::count(1),
+            }));
+            ability
+        };
+
+        let creature = create_test_creature(&mut state, ai);
+        let spell_id = ObjectId(99);
+        let ability = ResolvedAbility::new(
+            Effect::Pump {
+                power: PtValue::Fixed(3),
+                toughness: PtValue::Fixed(3),
+                target: TargetFilter::Any,
+            },
+            vec![TargetRef::Object(creature)],
+            spell_id,
+            opp,
+        );
+        state.stack.push_back(StackEntry {
+            id: spell_id,
+            source_id: spell_id,
+            controller: opp,
+            kind: StackEntryKind::Spell {
+                card_id: CardId(99),
+                ability: Some(Box::new(ability)),
+                casting_variant: Default::default(),
+                actual_mana_spent: 0,
+            },
+        });
+
+        assert!(!any_land_sacrifice_protection_payoff(
+            &state,
+            ai,
+            &safekeeper
+        ));
+    }
+
+    #[test]
+    fn shroud_payoff_allows_harmful_removal_on_ai_creature() {
+        use engine::types::ability::{
+            ResolvedAbility, SacrificeCost, SacrificeRequirement, TargetRef, TypeFilter,
+        };
+        use engine::types::game_state::{StackEntry, StackEntryKind};
+        use engine::types::identifiers::{CardId, ObjectId};
+
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let opp = PlayerId(1);
+
+        let safekeeper = {
+            let mut ability = AbilityDefinition::new(
+                AbilityKind::Activated,
+                grant_effect(
+                    Some(TargetFilter::ParentTarget),
+                    Some(TargetFilter::Typed(
+                        TypedFilter::default().controller(ControllerRef::You),
+                    )),
+                    Keyword::Shroud,
+                ),
+            );
+            ability.cost = Some(AbilityCost::Sacrifice(SacrificeCost {
+                target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)),
+                requirement: SacrificeRequirement::count(1),
+            }));
+            ability
+        };
+
+        let creature = create_test_creature(&mut state, ai);
+        let spell_id = ObjectId(99);
+        let ability = ResolvedAbility::new(
+            Effect::Destroy {
+                target: TargetFilter::Any,
+                cant_regenerate: false,
+            },
+            vec![TargetRef::Object(creature)],
+            spell_id,
+            opp,
+        );
+        state.stack.push_back(StackEntry {
+            id: spell_id,
+            source_id: spell_id,
+            controller: opp,
+            kind: StackEntryKind::Spell {
+                card_id: CardId(99),
+                ability: Some(Box::new(ability)),
+                casting_variant: Default::default(),
+                actual_mana_spent: 0,
+            },
+        });
+
+        assert!(any_land_sacrifice_protection_payoff(
+            &state,
+            ai,
+            &safekeeper
+        ));
+    }
+
+    fn create_test_creature(
+        state: &mut GameState,
+        controller: PlayerId,
+    ) -> engine::types::identifiers::ObjectId {
+        use engine::game::zones::create_object;
+        use engine::types::identifiers::CardId;
+        use engine::types::zones::Zone;
+        let id = create_object(
+            state,
+            CardId(2),
+            controller,
+            "Creature".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        id
+    }
+
+    fn push_opponent_damage(
+        state: &mut GameState,
+        recipient: engine::types::identifiers::ObjectId,
+        source_keywords: &[Keyword],
+        mass: bool,
+        amount: i32,
+    ) {
+        use engine::types::ability::{QuantityExpr, ResolvedAbility, TargetRef};
+        use engine::types::game_state::{StackEntry, StackEntryKind};
+        use engine::types::identifiers::CardId;
+        use engine::types::zones::Zone;
+
+        let opponent = PlayerId(1);
+        let source_id = engine::game::zones::create_object(
+            state,
+            CardId(99),
+            opponent,
+            "Counter Damage".to_string(),
+            Zone::Stack,
+        );
+        let source = state.objects.get_mut(&source_id).unwrap();
+        source.base_keywords.extend(source_keywords.iter().cloned());
+        source.keywords.extend(source_keywords.iter().cloned());
+        let effect = if mass {
+            Effect::DamageAll {
+                amount: QuantityExpr::Fixed { value: amount },
+                target: TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::Opponent),
+                ),
+                player_filter: None,
+                damage_source: None,
+            }
+        } else {
+            Effect::DealDamage {
+                amount: QuantityExpr::Fixed { value: amount },
+                target: TargetFilter::Any,
+                damage_source: None,
+                excess: None,
+            }
+        };
+        let targets = (!mass)
+            .then_some(vec![TargetRef::Object(recipient)])
+            .unwrap_or_default();
+        let ability = ResolvedAbility::new(effect, targets, source_id, opponent);
+        state.stack.push_back(StackEntry {
+            id: source_id,
+            source_id,
+            controller: opponent,
+            kind: StackEntryKind::Spell {
+                card_id: CardId(99),
+                ability: Some(Box::new(ability)),
+                casting_variant: Default::default(),
+                actual_mana_spent: 0,
+            },
+        });
+    }
+
+    #[test]
+    fn indestructible_does_not_answer_targeted_infect_damage() {
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let recipient = create_test_creature(&mut state, ai);
+        state.objects.get_mut(&recipient).unwrap().toughness = Some(3);
+        push_opponent_damage(&mut state, recipient, &[Keyword::Infect], false, 3);
+        let effect = grant_effect(Some(TargetFilter::SelfRef), None, Keyword::Indestructible);
+
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, recipient, &effect),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn indestructible_does_not_answer_mass_wither_damage() {
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let recipient = create_test_creature(&mut state, ai);
+        state.objects.get_mut(&recipient).unwrap().toughness = Some(3);
+        push_opponent_damage(&mut state, recipient, &[Keyword::Wither], true, 3);
+        let effect = grant_effect(Some(TargetFilter::SelfRef), None, Keyword::Indestructible);
+
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, recipient, &effect),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn indestructible_may_answer_targeted_infect_deathtouch_damage() {
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let recipient = create_test_creature(&mut state, ai);
+        state.objects.get_mut(&recipient).unwrap().toughness = Some(3);
+        push_opponent_damage(
+            &mut state,
+            recipient,
+            &[Keyword::Infect, Keyword::Deathtouch],
+            false,
+            1,
+        );
+        let effect = grant_effect(Some(TargetFilter::SelfRef), None, Keyword::Indestructible);
+
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, recipient, &effect),
+            None,
+            "deathtouch destruction can be stopped even when infect uses counters"
+        );
+    }
+
+    #[test]
+    fn indestructible_may_answer_mass_wither_deathtouch_damage() {
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let recipient = create_test_creature(&mut state, ai);
+        state.objects.get_mut(&recipient).unwrap().toughness = Some(3);
+        push_opponent_damage(
+            &mut state,
+            recipient,
+            &[Keyword::Wither, Keyword::Deathtouch],
+            true,
+            1,
+        );
+        let effect = grant_effect(Some(TargetFilter::SelfRef), None, Keyword::Indestructible);
+
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, recipient, &effect),
+            None,
+            "deathtouch destruction can be stopped even when wither uses counters"
+        );
+    }
+
+    #[test]
+    fn stronger_targeting_and_protection_grants_are_redundant() {
+        use engine::types::mana::ManaColor;
+
+        let mut state = GameState::new_two_player(42);
+        let recipient = create_test_creature(&mut state, PlayerId(0));
+        let object = state.objects.get_mut(&recipient).unwrap();
+        object.keywords.push(Keyword::Hexproof);
+        object
+            .keywords
+            .push(Keyword::Protection(ProtectionTarget::Everything));
+
+        assert!(grant_already_effective(
+            &state,
+            recipient,
+            &DefensiveGrant::HexproofFrom(HexproofFilter::Color(ManaColor::Red)),
+            None
+        ));
+        assert!(grant_already_effective(
+            &state,
+            recipient,
+            &DefensiveGrant::Protection(ProtectionTarget::Color(ManaColor::Red)),
+            None
+        ));
+    }
+
+    #[test]
+    fn fight_damage_is_ambiguous_for_indestructible_payoff() {
+        let mut state = GameState::new_two_player(42);
+        let recipient = create_test_creature(&mut state, PlayerId(0));
+        let source = create_test_creature(&mut state, PlayerId(1));
+        let effect = Effect::Fight {
+            target: TargetFilter::Any,
+            subject: TargetFilter::SelfRef,
+        };
+
+        assert_eq!(
+            grant_answers_targeted_effect(
+                &state,
+                &DefensiveGrant::Indestructible,
+                &effect,
+                recipient,
+                state.objects.get(&source),
+                &[],
+                PlayerId(1),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn shroud_answers_opposing_aura_targeting_protected_creature() {
+        use engine::types::ability::{ResolvedAbility, TargetRef};
+        use engine::types::game_state::{StackEntry, StackEntryKind};
+        use engine::types::identifiers::CardId;
+        use engine::types::zones::Zone;
+
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let opponent = PlayerId(1);
+        let recipient = create_test_creature(&mut state, ai);
+        let aura_id = engine::game::zones::create_object(
+            &mut state,
+            CardId(88),
+            opponent,
+            "Opposing Aura".to_string(),
+            Zone::Stack,
+        );
+        let aura = state.objects.get_mut(&aura_id).unwrap();
+        aura.card_types.core_types.push(CoreType::Enchantment);
+        aura.card_types.subtypes.push("Aura".to_string());
+        let ability = ResolvedAbility::new(
+            Effect::unimplemented("aura spell", "Enchant creature"),
+            vec![TargetRef::Object(recipient)],
+            aura_id,
+            opponent,
+        );
+        state.stack.push_back(StackEntry {
+            id: aura_id,
+            source_id: aura_id,
+            controller: opponent,
+            kind: StackEntryKind::Spell {
+                card_id: CardId(88),
+                ability: Some(Box::new(ability)),
+                casting_variant: Default::default(),
+                actual_mana_spent: 0,
+            },
+        });
+        let effect = grant_effect(Some(TargetFilter::SelfRef), None, Keyword::Shroud);
+
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, recipient, &effect),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn protection_evasion_requires_an_untapped_legal_blocker() {
+        use engine::game::combat::{AttackerInfo, CombatState};
+        use engine::types::mana::ManaColor;
+
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let opp = PlayerId(1);
+        let attacker = create_test_creature(&mut state, ai);
+        let blocker = create_test_creature(&mut state, opp);
+        state.objects.get_mut(&blocker).unwrap().color = vec![ManaColor::Red];
+        state.phase = Phase::DeclareAttackers;
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::attacking_player(attacker, opp)],
+            ..Default::default()
+        });
+        let effect = grant_effect(
+            Some(TargetFilter::SelfRef),
+            None,
+            Keyword::Protection(ProtectionTarget::Color(ManaColor::Red)),
+        );
+
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, attacker, &effect),
+            Some(true)
+        );
+
+        state.objects.get_mut(&blocker).unwrap().tapped = true;
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, attacker, &effect),
+            Some(false),
+            "the engine's legal-blocker population excludes tapped creatures"
+        );
+    }
+
+    #[test]
+    fn self_indestructible_has_no_payoff_after_empty_blocker_declaration() {
+        use engine::game::combat::{AttackerInfo, CombatState};
+
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let opp = PlayerId(1);
+        let attacker = create_test_creature(&mut state, ai);
+        state.phase = Phase::DeclareBlockers;
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::attacking_player(attacker, opp)],
+            blockers_declared_by: vec![opp],
+            ..Default::default()
+        });
+        let effect = grant_effect(Some(TargetFilter::SelfRef), None, Keyword::Indestructible);
+
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, attacker, &effect),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn self_indestructible_has_no_payoff_against_infect_blocker() {
+        use engine::game::combat::{AttackerInfo, CombatState};
+
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let opp = PlayerId(1);
+        let attacker = create_test_creature(&mut state, ai);
+        state.objects.get_mut(&attacker).unwrap().toughness = Some(3);
+        let blocker = create_test_creature(&mut state, opp);
+        let blocker_object = state.objects.get_mut(&blocker).unwrap();
+        blocker_object.power = Some(1);
+        blocker_object.keywords.push(Keyword::Infect);
+        state.phase = Phase::DeclareBlockers;
+        let mut combat = CombatState {
+            attackers: vec![AttackerInfo::attacking_player(attacker, opp)],
+            blockers_declared_by: vec![opp],
+            ..Default::default()
+        };
+        combat.blocker_assignments.insert(attacker, vec![blocker]);
+        combat.blocker_to_attacker.insert(blocker, vec![attacker]);
+        state.combat = Some(combat);
+        let effect = grant_effect(Some(TargetFilter::SelfRef), None, Keyword::Indestructible);
+
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, attacker, &effect),
+            Some(false)
+        );
+
+        state
+            .objects
+            .get_mut(&blocker)
+            .unwrap()
+            .keywords
+            .push(Keyword::Deathtouch);
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, attacker, &effect),
+            None,
+            "deathtouch destruction remains preventable by indestructible"
+        );
+    }
+
+    #[test]
+    fn combat_damage_after_regular_damage_has_no_protection_payoff() {
+        use engine::game::combat::{AttackerInfo, CombatState};
+
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let opp = PlayerId(1);
+        let attacker = create_test_creature(&mut state, ai);
+        let blocker = create_test_creature(&mut state, opp);
+        state.phase = Phase::CombatDamage;
+        let mut combat = CombatState {
+            attackers: vec![AttackerInfo::attacking_player(attacker, opp)],
+            regular_damage_done: true,
+            ..Default::default()
+        };
+        combat.blocker_assignments.insert(attacker, vec![blocker]);
+        combat.blocker_to_attacker.insert(blocker, vec![attacker]);
+        state.combat = Some(combat);
+        let effect = grant_effect(Some(TargetFilter::SelfRef), None, Keyword::Indestructible);
+
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, attacker, &effect),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn pending_combat_damage_is_not_a_payoff_for_sidelined_recipient() {
+        use engine::game::combat::{AttackerInfo, CombatState};
+
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let opp = PlayerId(1);
+        let recipient = create_test_creature(&mut state, ai);
+        let attacker = create_test_creature(&mut state, ai);
+        let blocker = create_test_creature(&mut state, opp);
+        state.phase = Phase::CombatDamage;
+        let mut combat = CombatState {
+            attackers: vec![AttackerInfo::attacking_player(attacker, opp)],
+            ..Default::default()
+        };
+        combat.blocker_assignments.insert(attacker, vec![blocker]);
+        combat.blocker_to_attacker.insert(blocker, vec![attacker]);
+        state.combat = Some(combat);
+        let effect = grant_effect(Some(TargetFilter::SelfRef), None, Keyword::Indestructible);
+
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, recipient, &effect),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn pending_combat_damage_is_not_a_payoff_for_shroud() {
+        use engine::game::combat::{AttackerInfo, CombatState};
+
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let opp = PlayerId(1);
+        let attacker = create_test_creature(&mut state, ai);
+        let blocker = create_test_creature(&mut state, opp);
+        state.phase = Phase::CombatDamage;
+        let mut combat = CombatState {
+            attackers: vec![AttackerInfo::attacking_player(attacker, opp)],
+            ..Default::default()
+        };
+        combat.blocker_assignments.insert(attacker, vec![blocker]);
+        combat.blocker_to_attacker.insert(blocker, vec![attacker]);
+        state.combat = Some(combat);
+        let effect = grant_effect(Some(TargetFilter::SelfRef), None, Keyword::Shroud);
+
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, attacker, &effect),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn regular_substep_excludes_first_strike_only_but_includes_double_strike() {
+        use engine::game::combat::{AttackerInfo, CombatState};
+
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let opp = PlayerId(1);
+        let attacker = create_test_creature(&mut state, ai);
+        let blocker = create_test_creature(&mut state, opp);
+        let blocker_object = state.objects.get_mut(&blocker).unwrap();
+        blocker_object.power = Some(3);
+        blocker_object.keywords.push(Keyword::FirstStrike);
+        state.phase = Phase::CombatDamage;
+        let mut combat = CombatState {
+            attackers: vec![AttackerInfo::attacking_player(attacker, opp)],
+            first_strike_done: true,
+            first_strike_participants: Some(std::collections::HashSet::from([blocker])),
+            ..Default::default()
+        };
+        combat.blocker_assignments.insert(attacker, vec![blocker]);
+        combat.blocker_to_attacker.insert(blocker, vec![attacker]);
+        state.combat = Some(combat);
+        let effect = grant_effect(Some(TargetFilter::SelfRef), None, Keyword::Indestructible);
+
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, attacker, &effect),
+            Some(false),
+            "first-strike-only blocker has no pending regular damage"
+        );
+
+        let blocker_object = state.objects.get_mut(&blocker).unwrap();
+        blocker_object.keywords.clear();
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, attacker, &effect),
+            Some(false),
+            "losing first strike does not add the source to regular damage"
+        );
+
+        state.combat.as_mut().unwrap().first_strike_participants =
+            Some(std::collections::HashSet::from([attacker]));
+        state
+            .objects
+            .get_mut(&blocker)
+            .unwrap()
+            .keywords
+            .push(Keyword::FirstStrike);
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, attacker, &effect),
+            None,
+            "gaining first strike does not remove a normal source from regular damage"
+        );
+
+        state.combat.as_mut().unwrap().first_strike_participants =
+            Some(std::collections::HashSet::from([blocker]));
+        let blocker_object = state.objects.get_mut(&blocker).unwrap();
+        blocker_object.keywords.clear();
+        blocker_object.keywords.push(Keyword::DoubleStrike);
+        assert_eq!(
+            self_protection_effect_payoff(&state, ai, attacker, &effect),
+            None,
+            "double strike blocker still participates in regular damage"
+        );
+    }
+
+    #[test]
+    fn shroud_answers_a_fight_that_reaches_the_creature_through_a_later_slot() {
+        use engine::game::scenario::{GameScenario, P0, P1};
+        use engine::types::game_state::WaitingFor;
+        use engine::types::mana::{ManaColor, ManaCost};
+        const TAIL_SWIPE: &str = "Choose target creature you control and target creature you don't control. If you cast this spell during your main phase, the creature you control gets +1/+1 until end of turn. Then those creatures fight each other. (Each deals damage equal to its power to the other.)";
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let theirs = scenario.add_creature(P1, "Theirs", 3, 3).id();
+        let ai_creature = scenario.add_creature(P0, "Ai", 2, 2).id();
+        let swipe = scenario
+            .add_spell_to_hand_from_oracle(P1, "Tail Swipe", true, TAIL_SWIPE)
+            .with_mana_cost(ManaCost::generic(1))
+            .id();
+        scenario.add_basic_land(P1, ManaColor::Green);
+        let mut runner = scenario.build();
+        {
+            let state = runner.state_mut();
+            state.active_player = P1;
+            state.priority_player = P1;
+            state.waiting_for = WaitingFor::Priority { player: P1 };
+        }
+        runner
+            .cast(swipe)
+            .target_objects(&[theirs, ai_creature])
+            .commit();
+        let state = runner.state();
+        let entry = state.stack.back().expect("Tail Swipe");
+        assert_eq!(entry.controller, P1, "reach guard: an opposing entry");
+        assert!(
+            !entry
+                .ability()
+                .is_some_and(|root| root.targets.contains(&TargetRef::Object(ai_creature))),
+            "reach guard: the root does not target the AI's creature"
+        );
+        assert!(any_stack_harmful_answerable_by_grants(
+            state,
+            P0,
+            &[shroud_grant(PlayerId(0))]
+        ));
+    }
+
+    /// A Two-Headed Giant game (teams: P0+P1 vs P2+P3) in which `caster` has
+    /// a zero-cost spell with `oracle` at P0's creature on the stack.
+    fn two_headed_giant_spell_at_p0_creature(
+        caster: PlayerId,
+        oracle: &str,
+    ) -> (engine::game::scenario::GameRunner, ObjectId) {
+        use engine::types::game_state::WaitingFor;
+        use engine::types::mana::ManaCost;
+        let mut scenario = engine::game::scenario::GameScenario::new_with_format(
+            engine::types::format::FormatConfig::two_headed_giant(),
+            4,
+            42,
+        );
+        scenario.at_phase(Phase::PreCombatMain);
+        let creature = scenario
+            .add_creature(PlayerId(0), "Protected Bear", 2, 2)
+            .id();
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(caster, "Probe Spell", true, oracle)
+            .with_mana_cost(ManaCost::generic(0))
+            .id();
+        let mut runner = scenario.build();
+        {
+            let state = runner.state_mut();
+            state.active_player = caster;
+            state.priority_player = caster;
+            state.waiting_for = WaitingFor::Priority { player: caster };
+        }
+        runner.cast(spell).target_object(creature).commit();
+        (runner, creature)
+    }
+
+    /// CR 102.3 + CR 109.5: a grant that stops "spells or abilities your
+    /// opponents control" from targeting (Vines of Vastwood) answers an
+    /// opponent's targeted removal, but not a teammate's: in Two-Headed Giant
+    /// the teammate is not an opponent.
+    #[test]
+    fn opponent_scoped_cant_be_targeted_grant_answers_opponent_not_teammate() {
+        const DOOM_BLADE: &str = "Destroy target nonblack creature.";
+        let grant = grant_from_static_mode(
+            &StaticMode::CantBeTargeted {
+                who: ProhibitionScope::Opponents,
+            },
+            PlayerId(0),
+        );
+        assert_eq!(grant.len(), 1);
+
+        let (runner, _) = two_headed_giant_spell_at_p0_creature(PlayerId(2), DOOM_BLADE);
+        assert!(
+            any_stack_harmful_answerable_by_grants(runner.state(), PlayerId(0), &grant),
+            "an opponent's Doom Blade is answered"
+        );
+
+        let (runner, _) = two_headed_giant_spell_at_p0_creature(PlayerId(1), DOOM_BLADE);
+        assert!(
+            !any_stack_harmful_answerable_by_grants(runner.state(), PlayerId(0), &grant),
+            "a teammate's Doom Blade is not stopped by an opponents-only grant"
+        );
+
+        // Shroud names every player, so it answers the teammate's removal too.
+        assert!(any_stack_harmful_answerable_by_grants(
+            runner.state(),
+            PlayerId(0),
+            &[shroud_grant(PlayerId(0))]
+        ));
+    }
+
+    /// CR 611.2c + CR 109.5 + CR 102.3: after the real Vines of Vastwood resolves
+    /// (a transient rule effect, never grafted onto the creature), the restriction
+    /// is already effective against an opponent but not against the caster's
+    /// teammate in Two-Headed Giant.
+    #[test]
+    fn resolved_vines_is_effective_against_opponent_not_teammate() {
+        use engine::game::scenario::{GameScenario, P0};
+        use engine::types::game_state::WaitingFor;
+        use engine::types::mana::ManaCost;
+        const VINES_OF_VASTWOOD: &str = "Kicker {G}\nTarget creature can't be the target of spells or abilities your opponents control this turn. If this spell was kicked, that creature gets +4/+4 until end of turn.";
+        let mut scenario = GameScenario::new_with_format(
+            engine::types::format::FormatConfig::two_headed_giant(),
+            4,
+            42,
+        );
+        scenario.at_phase(Phase::PreCombatMain);
+        let creature = scenario.add_creature(P0, "Protected Bear", 2, 2).id();
+        scenario.add_creature(P0, "Bystander Bear", 2, 2);
+        scenario.add_creature(P0, "Second Bystander", 2, 2);
+        let vines = scenario
+            .add_spell_to_hand(P0, "Vines of Vastwood", true)
+            .with_mana_cost(ManaCost::generic(0))
+            .from_oracle_text(VINES_OF_VASTWOOD)
+            .id();
+        let mut runner = scenario.build();
+        runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+        runner.cast(vines).target_object(creature).resolve();
+        let state = runner.state();
+        let grant = shroud_grant(P0);
+        assert!(
+            grant_already_effective(state, creature, &grant, Some(PlayerId(2))),
+            "an opponent can't target the creature"
+        );
+        assert!(
+            !grant_already_effective(state, creature, &grant, Some(PlayerId(1))),
+            "the teammate is not one of Vines' caster's opponents"
+        );
+    }
+
+    /// P1 casts `text` at P0's creature (`toughness`, `keywords`).
+    fn opponent_spell_at_ai_creature(
+        name: &str,
+        text: &str,
+        cost: engine::types::mana::ManaCost,
+        toughness: i32,
+        keywords: &[Keyword],
+        targets_own_creature_first: bool,
+    ) -> (engine::game::scenario::GameRunner, ObjectId) {
+        use engine::game::scenario::{GameScenario, P0, P1};
+        use engine::types::game_state::WaitingFor;
+        use engine::types::mana::ManaColor;
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let ai_creature = {
+            let mut builder = scenario.add_creature(P0, "Ai", 3, toughness);
+            for keyword in keywords {
+                builder.with_keyword(keyword.clone());
+            }
+            builder.id()
+        };
+        let own = scenario.add_creature(P1, "Own", 3, 3).id();
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(P1, name, true, text)
+            .with_mana_cost(cost)
+            .id();
+        for _ in 0..2 {
+            scenario.add_basic_land(P1, ManaColor::Black);
+        }
+        let mut runner = scenario.build();
+        {
+            let state = runner.state_mut();
+            state.active_player = P1;
+            state.priority_player = P1;
+            state.waiting_for = WaitingFor::Priority { player: P1 };
+        }
+        let targets: &[ObjectId] = if targets_own_creature_first {
+            &[own, ai_creature]
+        } else {
+            &[ai_creature]
+        };
+        runner.cast(spell).target_objects(targets).commit();
+        (runner, ai_creature)
+    }
+
+    const MURDER: &str = "Destroy target creature.";
+    const SHOCK: &str = "Shock deals 2 damage to any target.";
+    const SELF_DESTRUCT: &str = "Target creature you control deals X damage to any other target and X damage to itself, where X is its power.";
+
+    #[test]
+    fn a_grant_the_creature_already_has_answers_nothing() {
+        use engine::game::scenario::P0;
+        use engine::types::mana::ManaCost;
+        for indestructible in [false, true] {
+            let keywords: &[Keyword] = if indestructible {
+                &[Keyword::Indestructible]
+            } else {
+                &[]
+            };
+            let (runner, _) = opponent_spell_at_ai_creature(
+                "Murder",
+                MURDER,
+                ManaCost::generic(2),
+                3,
+                keywords,
+                false,
+            );
+            assert_eq!(
+                any_stack_harmful_answerable_by_grants(
+                    runner.state(),
+                    P0,
+                    &[DefensiveGrant::Indestructible]
+                ),
+                !indestructible
+            );
+        }
+    }
+
+    #[test]
+    fn prevention_answers_only_damage_that_would_kill_the_creature() {
+        use engine::game::scenario::P0;
+        use engine::types::mana::ManaCost;
+        let answerable = |runner: &engine::game::scenario::GameRunner| {
+            any_stack_harmful_answerable_by_grants(
+                runner.state(),
+                P0,
+                &[DefensiveGrant::PreventDamage],
+            )
+        };
+        let (runner, _) =
+            opponent_spell_at_ai_creature("Shock", SHOCK, ManaCost::generic(1), 2, &[], false);
+        assert!(
+            answerable(&runner),
+            "control: 2 damage kills a 2-toughness creature"
+        );
+        let (runner, _) =
+            opponent_spell_at_ai_creature("Shock", SHOCK, ManaCost::generic(1), 3, &[], false);
+        assert!(!answerable(&runner));
+        // Self-Destruct's damage is X, which is not judged, so the grant
+        // still answers it.
+        let (runner, _) = opponent_spell_at_ai_creature(
+            "Self-Destruct",
+            SELF_DESTRUCT,
+            ManaCost::generic(2),
+            4,
+            &[],
+            true,
+        );
+        assert!(answerable(&runner));
+    }
+
+    /// P1 casts two Shocks at P0's creature with toughness `toughness`, each
+    /// its own stack entry.
+    fn two_shocks_at_ai_creature(toughness: i32) -> (engine::game::scenario::GameRunner, ObjectId) {
+        use engine::game::scenario::{GameScenario, P0, P1};
+        use engine::types::game_state::WaitingFor;
+        use engine::types::mana::{ManaColor, ManaCost};
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let ai_creature = scenario.add_creature(P0, "Ai", 3, toughness).id();
+        let shocks: Vec<ObjectId> = (0..2)
+            .map(|_| {
+                scenario
+                    .add_spell_to_hand_from_oracle(P1, "Shock", true, SHOCK)
+                    .with_mana_cost(ManaCost::generic(1))
+                    .id()
+            })
+            .collect();
+        for _ in 0..2 {
+            scenario.add_basic_land(P1, ManaColor::Red);
+        }
+        let mut runner = scenario.build();
+        {
+            let state = runner.state_mut();
+            state.active_player = P1;
+            state.priority_player = P1;
+            state.waiting_for = WaitingFor::Priority { player: P1 };
+        }
+        for shock in shocks {
+            runner.cast(shock).target_object(ai_creature).commit();
+        }
+        (runner, ai_creature)
+    }
+
+    #[test]
+    fn prevention_is_judged_against_the_damage_of_every_stack_entry() {
+        use engine::game::effects::stack_reach::stack_entry_node_reach;
+        use engine::game::scenario::P0;
+        for toughness in [3, 5] {
+            let (runner, ai_creature) = two_shocks_at_ai_creature(toughness);
+            let state = runner.state();
+            assert!(
+                state.stack.len() == 2
+                    && state.stack.iter().all(|entry| {
+                        stack_entry_node_reach(state, entry)
+                            .iter()
+                            .any(|reach| reach.acted_on == vec![TargetRef::Object(ai_creature)])
+                    }),
+                "reach guard: each Shock is its own stack entry acting on the creature"
+            );
+            assert_eq!(
+                any_stack_harmful_answerable_by_grants(state, P0, &[DefensiveGrant::PreventDamage]),
+                toughness == 3,
+                "4 damage kills a 3-toughness creature and not a 5-toughness one"
+            );
+        }
+    }
+
+    #[test]
+    fn prevention_is_judged_among_landfall_triggers_without_reading_their_reach() {
+        use crate::test_support::{reading_with_reach_count, with_landfall_triggers};
+        use engine::game::scenario::{P0, P1};
+        let answerable = |state: &GameState| {
+            any_stack_harmful_answerable_by_grants(state, P0, &[DefensiveGrant::PreventDamage])
+        };
+        for toughness in [3, 5] {
+            let (runner, _) = two_shocks_at_ai_creature(toughness);
+            let plain = runner.state();
+            // P1's landfall triggers below, between and above the two Shocks.
+            let landfall = with_landfall_triggers(plain, P1);
+            let (answer, builds) = reading_with_reach_count(|| answerable(plain));
+            assert_eq!(
+                answer,
+                toughness == 3,
+                "4 damage kills a 3-toughness creature and not a 5-toughness one"
+            );
+            assert!(builds > 0, "reach guard: the Shocks' reach is read");
+            assert_eq!(
+                reading_with_reach_count(|| answerable(&landfall)),
+                (answer, builds),
+                "the same answer, without reading the triggers' reach"
+            );
+        }
+    }
+
+    const PSIONIC_ENTITY: &str =
+        "{T}: This creature deals 2 damage to any target and 3 damage to itself.";
+    const RAY_OF_COMMAND: &str = "Untap target creature an opponent controls and gain control of it until end of turn. That creature gains haste until end of turn. When you lose control of the creature, tap it.";
+    const KARPLUSAN_YETI: &str = "{T}: This creature deals damage equal to its power to target creature. That creature deals damage equal to its power to this creature.";
+    const GHYRSON_STARN: &str = "Ward {2} (Whenever this creature becomes the target of a spell or ability an opponent controls, counter it unless that player pays {2}.)\nThree Autostubs — Whenever another source you control deals exactly 1 damage to a permanent or player, Ghyrson Starn deals 2 damage to that permanent or player.";
+    const PRODIGAL_PYROMANCER: &str = "{T}: This creature deals 1 damage to any target.";
+    const SABOTAGE_STRATEGIST: &str = "Flying, vigilance\nWhenever one or more creatures attack you, those creatures get -1/-0 until end of turn.\nExhaust — {5}{U}{U}: Put three +1/+1 counters on this creature. (Activate each exhaust ability only once.)";
+
+    /// The built scenario with P1 active and holding priority.
+    fn p1_priority(
+        scenario: engine::game::scenario::GameScenario,
+    ) -> engine::game::scenario::GameRunner {
+        use engine::game::scenario::P1;
+        use engine::types::game_state::WaitingFor;
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+        runner
+    }
+
+    /// The player with priority activates `source`'s first ability at `targets`.
+    fn activate_first_ability(
+        runner: &mut engine::game::scenario::GameRunner,
+        source: ObjectId,
+        targets: &[TargetRef],
+    ) {
+        use engine::types::actions::GameAction;
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&source)
+            .expect("source")
+            .summoning_sick = false;
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+            })
+            .expect("activate");
+        for target in targets {
+            runner
+                .act(GameAction::ChooseTarget {
+                    target: Some(target.clone()),
+                })
+                .expect("choose a target");
+        }
+    }
+
+    /// Gives `object` `keyword`, resolves the stack, and returns the zone
+    /// `object` ends in.
+    fn zone_after_the_stack_resolves(
+        mut runner: engine::game::scenario::GameRunner,
+        object: ObjectId,
+        keyword: Keyword,
+    ) -> engine::types::zones::Zone {
+        let state = runner.state_mut();
+        let target = state.objects.get_mut(&object).expect("object");
+        target.keywords.push(keyword.clone());
+        target.base_keywords.push(keyword);
+        state.layers_dirty.mark_full();
+        runner.advance_until_stack_empty();
+        runner.state().objects[&object].zone
+    }
+
+    /// P1's creature `name` (`color`) activates its first ability at
+    /// `aim(creature, P1's green 2/2)`, then P0's Ray of Command takes the
+    /// creature while the ability waits on the stack.
+    fn ability_of_a_creature_the_ai_took(
+        name: &str,
+        text: &str,
+        color: engine::types::mana::ManaColor,
+        aim: impl Fn(ObjectId, ObjectId) -> Vec<TargetRef>,
+    ) -> (engine::game::scenario::GameRunner, ObjectId) {
+        use engine::game::effects::stack_reach::stack_entry_node_reach;
+        use engine::game::scenario::{GameScenario, P0, P1};
+        use engine::types::actions::GameAction;
+        use engine::types::mana::{ManaColor, ManaCost};
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let creature = {
+            let mut builder = scenario.add_creature_from_oracle(P1, name, 2, 2, text);
+            builder.with_color(vec![color]);
+            builder.id()
+        };
+        let bear = {
+            let mut builder = scenario.add_creature(P1, "Bear", 2, 2);
+            builder.with_color(vec![ManaColor::Green]);
+            builder.id()
+        };
+        let ray = scenario
+            .add_spell_to_hand_from_oracle(P0, "Ray of Command", true, RAY_OF_COMMAND)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = p1_priority(scenario);
+        activate_first_ability(&mut runner, creature, &aim(creature, bear));
+        runner.act(GameAction::PassPriority).expect("P1 passes");
+        runner.cast(ray).target_object(creature).commit();
+        runner.resolve_top();
+        let state = runner.state();
+        assert!(
+            state.objects[&creature].controller == P0
+                && state.stack.len() == 1
+                && state.stack[0].controller == P1
+                && stack_entry_node_reach(state, &state.stack[0])
+                    .iter()
+                    .any(|reach| reach.acted_on == vec![TargetRef::Object(creature)]),
+            "reach guard: P1's ability acts on the creature P0 now controls"
+        );
+        (runner, creature)
+    }
+
+    #[test]
+    fn targeting_immunity_does_not_answer_damage_an_ability_deals_to_its_source() {
+        use engine::game::scenario::P0;
+        use engine::types::mana::ManaColor;
+        use engine::types::zones::Zone;
+        let entity_aimed_at = |itself: bool| {
+            ability_of_a_creature_the_ai_took(
+                "Psionic Entity",
+                PSIONIC_ENTITY,
+                ManaColor::Blue,
+                move |entity, _| {
+                    if itself {
+                        vec![TargetRef::Object(entity)]
+                    } else {
+                        vec![TargetRef::Player(P0)]
+                    }
+                },
+            )
+        };
+        let answers = |runner: &engine::game::scenario::GameRunner, grant: DefensiveGrant| {
+            any_stack_harmful_answerable_by_grants(runner.state(), P0, &[grant])
+        };
+        let blue = ProtectionTarget::Color(ManaColor::Blue);
+
+        let (runner, entity) = entity_aimed_at(false);
+        assert!(!answers(&runner, shroud_grant(PlayerId(0))));
+        assert!(!answers(
+            &runner,
+            DefensiveGrant::HexproofFrom(HexproofFilter::Color(ManaColor::Blue))
+        ));
+        assert!(answers(&runner, DefensiveGrant::Protection(blue.clone())));
+        assert_eq!(
+            zone_after_the_stack_resolves(entity_aimed_at(false).0, entity, Keyword::Shroud),
+            Zone::Graveyard,
+            "engine: shroud does not stop the damage the Entity deals to itself"
+        );
+        assert_eq!(
+            zone_after_the_stack_resolves(
+                entity_aimed_at(false).0,
+                entity,
+                Keyword::Protection(blue)
+            ),
+            Zone::Battlefield,
+            "engine: protection from blue prevents it"
+        );
+
+        let (runner, _) = entity_aimed_at(true);
+        assert!(
+            answers(&runner, shroud_grant(PlayerId(0))),
+            "control: the Entity is the ability's target"
+        );
+    }
+
+    #[test]
+    fn protection_does_not_answer_untargeted_damage_another_object_deals() {
+        use engine::game::scenario::P0;
+        use engine::types::mana::ManaColor;
+        use engine::types::zones::Zone;
+        // P1's Karplusan Yeti (red) aimed at P1's green 2/2, which then deals
+        // damage to the Yeti.
+        let yeti = || {
+            ability_of_a_creature_the_ai_took(
+                "Karplusan Yeti",
+                KARPLUSAN_YETI,
+                ManaColor::Red,
+                |_, bear| vec![TargetRef::Object(bear)],
+            )
+        };
+        let red = ProtectionTarget::Color(ManaColor::Red);
+        let (runner, id) = yeti();
+        assert!(!any_stack_harmful_answerable_by_grants(
+            runner.state(),
+            P0,
+            &[DefensiveGrant::Protection(red.clone())]
+        ));
+        assert_eq!(
+            zone_after_the_stack_resolves(yeti().0, id, Keyword::Protection(red)),
+            Zone::Graveyard,
+            "engine: the green 2/2's damage is not prevented"
+        );
+    }
+
+    /// P1's Prodigal Pyromancer pings P0's 3/3, and P1's Ghyrson Starn (blue and
+    /// red) triggers on that damage.
+    fn ghyrson_starn_trigger_at_the_ai_creature() -> (engine::game::scenario::GameRunner, ObjectId)
+    {
+        use engine::game::effects::stack_reach::stack_entry_node_reach;
+        use engine::game::scenario::{GameScenario, P0, P1};
+        use engine::types::actions::GameAction;
+        use engine::types::game_state::StackEntryKind;
+        use engine::types::mana::ManaColor;
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let ai_creature = scenario.add_creature(P0, "Ai", 3, 3).id();
+        {
+            let mut builder = scenario.add_creature(P1, "Ghyrson Starn, Kelermorph", 3, 2);
+            builder.from_oracle_text_with_keywords(&["Three Autostubs", "Ward"], GHYRSON_STARN);
+            builder.with_color(vec![ManaColor::Blue, ManaColor::Red]);
+        }
+        let pyromancer = scenario
+            .add_creature_from_oracle(P1, "Prodigal Pyromancer", 1, 1, PRODIGAL_PYROMANCER)
+            .id();
+        let mut runner = p1_priority(scenario);
+        activate_first_ability(&mut runner, pyromancer, &[TargetRef::Object(ai_creature)]);
+        for _ in 0..4 {
+            if runner
+                .state()
+                .stack
+                .back()
+                .is_some_and(|entry| matches!(entry.kind, StackEntryKind::TriggeredAbility { .. }))
+            {
+                break;
+            }
+            runner
+                .act(GameAction::PassPriority)
+                .expect("P1 and P0 pass priority");
+        }
+        let state = runner.state();
+        let entry = state.stack.back().expect("Ghyrson Starn's trigger");
+        assert!(
+            matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+                && entry.controller == P1
+                && stack_entry_node_reach(state, entry)
+                    .iter()
+                    .any(|reach| reach.acted_on == vec![TargetRef::Object(ai_creature)]),
+            "reach guard: P1's trigger acts on the AI's creature"
+        );
+        (runner, ai_creature)
+    }
+
+    #[test]
+    fn targeting_immunity_does_not_answer_damage_to_the_object_a_trigger_names() {
+        use engine::game::scenario::P0;
+        use engine::types::mana::ManaColor;
+        use engine::types::zones::Zone;
+        let (runner, ai_creature) = ghyrson_starn_trigger_at_the_ai_creature();
+        let answers = |grant: DefensiveGrant| {
+            any_stack_harmful_answerable_by_grants(runner.state(), P0, &[grant])
+        };
+        let red = ProtectionTarget::Color(ManaColor::Red);
+        assert!(!answers(shroud_grant(PlayerId(0))));
+        assert!(!answers(DefensiveGrant::HexproofFrom(
+            HexproofFilter::Color(ManaColor::Red)
+        )));
+        assert!(answers(DefensiveGrant::Protection(red.clone())));
+        assert_eq!(
+            zone_after_the_stack_resolves(
+                ghyrson_starn_trigger_at_the_ai_creature().0,
+                ai_creature,
+                Keyword::Shroud
+            ),
+            Zone::Graveyard,
+            "engine: shroud does not stop the trigger's damage"
+        );
+        assert_eq!(
+            zone_after_the_stack_resolves(
+                ghyrson_starn_trigger_at_the_ai_creature().0,
+                ai_creature,
+                Keyword::Protection(red)
+            ),
+            Zone::Battlefield,
+            "engine: protection from red prevents it"
+        );
+    }
+
+    #[test]
+    fn a_grant_does_not_answer_damage_to_a_phased_out_ai_creature() {
+        use engine::game::effects::stack_reach::stack_entry_node_reach;
+        use engine::game::game_object::PhaseOutCause;
+        use engine::game::phasing::phase_out_object;
+        use engine::game::scenario::P0;
+        use engine::types::mana::ManaColor;
+        let (mut runner, ai_creature) = ghyrson_starn_trigger_at_the_ai_creature();
+        let red = [DefensiveGrant::Protection(ProtectionTarget::Color(
+            ManaColor::Red,
+        ))];
+        assert!(
+            any_stack_harmful_answerable_by_grants(runner.state(), P0, &red),
+            "control: protection from red answers the trigger's damage to the phased-in creature"
+        );
+        // The creature phases out with the trigger waiting, as an effect
+        // that phases it out does.
+        assert_eq!(
+            phase_out_object(
+                runner.state_mut(),
+                ai_creature,
+                PhaseOutCause::Directly,
+                &mut Vec::new()
+            ),
+            vec![ai_creature],
+            "reach guard: the creature phased out"
+        );
+        let state = runner.state();
+        let entry = state.stack.back().expect("Ghyrson Starn's trigger");
+        assert!(
+            stack_entry_node_reach(state, entry)
+                .iter()
+                .any(|reach| reach.acted_on == vec![TargetRef::Object(ai_creature)]),
+            "reach guard: the trigger still acts on the phased-out creature"
+        );
+        // CR 702.26b: a phased-out creature is treated as though it does not
+        // exist, so no grant reaches it.
+        assert!(!any_stack_harmful_answerable_by_grants(state, P0, &red));
+    }
+
+    #[test]
+    fn targeting_immunity_does_not_answer_an_attack_trigger_that_targets_nothing() {
+        use engine::game::ability_utils::flatten_targets_in_chain;
+        use engine::game::combat::AttackTarget;
+        use engine::game::scenario::{GameScenario, P0, P1};
+        use engine::types::actions::GameAction;
+        use engine::types::mana::ManaColor;
+        // P0's 2/2 attacks P1, whose Sabotage Strategist (blue) triggers.
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let attacker = scenario.add_creature(P0, "Bear", 2, 2).id();
+        let strategist = {
+            let mut builder = scenario.add_creature(P1, "Sabotage Strategist", 2, 2);
+            builder.from_oracle_text_with_keywords(
+                &["Exhaust", "Flying", "Vigilance"],
+                SABOTAGE_STRATEGIST,
+            );
+            builder.with_color(vec![ManaColor::Blue]);
+            builder.id()
+        };
+        let mut runner = scenario.build();
+        runner.advance_to_combat();
+        runner
+            .declare_attackers(&[(attacker, AttackTarget::Player(P1))])
+            .expect("declare attackers");
+        for _ in 0..4 {
+            if runner
+                .state()
+                .stack
+                .iter()
+                .any(|e| e.source_id == strategist)
+            {
+                break;
+            }
+            runner.act(GameAction::PassPriority).expect("pass priority");
+        }
+        let state = runner.state();
+        assert!(
+            state.stack.iter().any(|entry| entry.source_id == strategist
+                && entry.ability().is_some_and(|root| {
+                    flatten_targets_in_chain(root) == vec![TargetRef::Object(attacker)]
+                })),
+            "reach guard: P1's trigger holds the attacker"
+        );
+        for grant in [
+            shroud_grant(PlayerId(0)),
+            DefensiveGrant::HexproofFrom(HexproofFilter::Color(ManaColor::Blue)),
+            DefensiveGrant::Protection(ProtectionTarget::Color(ManaColor::Blue)),
+        ] {
+            assert!(
+                !any_stack_harmful_answerable_by_grants(state, P0, std::slice::from_ref(&grant)),
+                "{grant:?}"
+            );
+            assert_eq!(
+                stack_payoff_for_opportunity(
+                    state,
+                    P0,
+                    &DefensiveOpportunity {
+                        grant: grant.clone(),
+                        recipients: vec![attacker],
+                    },
+                ),
+                Some(false),
+                "{grant:?}"
+            );
+        }
+        let object = runner
+            .state_mut()
+            .objects
+            .get_mut(&attacker)
+            .expect("attacker");
+        object.keywords.push(Keyword::Shroud);
+        object.base_keywords.push(Keyword::Shroud);
+        runner.state_mut().layers_dirty.mark_full();
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            runner.state().objects[&attacker].power,
+            Some(1),
+            "engine: shroud does not stop the -1/-0"
+        );
+    }
+
+    #[test]
+    fn targeting_immunity_answers_a_spell_that_targets_the_creature() {
+        use engine::game::scenario::{GameScenario, P0, P1};
+        use engine::types::mana::{ManaColor, ManaCost};
+        use engine::types::zones::Zone;
+        // P1's Murder (black) at P0's 2/2.
+        let murder_at_the_ai_creature = || {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            let ai_creature = scenario.add_creature(P0, "Bear", 2, 2).id();
+            let murder = {
+                let mut builder = scenario.add_spell_to_hand_from_oracle(
+                    P1,
+                    "Murder",
+                    true,
+                    "Destroy target creature.",
+                );
+                builder.with_mana_cost(ManaCost::zero());
+                builder.with_color(vec![ManaColor::Black]);
+                builder.id()
+            };
+            let mut runner = p1_priority(scenario);
+            runner.cast(murder).target_objects(&[ai_creature]).commit();
+            (runner, ai_creature)
+        };
+        let black = ProtectionTarget::Color(ManaColor::Black);
+        let (runner, ai_creature) = murder_at_the_ai_creature();
+        for grant in [
+            shroud_grant(PlayerId(0)),
+            DefensiveGrant::HexproofFrom(HexproofFilter::Color(ManaColor::Black)),
+            DefensiveGrant::Protection(black.clone()),
+        ] {
+            assert!(
+                any_stack_harmful_answerable_by_grants(
+                    runner.state(),
+                    P0,
+                    std::slice::from_ref(&grant)
+                ),
+                "{grant:?}"
+            );
+            assert_eq!(
+                stack_payoff_for_opportunity(
+                    runner.state(),
+                    P0,
+                    &DefensiveOpportunity {
+                        grant: grant.clone(),
+                        recipients: vec![ai_creature],
+                    },
+                ),
+                Some(true),
+                "{grant:?}"
+            );
+        }
+        assert_eq!(
+            zone_after_the_stack_resolves(
+                murder_at_the_ai_creature().0,
+                ai_creature,
+                Keyword::Protection(black)
+            ),
+            Zone::Battlefield,
+            "engine: protection from black makes Murder's target illegal"
+        );
+    }
+
+    #[test]
+    fn targeting_immunity_answers_an_aura_spell_only_at_its_chosen_target() {
+        use engine::types::ability::{ChosenTargetSlots, ResolvedAbility};
+        use engine::types::game_state::{StackEntry, StackEntryKind};
+        use engine::types::identifiers::CardId;
+        use engine::types::mana::ManaColor;
+        use engine::types::zones::Zone;
+
+        let mut state = GameState::new_two_player(42);
+        let ai = PlayerId(0);
+        let opponent = PlayerId(1);
+        let recipient = create_test_creature(&mut state, ai);
+        let aura_id = engine::game::zones::create_object(
+            &mut state,
+            CardId(88),
+            opponent,
+            "Opposing Aura".to_string(),
+            Zone::Stack,
+        );
+        let aura = state.objects.get_mut(&aura_id).unwrap();
+        aura.card_types.core_types.push(CoreType::Enchantment);
+        aura.card_types.subtypes.push("Aura".to_string());
+        aura.color = vec![ManaColor::Blue];
+        // The Aura spell holds the creature; `chosen` says whether it was
+        // chosen as the spell's target.
+        for chosen in [vec![0], vec![]] {
+            let mut ability = ResolvedAbility::new(
+                Effect::unimplemented("aura spell", "Enchant creature"),
+                vec![TargetRef::Object(recipient)],
+                aura_id,
+                opponent,
+            );
+            ability.chosen_target_slots = ChosenTargetSlots::Recorded(chosen.clone());
+            let mut board = state.clone();
+            board.stack.push_back(StackEntry {
+                id: aura_id,
+                source_id: aura_id,
+                controller: opponent,
+                kind: StackEntryKind::Spell {
+                    card_id: CardId(88),
+                    ability: Some(Box::new(ability)),
+                    casting_variant: Default::default(),
+                    actual_mana_spent: 0,
+                },
+            });
+            for grant in [
+                shroud_grant(PlayerId(0)),
+                DefensiveGrant::HexproofFrom(HexproofFilter::Color(ManaColor::Blue)),
+                DefensiveGrant::Protection(ProtectionTarget::Color(ManaColor::Blue)),
+            ] {
+                assert_eq!(
+                    stack_payoff_for_opportunity(
+                        &board,
+                        ai,
+                        &DefensiveOpportunity {
+                            grant: grant.clone(),
+                            recipients: vec![recipient],
+                        },
+                    ),
+                    Some(!chosen.is_empty()),
+                    "{grant:?}, chosen {chosen:?}"
+                );
+            }
+        }
+    }
+}

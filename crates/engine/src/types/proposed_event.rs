@@ -1,0 +1,2999 @@
+use std::collections::HashSet;
+
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::game::game_object::{
+    AttachTarget, BackFaceData, DisplayIdentity, GameObject, ObjectIncarnationRefExt,
+};
+
+use super::counter::CounterType;
+use super::definitions::ReplacementIdentity;
+
+use super::ability::{
+    ContinuousModification, CopiableValues, DieRollIgnoreRule, Duration, FaceDownProfile,
+    LibraryPosition, TargetRef,
+};
+use super::events::EventObjectSnapshot;
+use super::identifiers::{ObjectId, ObjectIncarnationRef, ProtectionReplacementSourceExt};
+use super::keywords::{Keyword, MatchedProtectionQuality};
+use super::mana::{ManaType, UnitDecision};
+use super::phase::Phase;
+use super::player::{PlayerCounterKind, PlayerId};
+use super::zones::Zone;
+
+pub use super::token_spec::{
+    TokenAttackRequest, TokenCharacteristics, TokenHostRequest, TokenSpec,
+};
+pub use super::zones::{ChainReferentIntent, EtbTapState};
+
+/// CR 616.1: identity of one replacement candidate: the source object plus a
+/// per-source ordinal — or, for virtual protection candidates, the quality's
+/// full 64-bit minor word. `u64`, never `usize`: the index rides in
+/// serialized pause records on every target including wasm32, where `usize`
+/// is 32 bits wide and would truncate fingerprint qualities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReplacementId {
+    pub source: ObjectId,
+    pub index: u64,
+}
+
+impl ReplacementId {
+    /// Contained `u64`→`usize` conversion for registry indexing. Real
+    /// definition ordinals always fit; anything wider (a virtual-candidate
+    /// payload, or foreign) resolves to `None` — the same answer a direct
+    /// `.get()` gives an out-of-range index on 64-bit.
+    pub(crate) fn index_as_usize(self) -> Option<usize> {
+        usize::try_from(self.index).ok()
+    }
+}
+
+impl ReplacementIdentity for ReplacementId {
+    fn registry_index(self) -> Option<usize> {
+        self.index_as_usize()
+    }
+}
+
+/// CR 701.23a + CR 614.6: Final disposition of one found card after the
+/// replacement pipeline. The modified form snapshots the selected source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchFoundDisposition {
+    Original,
+    Modified(BoundSearchFoundDisposition),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundSearchFoundDisposition {
+    pub destination: Zone,
+    /// CR 400.7: exact incarnation of the selected replacement source. A
+    /// resumed choice consumes this snapshot without rebinding to a new object
+    /// that later reused the same id.
+    pub source: ObjectIncarnationRef,
+    /// CR 611.2b + CR 609.4b: A permission rider bound at replacement
+    /// selection time and installed only after the found card actually reaches
+    /// exile. It contains no found-object identity; delivery supplies that
+    /// independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<BoundSearchFoundGrant>,
+    /// CR 608.2c: who performs the found card's move. `LibraryPlayer` is the
+    /// searcher, whose own library is searched ("they exile each card they
+    /// find"); `Controller` records no performer. A named `Player` is never
+    /// bound.
+    #[serde(
+        default,
+        skip_serializing_if = "super::ability::LibraryInstructionActor::is_controller"
+    )]
+    pub actor: super::ability::LibraryInstructionActor,
+}
+
+impl BoundSearchFoundDisposition {
+    /// CR 608.2c: the player recorded as having exiled the found
+    /// card, given the event's searcher. Only a move that requests exile
+    /// records a performer. The delivery states that no player's action
+    /// decides ownership (`EntryOwnershipActor::NoPlayer`), so a replacement
+    /// that redirects the requested exile elsewhere (CR 614.6) cannot make the
+    /// searcher the card's receiver or owner.
+    pub fn performer(&self, searcher: PlayerId) -> Option<PlayerId> {
+        use super::ability::LibraryInstructionActor;
+        match &self.actor {
+            LibraryInstructionActor::LibraryPlayer if self.destination == Zone::Exile => {
+                Some(searcher)
+            }
+            LibraryInstructionActor::LibraryPlayer
+            | LibraryInstructionActor::Controller
+            | LibraryInstructionActor::Player { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundSearchFoundGrant {
+    /// CR 400.7: exact incarnation of the replacement source whose effect
+    /// created the permission.
+    pub source: ObjectIncarnationRef,
+    pub controller: PlayerId,
+    pub grantee: PlayerId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mana_spend_permission: Option<super::ability::ManaSpendPermission>,
+}
+
+/// CR 616.1: Candidate data frozen when a SearchFound ordering
+/// prompt is offered. Resume consumes this snapshot without consulting the
+/// live source object or replacement registry again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundSearchFoundCandidate {
+    pub replacement_id: ReplacementId,
+    pub disposition: BoundSearchFoundDisposition,
+    pub source_name: String,
+    pub description: String,
+    /// Whether the snapshotted definition may be declined. This is carried per
+    /// candidate because a CR 616.1 ordering prompt can contain more than one
+    /// optional SearchFound replacement; collapsing optionality onto the whole
+    /// pending prompt would force one of them to apply.
+    #[serde(default)]
+    pub is_optional: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(tag = "type")]
+pub enum AppliedReplacementKey {
+    Object {
+        source: ObjectId,
+        index: u64,
+    },
+    Floating {
+        index: u64,
+    },
+    StepEndMana {
+        index: u64,
+    },
+    /// CR 614.12a: The selected controller for an as-enters replacement.
+    /// This rides the event's existing replacement provenance so the selected
+    /// answer remains distinguishable from an originating controller override.
+    EntryControllerChoice {
+        source: ObjectId,
+        index: u64,
+        controller: PlayerId,
+    },
+    /// CR 702.16e + CR 615.13 (Matt F4, keyed by ability in R8-F1):
+    /// prevention by player/object protection inside a simultaneous batch.
+    /// Protection has no registry shield (and no rider), so it aggregates
+    /// under its own key — one application per (quality, recipient) per
+    /// batch — instead of fragmenting one event per damage event. The key
+    /// carries the matched protection quality (CR 702.16g: "protection from
+    /// [A] and from [B]" behaves as two separate abilities), never granter
+    /// identity: the gate claims each event for its first matching ability,
+    /// and qualities survive save/load while grantor tables do not.
+    Protection {
+        quality: MatchedProtectionQuality,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(tag = "type")]
+enum TaggedAppliedReplacementKey {
+    Object {
+        source: ObjectId,
+        index: u64,
+    },
+    Floating {
+        index: u64,
+    },
+    StepEndMana {
+        index: u64,
+    },
+    EntryControllerChoice {
+        source: ObjectId,
+        index: u64,
+        controller: PlayerId,
+    },
+    Protection {
+        quality: MatchedProtectionQuality,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(untagged)]
+enum AppliedReplacementKeyCompat {
+    Tagged(TaggedAppliedReplacementKey),
+    Legacy(ReplacementId),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum LegacySentinelCarrier {
+    Floating,
+    StepEndMana,
+}
+
+impl AppliedReplacementKeyCompat {
+    fn into_key(self, sentinel_carrier: LegacySentinelCarrier) -> AppliedReplacementKey {
+        match self {
+            AppliedReplacementKeyCompat::Tagged(TaggedAppliedReplacementKey::Object {
+                source,
+                index,
+            }) => AppliedReplacementKey::Object { source, index },
+            AppliedReplacementKeyCompat::Tagged(TaggedAppliedReplacementKey::Floating {
+                index,
+            }) => AppliedReplacementKey::Floating { index },
+            AppliedReplacementKeyCompat::Tagged(TaggedAppliedReplacementKey::StepEndMana {
+                index,
+            }) => AppliedReplacementKey::StepEndMana { index },
+            AppliedReplacementKeyCompat::Tagged(
+                TaggedAppliedReplacementKey::EntryControllerChoice {
+                    source,
+                    index,
+                    controller,
+                },
+            ) => AppliedReplacementKey::EntryControllerChoice {
+                source,
+                index,
+                controller,
+            },
+            AppliedReplacementKeyCompat::Tagged(TaggedAppliedReplacementKey::Protection {
+                quality,
+            }) => AppliedReplacementKey::Protection { quality },
+            AppliedReplacementKeyCompat::Legacy(ReplacementId {
+                source: ObjectId(0),
+                index,
+            }) => match sentinel_carrier {
+                LegacySentinelCarrier::Floating => AppliedReplacementKey::Floating { index },
+                LegacySentinelCarrier::StepEndMana => AppliedReplacementKey::StepEndMana { index },
+            },
+            AppliedReplacementKeyCompat::Legacy(ReplacementId { source, index }) => {
+                AppliedReplacementKey::Object { source, index }
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AppliedReplacementKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        AppliedReplacementKeyCompat::deserialize(deserializer)
+            .map(|key| key.into_key(LegacySentinelCarrier::Floating))
+    }
+}
+
+impl AppliedReplacementKey {
+    pub fn object(source: ObjectId, index: u64) -> Self {
+        Self::Object { source, index }
+    }
+
+    pub fn floating(index: u64) -> Self {
+        Self::Floating { index }
+    }
+
+    pub fn step_end_mana(index: u64) -> Self {
+        Self::StepEndMana { index }
+    }
+
+    pub fn source(self) -> ObjectId {
+        match self {
+            AppliedReplacementKey::Object { source, .. }
+            | AppliedReplacementKey::EntryControllerChoice { source, .. } => source,
+            AppliedReplacementKey::Floating { .. }
+            | AppliedReplacementKey::StepEndMana { .. }
+            | AppliedReplacementKey::Protection { .. } => ObjectId(0),
+        }
+    }
+
+    pub fn index(self) -> u64 {
+        match self {
+            AppliedReplacementKey::Object { index, .. }
+            | AppliedReplacementKey::Floating { index }
+            | AppliedReplacementKey::StepEndMana { index }
+            | AppliedReplacementKey::EntryControllerChoice { index, .. } => index,
+            // Protection never reaches `as_replacement_id`: the aggregate
+            // drain matches it before the registry lookup. The 0 is a
+            // type-system placeholder, never a registry address.
+            AppliedReplacementKey::Protection { .. } => 0,
+        }
+    }
+
+    pub fn as_replacement_id(self) -> ReplacementId {
+        ReplacementId {
+            source: self.source(),
+            index: self.index(),
+        }
+    }
+
+    pub fn for_event(event: &ProposedEvent, id: ReplacementId) -> Self {
+        // CR 616.1 (Matt R10-F1): protection virtual candidates key by
+        // their quality (pure unpack — no state needed, so the applied-set
+        // path stays total). The rid index carries the minor word whole on
+        // every target (`u64`, never `usize`), so our own writes always
+        // decode; foreign rids in the source range fall through to the
+        // opaque object key, contained.
+        if let Some(discriminant) = id.source.protection_source_discriminant() {
+            if let Some(quality) =
+                MatchedProtectionQuality::from_replacement_parts(discriminant, id.index)
+            {
+                return Self::Protection { quality };
+            }
+        }
+        if id.source != ObjectId(0) {
+            return Self::object(id.source, id.index);
+        }
+        match event {
+            ProposedEvent::EmptyManaPool { .. } => Self::step_end_mana(id.index),
+            _ => Self::floating(id.index),
+        }
+    }
+}
+
+pub fn deserialize_applied_keys_step_end_mana<'de, D>(
+    deserializer: D,
+) -> Result<HashSet<AppliedReplacementKey>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let keys = Vec::<AppliedReplacementKeyCompat>::deserialize(deserializer)?;
+    Ok(keys
+        .into_iter()
+        .map(|key| key.into_key(LegacySentinelCarrier::StepEndMana))
+        .collect())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CounterMoveStage {
+    Remove,
+    Add,
+}
+
+/// CR 121.2 + CR 121.2a: which stage of a draw a `ProposedEvent::Draw` is at.
+///
+/// "Draw N cards" is one instruction performed as N individual card draws
+/// (CR 121.2), and a replacement that refers to the number of cards drawn
+/// modifies the instruction "before considering any of the individual card
+/// draws" (CR 121.2a). The draw sequence proposes the instruction once, whole,
+/// then proposes each surviving individual draw. A definition's
+/// [`DrawReplacementScope`](super::ability::DrawReplacementScope) names the one
+/// stage it watches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum DrawEventStage {
+    /// The whole draw instruction, carrying its full count.
+    Instruction,
+    /// One individual card draw.
+    #[default]
+    Individual,
+}
+
+impl DrawEventStage {
+    /// Keeping the default omitted preserves the existing wire shape of an
+    /// individual draw event.
+    pub fn is_individual(&self) -> bool {
+        matches!(self, Self::Individual)
+    }
+}
+
+/// CR 614.16: provenance of a counter placement for "if an effect would put
+/// one or more counters" replacement effects. A placement is eligible when its
+/// cause is [`CounterCause::ResolvingEffect`] (the effect of a resolving spell
+/// or ability put the counter on) or [`CounterCause::ReplacementOrPrevention`]
+/// (another replacement or prevention effect did so, even when the original
+/// event being modified was not itself an effect). [`CounterCause::Other`] is
+/// the fail-closed default: cost payment, turn-based action, or any producer
+/// not yet classified. Real cause assignment owns to the callers (Phase 3);
+/// every direct constructor stamps `Other` until then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum CounterCause {
+    /// The placement comes from resolving a spell or ability effect.
+    ResolvingEffect,
+    /// The placement comes from another replacement or prevention effect.
+    ReplacementOrPrevention,
+    /// Fail-closed default: cost, turn-based action, or unclassified producer.
+    #[default]
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CounterPlacement {
+    Object {
+        #[serde(default)]
+        actor: PlayerId,
+        object_id: ObjectId,
+        counter_type: CounterType,
+        /// CR 614.16 provenance; inert until the eligibility gate lands.
+        #[serde(default)]
+        cause: CounterCause,
+    },
+    Player {
+        actor: PlayerId,
+        player_id: PlayerId,
+        counter_kind: PlayerCounterKind,
+        /// CR 614.16 provenance; inert until the eligibility gate lands.
+        #[serde(default)]
+        cause: CounterCause,
+    },
+    Energy {
+        actor: PlayerId,
+        player_id: PlayerId,
+        /// CR 614.16 provenance; inert until the eligibility gate lands.
+        #[serde(default)]
+        cause: CounterCause,
+    },
+}
+
+impl CounterPlacement {
+    pub fn object_id(&self) -> Option<ObjectId> {
+        match self {
+            CounterPlacement::Object { object_id, .. } => Some(*object_id),
+            CounterPlacement::Player { .. } | CounterPlacement::Energy { .. } => None,
+        }
+    }
+
+    pub fn player_id(&self) -> Option<PlayerId> {
+        match self {
+            CounterPlacement::Player { player_id, .. }
+            | CounterPlacement::Energy { player_id, .. } => Some(*player_id),
+            CounterPlacement::Object { .. } => None,
+        }
+    }
+
+    pub fn actor(&self) -> PlayerId {
+        match self {
+            CounterPlacement::Object { actor, .. }
+            | CounterPlacement::Player { actor, .. }
+            | CounterPlacement::Energy { actor, .. } => *actor,
+        }
+    }
+}
+
+impl ProposedEvent {
+    /// CR 614.16: promote a counter placement's [`CounterCause`] to
+    /// [`CounterCause::ReplacementOrPrevention`] once a replacement modifies
+    /// it. "If an effect would put one or more counters" replacements "also
+    /// apply if another replacement or prevention effect does so, even if the
+    /// original event being modified wasn't itself an effect" — so the
+    /// modified placement is effect-eligible whatever its original cause was
+    /// (cost payment and turn-based actions stamp `Other`, which fails the
+    /// gate until a replacement touches the placement). Callers are the
+    /// counter appliers that return a modified placement (`add_counter_applier`'s
+    /// three `Modified` arms and `apply_compleated_replacement`); every other
+    /// shape — including the move's remove stage, which is not a "put" — is
+    /// returned unchanged.
+    pub fn promote_counter_placement_cause(mut event: ProposedEvent) -> ProposedEvent {
+        match &mut event {
+            ProposedEvent::AddCounter { placement, .. } => match placement {
+                CounterPlacement::Object { cause, .. }
+                | CounterPlacement::Player { cause, .. }
+                | CounterPlacement::Energy { cause, .. } => {
+                    *cause = CounterCause::ReplacementOrPrevention;
+                }
+            },
+            ProposedEvent::MoveCounter {
+                stage: CounterMoveStage::Add,
+                cause,
+                ..
+            } => {
+                *cause = CounterCause::ReplacementOrPrevention;
+            }
+            ProposedEvent::MoveCounter { .. } => {}
+            _ => {}
+        }
+        event
+    }
+}
+
+/// CR 707.2 + CR 707.5: Copy-token creation payload carried by the same
+/// `CreateToken` proposed event that ordinary token creation uses for
+/// replacement effects. `TokenSpec` remains the replacement-visible probe
+/// characteristics; this payload carries the full copiable values needed once
+/// the event is accepted, including display metadata that is not copiable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyTokenSpec {
+    pub values: Box<CopiableValues>,
+    /// Display routing of the copy source (see [`DisplayIdentity`]). CR 111.1 +
+    /// CR 707.2: carries the exact token-art pointer when the source is itself a
+    /// true token, so a token-copy of a token resolves the source token's art
+    /// instead of falling back to a name+filter Scryfall search. `token_art` is
+    /// captured by the enter-as-copy replacement selection so an enter-as-copy
+    /// recipient (which keeps its own base and never runs the token creation
+    /// injectors) renders from the source's printed shape even when no exact ref
+    /// matched; it is `None` for printed-card sources, departed (LKI) sources,
+    /// and created copy-tokens — the latter derive their descriptor from their
+    /// own base at injection, which also reflects copy exceptions the source
+    /// never had.
+    #[serde(flatten)]
+    pub display: DisplayIdentity,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_keywords: Vec<Keyword>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_modifications: Vec<ContinuousModification>,
+    pub tapped: bool,
+    pub enters_attacking: bool,
+    /// CR 508.4: the batch's resolved destination.
+    #[serde(default, skip_serializing_if = "TokenAttackRequest::is_unspecified")]
+    pub attack_request: TokenAttackRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sacrifice_at: Option<Duration>,
+    pub source_id: ObjectId,
+    pub controller: PlayerId,
+    /// CR 608.2h + CR 707.9b: the copy donor whose live (or last-known)
+    /// characteristics donor-referential copy exceptions read. Dynamic P/T
+    /// exceptions ("half that creature's power", Saw in Half) resolve their
+    /// `Source`-scoped quantity against this incarnation at the stamp, so a
+    /// departed donor reads LKI rather than the token's own copied base.
+    /// `None` where no donor is in scope; consumers fall back to the token id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub donor: Option<ObjectIncarnationRef>,
+    /// CR 707.8a: both faces when the copy source is a double-faced permanent or
+    /// card; `None` for a single-faced source and for every producer that is not
+    /// an effect creating a token copy (each states why at its literal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub double_faced: Option<CopiedDoubleFaces>,
+}
+
+/// CR 707.8a: the faces of a token copy of a double-faced permanent, or of a
+/// double-faced card in another zone. `hidden` is the face that is not up,
+/// installed as the token's stored face with the copy's exceptions folded in
+/// (CR 707.9a/b/d); `up` names the face that is up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopiedDoubleFaces {
+    pub hidden: Box<BackFaceData>,
+    pub up: CopiedFaceUp,
+}
+
+/// CR 707.8a: which face of a double-faced copy token is up, as the copied
+/// object showed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CopiedFaceUp {
+    /// CR 712.8d: the front face.
+    Front,
+    /// CR 712.8e: a nonmodal double-faced permanent's back face (`transformed`).
+    TransformedBack,
+    /// CR 712.8f: a modal double-faced permanent's back face (`modal_back_face`).
+    ModalBack,
+}
+
+/// CR 614.1a + CR 111.1 + CR 616.1f: one batch of a CreateToken event — the
+/// event's own batch, or one a replacement added ("those tokens plus …",
+/// "instead create one of each"). An added batch is part of the same modified
+/// event, so every replacement applied afterwards applies to it too (to each
+/// batch it matches) under the affected player's single CR 616.1 ordering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenBatch {
+    pub owner: PlayerId,
+    pub spec: Box<TokenSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy: Option<Box<CopyTokenSpec>>,
+    #[serde(default)]
+    pub enter_tapped: EtbTapState,
+    pub count: u32,
+    /// CR 614.6: where an applied replacement sent this batch's entrants
+    /// instead of the battlefield (see [`ProposedEvent::CreateToken`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirected_to: Option<Zone>,
+}
+
+impl TokenBatch {
+    /// This batch as a single-batch `CreateToken` event carrying `applied`.
+    pub fn into_event(self, applied: HashSet<AppliedReplacementKey>) -> ProposedEvent {
+        let TokenBatch {
+            owner,
+            spec,
+            copy,
+            enter_tapped,
+            count,
+            redirected_to,
+        } = self;
+        ProposedEvent::CreateToken {
+            owner,
+            spec,
+            copy,
+            enter_tapped,
+            count,
+            appended: Vec::new(),
+            redirected_to,
+            applied,
+        }
+    }
+}
+
+/// CR 701.31 + CR 901.9c + CR 701.31c: Which rules path is proposing a
+/// planeswalk event. Scoped replacements (Fixed Point in Time) match only
+/// [`PlanarDie`]; generic "if you would planeswalk" replacements (Susan Foreman)
+/// match every cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PlaneswalkCause {
+    /// CR 901.8 / CR 901.9c: Planeswalker symbol on the planar die.
+    PlanarDie,
+    /// CR 701.31: Planeswalk from a spell or ability instruction (including
+    /// chained "then planeswalk" riders).
+    Instruction,
+    /// CR 701.31c / CR 312.5 / CR 704.6f: Phenomenon encounter, phenomenon
+    /// state-based planeswalk, and other rules-process planeswalks that are not
+    /// the planar-die ability and not an ability resolving on the stack.
+    #[default]
+    RulesProcess,
+}
+
+/// The `EntryOwnership::ActorOwns` input of a zone move
+/// (`zone_pipeline::entry_receiver`), recorded apart from the move's performer.
+///
+/// Every current writer records `NoPlayer` or `Player`, so a replacement that
+/// redirects a move (CR 614.6: "A modified event occurs instead") keeps the
+/// input the move was requested with. `Unrecorded` is what a save from before
+/// the field existed decodes to: those writers recorded one player, in
+/// `performed_by`, for both roles, and delivery keeps reading it for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EntryOwnershipActor {
+    /// The field is absent: a save from a writer that had no separate input.
+    #[default]
+    Unrecorded,
+    /// No player's action decides ownership; the card keeps its owner.
+    NoPlayer,
+    /// This player's action decides ownership.
+    Player(PlayerId),
+}
+
+impl EntryOwnershipActor {
+    /// Serde skip-helper: `Unrecorded` is the absent field.
+    pub fn is_unrecorded(&self) -> bool {
+        matches!(self, Self::Unrecorded)
+    }
+
+    /// The ownership input, given the event's recorded performer for a save
+    /// that predates the separate field.
+    pub fn resolve(self, legacy_performer: Option<PlayerId>) -> Option<PlayerId> {
+        match self {
+            Self::Player(player) => Some(player),
+            Self::NoPlayer => None,
+            Self::Unrecorded => legacy_performer,
+        }
+    }
+}
+
+impl From<Option<PlayerId>> for EntryOwnershipActor {
+    /// A current writer's input: a named player or, explicitly, nobody.
+    fn from(actor: Option<PlayerId>) -> Self {
+        actor.map_or(Self::NoPlayer, Self::Player)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProposedEvent {
+    ZoneChange {
+        object_id: ObjectId,
+        from: Zone,
+        to: Zone,
+        /// Final placement carried by this proposal. Explicit null is authoritative;
+        /// only save migration may import a missing field from a legacy carrier.
+        /// Boxed: `LibraryPosition` is 96 B and only library moves carry one, so
+        /// inline it would widen every `ProposedEvent` held by `GameState`
+        /// (`game_state_size.rs`).
+        #[serde(default)]
+        library_placement: Option<Box<LibraryPosition>>,
+        cause: Option<ObjectId>,
+        /// CR 303.4f: When an Aura enters the battlefield by a non-spell
+        /// effect and the effect does not specify what it enchants, the
+        /// controller chooses a legal object or player as it enters. The
+        /// ChangeZone pipeline resolves that choice before delivery and carries
+        /// the chosen host here so the battlefield entry and attachment are one
+        /// event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach_to: Option<AttachTarget>,
+        /// Explicit ETB tap-state override carried through the replacement pipeline.
+        /// `Unspecified` preserves any non-replacement tapped seed from the originating effect.
+        #[serde(default)]
+        enter_tapped: EtbTapState,
+        /// CR 508.4: Whether this permanent enters the battlefield attacking.
+        /// Carried through the replacement pipeline because an ETB-counter or
+        /// replacement-ordering pause resumes from the approved ZoneChange.
+        #[serde(default)]
+        enters_attacking: bool,
+        /// Counters to place on this permanent as it enters the battlefield.
+        /// Each entry is (counter_type, count). Set by ETB-counter replacements.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        enter_with_counters: Vec<(CounterType, u32)>,
+        /// CR 614.1c + CR 611.2a: "and with …" entry grants folded from the
+        /// applied replacements' execute chains, in application (CR 616.1)
+        /// order. They ride the event — like counters — so every applicable
+        /// same-entry rider survives, and delivery installs them on the new
+        /// object after CR 400.7's reset, exactly as the post-entry drain
+        /// would have for a single rider. `None` when there are none; appended only through
+        /// [`EnterWithGrants::append`], so `Some` is never empty. Boxed like
+        /// `face_down_profile`.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "EnterWithGrants::deserialize_nonempty"
+        )]
+        enter_with_grants: Option<Box<EnterWithGrants>>,
+        /// Override the controller on ETB. Used by Earthbending return ("under your control")
+        /// and other "enters the battlefield under [player]'s control" effects.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controller_override: Option<PlayerId>,
+        /// CR 712.2: When true, the object enters the battlefield showing its back face.
+        /// Set by "return ... transformed" effects.
+        #[serde(default)]
+        enter_transformed: bool,
+        /// CR 708.2a + CR 708.3: When `Some`, the object is turned face down
+        /// (before entering, CR 708.3) with these characteristics as it enters
+        /// the battlefield. Carried through the replacement pipeline so the
+        /// face-down state is established before ETB triggers would fire.
+        /// Boxed so this rarely-set field doesn't inflate the size of every
+        /// `ProposedEvent` (and the `Result<_, ProposedEvent>` pipeline).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        face_down_profile: Option<Box<FaceDownProfile>>,
+        /// Typed SearchLibrary intent. This is delivery metadata, not a
+        /// battlefield `FaceDownProfile`, and survives replacement pauses.
+        #[serde(
+            default,
+            skip_serializing_if = "crate::types::ability::ExileConcealment::is_public"
+        )]
+        face_down_in_exile: crate::types::ability::ExileConcealment,
+        /// CR 608.2c: whether this entry is the producer a following
+        /// demonstrative anaphor binds to. Rides the event so a CR 616.1
+        /// pause/resume delivers the same answer the effect asked for.
+        #[serde(default, skip_serializing_if = "ChainReferentIntent::is_silent")]
+        chain_referent: ChainReferentIntent,
+        /// CR 614.12a + CR 616.1c + CR 707.2: Pre-entry copy payload for
+        /// Mystic Reflection-style replacements. The copied values ride the
+        /// event so later replacement passes can match the entering permanent
+        /// as it would exist after the copy effect, before the zone change is
+        /// delivered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enter_as_copy: Option<Box<CopyTokenSpec>>,
+        /// CR 614.12a + CR 614.12: the answers to the entrant's own "As ~ enters,
+        /// choose …" replacements, made before it enters. They ride the event so
+        /// later replacement passes match the entering permanent as it would
+        /// exist with its choices, and delivery installs them on the new object
+        /// after CR 400.7's reset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enter_with_choices: Option<Box<EntryChoices>>,
+        /// CR 701.9a + CR 614.1: Preserves an operation-owned discard frame
+        /// through the inner hand-to-destination move and any replacement
+        /// choices. Unrelated zone changes omit it from the wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        discard_frame: Option<crate::types::identifiers::DiscardFrameId>,
+        /// CR 608.2c: the player performing the instruction that moves this
+        /// object ("that player exiles that card" names the drawer; a
+        /// controller-worded instruction names the controller). Rides the
+        /// event through replacement and CR 616.1 pause/resume so delivery can
+        /// record who exiled the object, including when re-exile creates a new
+        /// object without a zone change (CR 400.8).
+        /// `None` for moves no player performs (rules processes, raw movers).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        performed_by: Option<PlayerId>,
+        /// CR 614.12 + CR 611.2e: the same-resolution with-entry effect
+        /// ([`WithEntryEffect`]), carried through every replacement pass and
+        /// CR 616.1 pause. Boxed like `face_down_profile`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        with_entry_effect: Option<Box<WithEntryEffect>>,
+        /// CR 614.4 + CR 614.12: the other members of this battlefield entry's event
+        /// ([`CoEntrants`]), carried through every replacement pass and CR 616.1 pause.
+        /// `None` when there are none; built only by [`CoEntrants::for_entrant`], so `Some` is
+        /// never empty. Boxed like `face_down_profile`.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "CoEntrants::deserialize_nonempty"
+        )]
+        co_entrants: Option<Box<CoEntrants>>,
+        /// The player whose action decides entry ownership under
+        /// `EntryOwnership::ActorOwns` (`zone_pipeline::entry_receiver`), kept
+        /// apart from `performed_by`: an instruction's subject performs the move
+        /// while the instruction's controller (the zone prompt's chooser on the
+        /// interactive route) stays the ownership input.
+        #[serde(default, skip_serializing_if = "EntryOwnershipActor::is_unrecorded")]
+        ownership_actor: EntryOwnershipActor,
+        /// CR 701.24a + CR 730.3: whether this move is the move component of a
+        /// "shuffle [set] into [library]" operation whose chained `Shuffle`
+        /// randomizes the library. Its library position is then transient, so
+        /// a merged permanent's components share it instead of each taking the
+        /// zone default. Rides the event through replacement and CR 616.1
+        /// pause/resume, like `face_down_in_exile`.
+        #[serde(
+            default,
+            skip_serializing_if = "phase_ast::types::ability::LibraryShuffleMode::is_per_object"
+        )]
+        library_shuffle: crate::types::ability::LibraryShuffleMode,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    Damage {
+        source_id: ObjectId,
+        target: TargetRef,
+        amount: u32,
+        is_combat: bool,
+        /// CR 608.2h + CR 702.16e: the source's name as observed when the
+        /// damage event was created — the live name for live sources, the
+        /// last-known-information projection for departed sources (a Clone
+        /// copying Volatile Rig now in the graveyard reads "Volatile Rig",
+        /// not "Clone"). Protection matching reads this override before the
+        /// live object so chosen-name protection (Runed Halo) survives its
+        /// source across pauses, resumes, and save/load. `None` (including
+        /// payloads written before the field existed) falls back to the live
+        /// object, exactly the pre-override behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_name: Option<String>,
+        /// CR 400.7 + CR 608.2h: the source incarnation observed when the
+        /// damage event was created. Protection matching reads the live object
+        /// only while it is still this incarnation; a later object under the
+        /// id (a Clone back in the graveyard) is a different object and the
+        /// match falls to this incarnation's exit last-known information
+        /// instead. `None` (including payloads written before the field
+        /// existed) keeps the legacy live-first read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_incarnation: Option<u64>,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    Draw {
+        player_id: PlayerId,
+        count: u32,
+        /// CR 121.2a: the instruction, or one of its individual draws.
+        #[serde(default, skip_serializing_if = "DrawEventStage::is_individual")]
+        stage: DrawEventStage,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 701.23a + CR 614.1: One card found during a search, before the
+    /// search instruction sends it to its printed destination.
+    SearchFound {
+        searcher: PlayerId,
+        /// Semantic owner of the library participating in this search. `None`
+        /// when Library was not among the effective searched zones.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        library_owner: Option<PlayerId>,
+        object_id: ObjectId,
+        disposition: SearchFoundDisposition,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 701.22a + CR 614.1a: A player is about to scry cards. Replacement
+    /// effects can modify the count or replace the scry with another action.
+    Scry {
+        player_id: PlayerId,
+        count: u32,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 701.17a + CR 614.1a: A player is about to mill cards. Count-level
+    /// replacement effects such as "mill twice that many cards instead" must
+    /// see the event before individual library cards move zones.
+    Mill {
+        player_id: PlayerId,
+        count: u32,
+        destination: Zone,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 705.1 + CR 614.1a: A player is about to flip a single coin. Carried
+    /// through the replacement pipeline so per-flip "instead flip two and ignore
+    /// one" effects (Krark's Thumb) double the count before the RNG runs. Per the
+    /// card's 2019-01-25 ruling, each individual flip is replaced separately.
+    CoinFlip {
+        player_id: PlayerId,
+        count: u32,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 706.1 + CR 614.1a: A player is about to roll one or more dice as a
+    /// single instruction. Carried through the replacement pipeline so
+    /// count-modifying "instead roll that many dice plus one" effects
+    /// (Barbarian Class, Pixie Guide, Wyll) raise the count before the RNG runs.
+    ///
+    /// CR 706.1: The event is per-INSTRUCTION, not per-die — one "roll two
+    /// six-sided dice" instruction proposes ONE `RollDice { count: 2 }`. This
+    /// matches the once-per-batch firing of die-roll triggers. Contrast
+    /// `CoinFlip`, which is per-flip per Krark's Thumb's own ruling.
+    RollDice {
+        player_id: PlayerId,
+        count: u32,
+        sides: u8,
+        /// CR 706.6: What the die-roll resolver must do with the extra dice the
+        /// applied replacements caused to be rolled — ONE entry per applied
+        /// replacement, in application order. Appended by `roll_dice_applier`
+        /// from each matched `ReplacementDefinition.die_ignore_rule`; empty when
+        /// no applied replacement carried an ignore instruction. This field is
+        /// the ONLY channel by which the rules reach `roll_die.rs` —
+        /// `ApplyResult` carries nothing but the modified event.
+        ///
+        /// A `Vec` rather than an `Option` because CR 706.6 applies once per
+        /// INSTRUCTING effect: two stacked die-roll replacements (Barbarian
+        /// Class + Pixie Guide) each raise the count by one AND each instruct
+        /// the roller to ignore a roll, so three dice are rolled and TWO are
+        /// ignored. Collapsing to a single rule would leave the extra die
+        /// surviving and inflate every aggregate.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ignore_rules: Vec<DieRollIgnoreRule>,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 701.37a + CR 614.1a: A creature is about to explore. Replacement
+    /// effects can modify the explore action (e.g., add a scry prelude).
+    Explore {
+        object_id: ObjectId,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 701.50a + CR 614.1a: A creature is about to connive (draw N, discard N,
+    /// +1/+1 per nonland discarded). Carried through the replacement pipeline so
+    /// effects that intercept the connive keyword action (Leader, Super-Genius —
+    /// "instead you draw a card, then that creature connives") see the event
+    /// before the draw/discard/counter steps run. `count` is the connive N value,
+    /// already resolved from `QuantityExpr` at propose time.
+    Connive {
+        object_id: ObjectId,
+        /// CR 400.7 + CR 701.50b/f: the exact permanent that proposed this
+        /// action. A replacement-ordering pause must not recapture a later
+        /// incarnation that reused `object_id`. Intentionally no serde default:
+        /// a legacy raw-id-only parked event cannot reconstruct this authority.
+        subject: Box<EventObjectSnapshot>,
+        count: u32,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 701.34a + CR 614.1a: A player is about to proliferate. Replacement
+    /// effects can modify how many times the proliferate action is performed
+    /// (Tekuthal, Inquiry Dominus — "proliferate twice instead").
+    Proliferate {
+        player_id: PlayerId,
+        count: u32,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    LifeGain {
+        player_id: PlayerId,
+        amount: u32,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    LifeLoss {
+        player_id: PlayerId,
+        amount: u32,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    AddCounter {
+        /// CR 122.1 + CR 107.14: Counter placement may affect an object or a
+        /// player. Energy is represented as a dedicated player field at runtime
+        /// but is still a counter-placement event for replacement purposes.
+        #[serde(flatten)]
+        placement: CounterPlacement,
+        count: u32,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    RemoveCounter {
+        object_id: ObjectId,
+        counter_type: CounterType,
+        count: u32,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 122.5: Moving a counter is atomic: remove it from one object and put
+    /// it on another. Replacement effects see the remove and add stages, but
+    /// the physical counter mutation is committed only after both stages survive.
+    MoveCounter {
+        #[serde(default)]
+        actor: PlayerId,
+        source_id: ObjectId,
+        destination_id: ObjectId,
+        counter_type: CounterType,
+        remove_count: u32,
+        add_count: u32,
+        stage: CounterMoveStage,
+        /// CR 614.16 provenance of the initiating placement; inert until gate.
+        #[serde(default)]
+        cause: CounterCause,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 111.1 + CR 614.1a: Token creation event carrying the full
+    /// self-describing token specification. Replacement effects can modify
+    /// `count` (Doubling Season, Primal Vigor) or inspect `spec` for
+    /// characteristic-based gating (e.g., "whenever a creature token you
+    /// control would enter ...").
+    ///
+    /// `spec` is boxed so this variant doesn't dominate the enum size —
+    /// `TokenSpec` is ~400 bytes of resolved characteristics, and most
+    /// other variants are small IDs.
+    CreateToken {
+        owner: PlayerId,
+        /// Resolved token characteristics, keyed by replacement pipeline
+        /// matchers on the apply path to reproduce the token faithfully.
+        spec: Box<TokenSpec>,
+        /// CR 707.2: When present, the event creates tokens that are copies of
+        /// a permanent. Replacement matching still reads `spec`; the apply path
+        /// reads this payload so replacement-choice resume does not degrade to a
+        /// generic token.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        copy: Option<Box<CopyTokenSpec>>,
+        /// Explicit ETB tap-state override carried through the replacement pipeline.
+        /// `Unspecified` preserves the token spec's authored `tapped` bit.
+        #[serde(default)]
+        enter_tapped: EtbTapState,
+        /// CR 614.1a: Number of tokens to create. May be modified by replacement effects.
+        count: u32,
+        /// CR 614.1a + CR 616.1f + CR 614.5: batches this event's own
+        /// replacements added ("those tokens plus that many 1/1 green Squirrel
+        /// creature tokens", "instead create one of each"), in event order.
+        /// "Instead" yields one modified event, so they are not separate events:
+        /// they share this event's `applied` set, every replacement the affected
+        /// player applies afterwards applies to each batch it matches, and the
+        /// whole event is delivered (and its created referent published) as one.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        appended: Vec<TokenBatch>,
+        /// CR 614.6 + CR 111.1: where an applied replacement sent the batch's
+        /// entrants instead of the battlefield (Hallowed Moonlight: "exile it
+        /// instead"). The creation itself still happens (CR 111.1, CR 701.7a);
+        /// only the entry is replaced. `None` is the ordinary battlefield entry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redirected_to: Option<Zone>,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    TokenEntry {
+        entry_ref: ObjectId,
+        /// CR 614.6: the zone an applied replacement sent this entrant to
+        /// instead of the battlefield; `None` is the ordinary battlefield entry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redirected_to: Option<Zone>,
+        #[serde(default)]
+        enter_tapped: EtbTapState,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        enter_with_counters: Vec<(CounterType, u32)>,
+        /// CR 614.12a + CR 707.2: the answers to the token entrant's own "As ~
+        /// enters, choose …" replacements plus its paid as-enters amount latch,
+        /// mirroring the ZoneChange field. Direct token copies (Rite of
+        /// Replication copying Minion of the Wastes) ride the entry-payment
+        /// continuation through this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enter_with_choices: Option<Box<EntryChoices>>,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    Discard {
+        player_id: PlayerId,
+        object_id: ObjectId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<ObjectId>,
+        /// CR 614.1a + CR 701.9a: `true` when the discard is caused by resolving
+        /// a spell or ability effect; `false` for cost payment or turn-based
+        /// actions (cleanup hand-size discard).
+        #[serde(default)]
+        caused_by_effect: bool,
+        /// CR 701.9a + CR 614.1: Operation-owned provenance for an in-flight
+        /// discard. `None` preserves ordinary discard/cost behavior; Recruit
+        /// installs an id before the event enters replacement processing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        discard_frame: Option<crate::types::identifiers::DiscardFrameId>,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    Tap {
+        object_id: ObjectId,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    Untap {
+        object_id: ObjectId,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 614.1e + CR 708.11: a permanent is being turned face up. "As ~ is turned
+    /// face up" replacement effects apply here (megamorph/disguise).
+    TurnFaceUp {
+        object_id: ObjectId,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    Destroy {
+        object_id: ObjectId,
+        source: Option<ObjectId>,
+        /// CR 701.19c: When true, regeneration shields cannot prevent this destruction.
+        cant_regenerate: bool,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    Sacrifice {
+        object_id: ObjectId,
+        player_id: PlayerId,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 500.1 + CR 614.1b + CR 614.10: A turn is about to begin. Carried
+    /// through the replacement pipeline so condition-gated skip effects
+    /// (e.g., Stranglehold's "skip extra turns") can prevent the turn.
+    ///
+    /// `is_extra_turn` is true when this turn was granted by an effect
+    /// (CR 500.7 — popped from `state.extra_turns`).
+    BeginTurn {
+        player_id: PlayerId,
+        is_extra_turn: bool,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 500.1 + CR 614.1b: A phase/step is about to begin. Carried through
+    /// the replacement pipeline so condition-gated skip effects can prevent
+    /// the phase. Simple static-based skips (`StaticMode::SkipStep`) continue
+    /// to short-circuit earlier in `turns.rs`; this pipeline path handles
+    /// event-context-aware replacements.
+    BeginPhase {
+        player_id: PlayerId,
+        phase: Phase,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 106.3 + CR 614.1a: Mana is about to be produced by a source and added
+    /// to a player's mana pool. Carried through the replacement pipeline so
+    /// static effects like Contamination ("produces {B} instead") can replace
+    /// the produced mana type or amount before it enters the pool.
+    ProduceMana {
+        source_id: ObjectId,
+        player_id: PlayerId,
+        mana_type: ManaType,
+        /// CR 106.3: Number of mana units of `mana_type` this event produces.
+        #[serde(default = "default_produce_mana_count")]
+        count: u32,
+        /// CR 106.12: True when this production comes from activating a mana
+        /// ability with the tap symbol in its cost.
+        #[serde(default)]
+        tapped_for_mana: bool,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 703.4q + CR 614.1a + CR 616.1: A player's step-end "empty unspent
+    /// mana" event. Each entry in `units` describes one `ManaUnit` in the
+    /// affected player's pool and its tentative disposition. Step-end mana
+    /// handlers (Upwelling, Horizon Stone, Kruphix, Omnath, …) are
+    /// replacement effects that flip a unit's disposition from `Drop` to
+    /// `Keep` (CR 614.6) or `Recolor(_)` (CR 614.1a) when their filter
+    /// matches.
+    ///
+    /// CR 616.1: When ≥2 handlers apply to the same emptying event, the
+    /// affected player chooses ordering. The pipeline serializes choices in
+    /// APNAP order across players via `pending_phase_transition_progress`.
+    ///
+    /// CR 500.5 + CR 514.2: A unit whose `EndOfCombat` duration reaches this
+    /// boundary, or whose `EndOfTurn` duration ended during the cleanup action,
+    /// enters this event after its expiry marker is cleared. This lets the
+    /// ordinary empty-pool action count actual loss and compose with any other
+    /// retention or transformation effect still active.
+    EmptyManaPool {
+        player_id: PlayerId,
+        units: Vec<UnitDecision>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_applied_keys_step_end_mana",
+            serialize_with = "crate::types::deterministic_serde::hash_set"
+        )]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 701.31 + CR 614.1a: A player is about to planeswalk. All CR 701.31c
+    /// causes except the starting-plane reveal route through
+    /// `planechase::resolve_planeswalk_via_replacements`. Encounter / SBA /
+    /// leave-game paths use [`PlaneswalkCause::RulesProcess`]; ability
+    /// resolutions use [`PlaneswalkCause::Instruction`] or [`PlaneswalkCause::PlanarDie`].
+    Planeswalk {
+        player_id: PlayerId,
+        /// Distinguishes planar-die planeswalks (CR 901.9c) from ability-
+        /// instructed ones so scoped replacements (Fixed Point in Time) match
+        /// only the cause their Oracle text names.
+        #[serde(default)]
+        cause: PlaneswalkCause,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+    /// CR 701.3a + CR 614.1a: An Aura, Equipment, or Fortification is about to
+    /// become attached to an object via `Effect::Attach` (Equip activation, or
+    /// any other "attach ~ to" effect). Carried through the replacement
+    /// pipeline so "as it becomes attached, choose …" replacements
+    /// (`ReplacementEvent::Attached`, Psychic Paper) can bind their choice as
+    /// the attachment resolves, mirroring the "as ~ enters, choose" ETB
+    /// analogue. Auras attaching to a PLAYER host use `attach_to_player`
+    /// directly and never propose this event — only object hosts route
+    /// through `Effect::Attach::resolve`.
+    Attach {
+        attachment_id: ObjectId,
+        target_id: ObjectId,
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+        applied: HashSet<AppliedReplacementKey>,
+    },
+}
+
+fn default_produce_mana_count() -> u32 {
+    1
+}
+
+/// CR 614.12a: the answers to an entrant's own as-enters choices, carried by
+/// its battlefield entry (`ZoneChange::enter_with_choices` or
+/// `TokenEntry::enter_with_choices`). Boxed there because it is rarely populated.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EntryChoices(pub Vec<crate::types::ability::ChosenAttribute>);
+
+impl EntryChoices {
+    /// The carried choices of an entry (`[]` when it carries none).
+    pub fn of(choices: &Option<Box<EntryChoices>>) -> &[crate::types::ability::ChosenAttribute] {
+        choices
+            .as_deref()
+            .map_or(&[], |choices| choices.0.as_slice())
+    }
+}
+
+/// CR 611.2e + CR 614.12: the continuous effect that an "is/has" instruction of the
+/// resolution putting this permanent onto the battlefield applies simultaneously with the
+/// entry: that instruction's source and controller, and the modifications it applies to the
+/// entrant in written order, such as types and subtypes, colors, base power/toughness and
+/// abilities (CR 613.1d/e/f, CR 613.4b). Carried on the proposal so every replacement pass and
+/// CR 616.1 pause sees the entrant as it would exist on the battlefield. It is a description
+/// only: the rider instruction installs the real effect when it is followed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithEntryEffect {
+    pub source_id: ObjectId,
+    pub controller: PlayerId,
+    pub modifications: Vec<ContinuousModification>,
+}
+
+/// CR 611.2e + CR 613.1f + CR 614.12: whether a battlefield entrant has its own
+/// abilities as it would exist on the battlefield — a view derived from the carried
+/// [`WithEntryEffect`] by [`EntrantAbilities::of`], never stored. Abilities axis only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntrantAbilities {
+    /// The entrant enters with its own abilities.
+    Retained,
+    /// A same-resolution effect removes all of the entrant's abilities as it
+    /// enters, so none of its own entry abilities apply.
+    RemovedWithEntry,
+}
+
+impl EntrantAbilities {
+    /// CR 613.1f: `RemovedWithEntry` when the carried effect removes all abilities.
+    pub fn of(effect: Option<&WithEntryEffect>) -> Self {
+        match effect {
+            Some(effect)
+                if effect
+                    .modifications
+                    .iter()
+                    .any(|m| matches!(m, ContinuousModification::RemoveAllAbilities)) =>
+            {
+                Self::RemovedWithEntry
+            }
+            Some(_) | None => Self::Retained,
+        }
+    }
+
+    /// Whether the entrant's own abilities exist as it enters.
+    pub fn own_abilities_apply(self) -> bool {
+        match self {
+            EntrantAbilities::Retained => true,
+            EntrantAbilities::RemovedWithEntry => false,
+        }
+    }
+}
+
+/// CR 614.4 + CR 614.12 + CR 400.7: the other members of the battlefield-entry event a
+/// `ProposedEvent::ZoneChange` belongs to, each as the object it was when the event began
+/// (`LogicalZoneChangeGroup::announced_members`). The engine moves an event's members one
+/// at a time, so a member delivered earlier is on the battlefield when a later member is
+/// proposed, yet it did not exist before the event, and a replacement effect must exist
+/// before the event it modifies (Metallic Mimic ruling 2017-02-09: "Creatures of the chosen
+/// type that enter the battlefield at the same time as Metallic Mimic won't enter with an
+/// additional +1/+1 counter."). Never empty: a lone entry, a proposal outside a logical
+/// zone-change group and a `TokenEntry` carry none (`ZoneChange::co_entrants` is `None`).
+/// Known gap: per-player simultaneous puts resolved as separate player-scoped legs are
+/// separate logical groups, so an entrant of an earlier leg is still a replacement source for
+/// a later leg's (Show and Tell, "Each player may put an artifact, creature, enchantment, or
+/// land card from their hand onto the battlefield.": a Containment Priest put by an earlier
+/// player exiles a later player's creature). Closing it needs one group spanning the legs, as
+/// Living Death's per-seat legs already share one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct CoEntrants(Box<[ObjectIncarnationRef]>);
+
+impl CoEntrants {
+    /// The members of `event_members` other than `entrant`; `None` when there are none.
+    pub fn for_entrant(
+        event_members: &[ObjectIncarnationRef],
+        entrant: ObjectId,
+    ) -> Option<Box<Self>> {
+        Self::nonempty(
+            event_members
+                .iter()
+                .filter(|member| member.object_id != entrant)
+                .copied()
+                .collect(),
+        )
+    }
+
+    /// The single constructor: `None` for an empty member set, so a `CoEntrants` is never empty.
+    fn nonempty(members: Box<[ObjectIncarnationRef]>) -> Option<Box<Self>> {
+        (!members.is_empty()).then(|| Box::new(Self(members)))
+    }
+
+    /// Wire reader for `ZoneChange::co_entrants`: an empty list reads as `None`, the same as an
+    /// absent key, so a decoded `Some` is never empty either.
+    fn deserialize_nonempty<'de, D>(deserializer: D) -> Result<Option<Box<Self>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(
+            Option::<Box<[ObjectIncarnationRef]>>::deserialize(deserializer)?
+                .and_then(Self::nonempty),
+        )
+    }
+
+    pub fn as_slice(&self) -> &[ObjectIncarnationRef] {
+        &self.0
+    }
+
+    /// CR 614.4 + CR 400.7: `host` entered the battlefield earlier in this same event. It
+    /// was announced as a member and is now on the battlefield as a new object. A member
+    /// still where it was announced — a later member, or one the move leaves on the
+    /// battlefield — is the object that existed before the event.
+    pub fn entered_earlier(&self, host: &GameObject) -> bool {
+        host.zone == Zone::Battlefield
+            && self.0.iter().any(|member| {
+                member.object_id == host.id && *member != ObjectIncarnationRef::from_object(host)
+            })
+    }
+}
+
+/// CR 614.1c + CR 611.2a: one "and with …" entry grant riding a battlefield
+/// entry (`ZoneChange::enter_with_grants`). The grant is a single stripped
+/// chain link — a `GenericEffect` carrying only `static_abilities` with
+/// `Duration::UntilHostLeavesPlay` for `SelfRef`, no `sub_ability` or
+/// `else_ability` — plus the granting replacement's controller (CR 109.5),
+/// so delivery installs exactly what the post-entry drain would have, for
+/// every applicable same-entry replacement instead of just the first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnterWithGrant {
+    pub grant: crate::types::ability::AbilityDefinition,
+    pub controller: PlayerId,
+}
+
+/// CR 614.1c + CR 611.2a + CR 616.1: the entry grants riding one battlefield entry
+/// (`ZoneChange::enter_with_grants`), in application order. Never empty: an entry with no
+/// grant carries `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct EnterWithGrants(Vec<EnterWithGrant>);
+
+impl EnterWithGrants {
+    /// The single authority that adds grants to an entry: appends `grants` in order, creating
+    /// the box on the first one, so `Some` is never empty.
+    pub fn append(
+        slot: &mut Option<Box<EnterWithGrants>>,
+        grants: impl IntoIterator<Item = EnterWithGrant>,
+    ) {
+        let mut grants = grants.into_iter().peekable();
+        if grants.peek().is_some() {
+            slot.get_or_insert_with(|| Box::new(Self(Vec::new())))
+                .0
+                .extend(grants);
+        }
+    }
+
+    /// The carried grants of an entry, in application order (`[]` when it carries none).
+    pub fn of(grants: &Option<Box<EnterWithGrants>>) -> &[EnterWithGrant] {
+        grants.as_deref().map_or(&[], |grants| grants.0.as_slice())
+    }
+
+    /// Wire reader for `ZoneChange::enter_with_grants`: an empty list reads as `None`, the same
+    /// as an absent key, so a decoded `Some` is never empty either.
+    fn deserialize_nonempty<'de, D>(deserializer: D) -> Result<Option<Box<Self>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Option::<Vec<EnterWithGrant>>::deserialize(deserializer)?
+            .filter(|grants| !grants.is_empty())
+            .map(|grants| Box::new(Self(grants))))
+    }
+}
+
+impl ProposedEvent {
+    /// Construct a `ZoneChange` with default `enter_tapped: Unspecified` and empty `applied` set.
+    pub fn zone_change(object_id: ObjectId, from: Zone, to: Zone, cause: Option<ObjectId>) -> Self {
+        Self::ZoneChange {
+            object_id,
+            from,
+            to,
+            library_placement: None,
+            cause,
+            attach_to: None,
+            enter_tapped: EtbTapState::Unspecified,
+            enters_attacking: false,
+            enter_with_counters: Vec::new(),
+            enter_with_grants: None,
+            controller_override: None,
+            enter_transformed: false,
+            face_down_profile: None,
+            face_down_in_exile: crate::types::ability::ExileConcealment::Public,
+            chain_referent: ChainReferentIntent::default(),
+            enter_as_copy: None,
+            enter_with_choices: None,
+            discard_frame: None,
+            performed_by: None,
+            with_entry_effect: None,
+            co_entrants: None,
+            ownership_actor: crate::types::proposed_event::EntryOwnershipActor::NoPlayer,
+            library_shuffle: crate::types::ability::LibraryShuffleMode::PerObject,
+            applied: HashSet::new(),
+        }
+    }
+
+    /// CR 500.1 + CR 614.1b: Construct a `BeginTurn` proposed event.
+    pub fn begin_turn(player_id: PlayerId, is_extra_turn: bool) -> Self {
+        Self::BeginTurn {
+            player_id,
+            is_extra_turn,
+            applied: HashSet::new(),
+        }
+    }
+
+    /// CR 500.1 + CR 614.1b: Construct a `BeginPhase` proposed event.
+    pub fn begin_phase(player_id: PlayerId, phase: Phase) -> Self {
+        Self::BeginPhase {
+            player_id,
+            phase,
+            applied: HashSet::new(),
+        }
+    }
+
+    /// CR 701.31 + CR 901.9c + CR 614.1a: Construct a `Planeswalk` proposed
+    /// event for the planar-die planeswalking ability (CR 901.8).
+    pub fn planeswalk(player_id: PlayerId) -> Self {
+        Self::planeswalk_with_applied(player_id, PlaneswalkCause::PlanarDie, HashSet::new())
+    }
+
+    /// CR 701.31 + CR 614.5: Construct a `Planeswalk` proposed event with an
+    /// explicit cause and already-applied replacement keys (chained "then
+    /// planeswalk" riders retain the originating replacement's applied set).
+    pub fn planeswalk_with_applied(
+        player_id: PlayerId,
+        cause: PlaneswalkCause,
+        applied: HashSet<AppliedReplacementKey>,
+    ) -> Self {
+        Self::Planeswalk {
+            player_id,
+            cause,
+            applied,
+        }
+    }
+
+    /// CR 701.34a + CR 614.1a: Construct a `Proliferate` proposed event.
+    pub fn proliferate(player_id: PlayerId, count: u32) -> Self {
+        Self::Proliferate {
+            player_id,
+            count,
+            applied: HashSet::new(),
+        }
+    }
+
+    /// CR 106.3 + CR 614.1a: Construct a `ProduceMana` proposed event.
+    pub fn produce_mana(source_id: ObjectId, player_id: PlayerId, mana_type: ManaType) -> Self {
+        Self::produce_mana_with_context(source_id, player_id, mana_type, false)
+    }
+
+    /// CR 106.3 + CR 106.12 + CR 614.1a: Construct a `ProduceMana` proposed
+    /// event while preserving whether the mana was produced by tapping the
+    /// source for mana.
+    pub fn produce_mana_with_context(
+        source_id: ObjectId,
+        player_id: PlayerId,
+        mana_type: ManaType,
+        tapped_for_mana: bool,
+    ) -> Self {
+        Self::ProduceMana {
+            source_id,
+            player_id,
+            mana_type,
+            count: 1,
+            tapped_for_mana,
+            applied: HashSet::new(),
+        }
+    }
+
+    pub fn battlefield_entry_tap_state(&self) -> Option<EtbTapState> {
+        match self {
+            ProposedEvent::ZoneChange { enter_tapped, .. }
+            | ProposedEvent::CreateToken { enter_tapped, .. }
+            | ProposedEvent::TokenEntry { enter_tapped, .. } => Some(*enter_tapped),
+            _ => None,
+        }
+    }
+
+    /// CR 614.12 + CR 611.2e: the with-entry effect a zone change carries. Exhaustive: only a
+    /// `ZoneChange` carries one.
+    pub fn with_entry_effect(&self) -> Option<&WithEntryEffect> {
+        match self {
+            ProposedEvent::ZoneChange {
+                with_entry_effect, ..
+            } => with_entry_effect.as_deref(),
+            ProposedEvent::Damage { .. }
+            | ProposedEvent::Draw { .. }
+            | ProposedEvent::SearchFound { .. }
+            | ProposedEvent::Scry { .. }
+            | ProposedEvent::Mill { .. }
+            | ProposedEvent::CoinFlip { .. }
+            | ProposedEvent::RollDice { .. }
+            | ProposedEvent::Explore { .. }
+            | ProposedEvent::Connive { .. }
+            | ProposedEvent::Proliferate { .. }
+            | ProposedEvent::LifeGain { .. }
+            | ProposedEvent::LifeLoss { .. }
+            | ProposedEvent::AddCounter { .. }
+            | ProposedEvent::RemoveCounter { .. }
+            | ProposedEvent::MoveCounter { .. }
+            | ProposedEvent::CreateToken { .. }
+            | ProposedEvent::TokenEntry { .. }
+            | ProposedEvent::Discard { .. }
+            | ProposedEvent::Tap { .. }
+            | ProposedEvent::Untap { .. }
+            | ProposedEvent::TurnFaceUp { .. }
+            | ProposedEvent::Destroy { .. }
+            | ProposedEvent::Sacrifice { .. }
+            | ProposedEvent::BeginTurn { .. }
+            | ProposedEvent::BeginPhase { .. }
+            | ProposedEvent::ProduceMana { .. }
+            | ProposedEvent::EmptyManaPool { .. }
+            | ProposedEvent::Planeswalk { .. }
+            | ProposedEvent::Attach { .. } => None,
+        }
+    }
+
+    /// CR 614.12 + CR 611.2e + CR 613.1f: the derived view of [`Self::with_entry_effect`].
+    pub fn entrant_abilities(&self) -> EntrantAbilities {
+        EntrantAbilities::of(self.with_entry_effect())
+    }
+
+    /// CR 614.4 + CR 614.12: the other members of the entry event a zone change belongs to.
+    /// `Some` only for a `ZoneChange` that is a battlefield entry of a multi-member event.
+    pub fn co_entrants(&self) -> Option<&CoEntrants> {
+        match self {
+            ProposedEvent::ZoneChange { co_entrants, .. } => co_entrants.as_deref(),
+            ProposedEvent::Damage { .. }
+            | ProposedEvent::Draw { .. }
+            | ProposedEvent::SearchFound { .. }
+            | ProposedEvent::Scry { .. }
+            | ProposedEvent::Mill { .. }
+            | ProposedEvent::CoinFlip { .. }
+            | ProposedEvent::RollDice { .. }
+            | ProposedEvent::Explore { .. }
+            | ProposedEvent::Connive { .. }
+            | ProposedEvent::Proliferate { .. }
+            | ProposedEvent::LifeGain { .. }
+            | ProposedEvent::LifeLoss { .. }
+            | ProposedEvent::AddCounter { .. }
+            | ProposedEvent::RemoveCounter { .. }
+            | ProposedEvent::MoveCounter { .. }
+            | ProposedEvent::CreateToken { .. }
+            | ProposedEvent::TokenEntry { .. }
+            | ProposedEvent::Discard { .. }
+            | ProposedEvent::Tap { .. }
+            | ProposedEvent::Untap { .. }
+            | ProposedEvent::TurnFaceUp { .. }
+            | ProposedEvent::Destroy { .. }
+            | ProposedEvent::Sacrifice { .. }
+            | ProposedEvent::BeginTurn { .. }
+            | ProposedEvent::BeginPhase { .. }
+            | ProposedEvent::ProduceMana { .. }
+            | ProposedEvent::EmptyManaPool { .. }
+            | ProposedEvent::Planeswalk { .. }
+            | ProposedEvent::Attach { .. } => None,
+        }
+    }
+
+    pub fn battlefield_entry_tap_state_mut(&mut self) -> Option<&mut EtbTapState> {
+        match self {
+            ProposedEvent::ZoneChange { enter_tapped, .. }
+            | ProposedEvent::CreateToken { enter_tapped, .. }
+            | ProposedEvent::TokenEntry { enter_tapped, .. } => Some(enter_tapped),
+            _ => None,
+        }
+    }
+
+    pub fn applied_set(&self) -> &HashSet<AppliedReplacementKey> {
+        match self {
+            ProposedEvent::ZoneChange { applied, .. }
+            | ProposedEvent::Damage { applied, .. }
+            | ProposedEvent::Draw { applied, .. }
+            | ProposedEvent::SearchFound { applied, .. }
+            | ProposedEvent::Scry { applied, .. }
+            | ProposedEvent::Mill { applied, .. }
+            | ProposedEvent::CoinFlip { applied, .. }
+            | ProposedEvent::RollDice { applied, .. }
+            | ProposedEvent::Explore { applied, .. }
+            | ProposedEvent::Connive { applied, .. }
+            | ProposedEvent::Proliferate { applied, .. }
+            | ProposedEvent::LifeGain { applied, .. }
+            | ProposedEvent::LifeLoss { applied, .. }
+            | ProposedEvent::AddCounter { applied, .. }
+            | ProposedEvent::RemoveCounter { applied, .. }
+            | ProposedEvent::MoveCounter { applied, .. }
+            | ProposedEvent::CreateToken { applied, .. }
+            | ProposedEvent::TokenEntry { applied, .. }
+            | ProposedEvent::Discard { applied, .. }
+            | ProposedEvent::Tap { applied, .. }
+            | ProposedEvent::Untap { applied, .. }
+            | ProposedEvent::TurnFaceUp { applied, .. }
+            | ProposedEvent::Destroy { applied, .. }
+            | ProposedEvent::Sacrifice { applied, .. }
+            | ProposedEvent::BeginTurn { applied, .. }
+            | ProposedEvent::BeginPhase { applied, .. }
+            | ProposedEvent::ProduceMana { applied, .. }
+            | ProposedEvent::EmptyManaPool { applied, .. }
+            | ProposedEvent::Planeswalk { applied, .. }
+            | ProposedEvent::Attach { applied, .. } => applied,
+        }
+    }
+
+    pub fn applied_set_mut(&mut self) -> &mut HashSet<AppliedReplacementKey> {
+        match self {
+            ProposedEvent::ZoneChange { applied, .. }
+            | ProposedEvent::Damage { applied, .. }
+            | ProposedEvent::Draw { applied, .. }
+            | ProposedEvent::SearchFound { applied, .. }
+            | ProposedEvent::Scry { applied, .. }
+            | ProposedEvent::Mill { applied, .. }
+            | ProposedEvent::CoinFlip { applied, .. }
+            | ProposedEvent::RollDice { applied, .. }
+            | ProposedEvent::Explore { applied, .. }
+            | ProposedEvent::Connive { applied, .. }
+            | ProposedEvent::Proliferate { applied, .. }
+            | ProposedEvent::LifeGain { applied, .. }
+            | ProposedEvent::LifeLoss { applied, .. }
+            | ProposedEvent::AddCounter { applied, .. }
+            | ProposedEvent::RemoveCounter { applied, .. }
+            | ProposedEvent::MoveCounter { applied, .. }
+            | ProposedEvent::CreateToken { applied, .. }
+            | ProposedEvent::TokenEntry { applied, .. }
+            | ProposedEvent::Discard { applied, .. }
+            | ProposedEvent::Tap { applied, .. }
+            | ProposedEvent::Untap { applied, .. }
+            | ProposedEvent::TurnFaceUp { applied, .. }
+            | ProposedEvent::Destroy { applied, .. }
+            | ProposedEvent::Sacrifice { applied, .. }
+            | ProposedEvent::BeginTurn { applied, .. }
+            | ProposedEvent::BeginPhase { applied, .. }
+            | ProposedEvent::ProduceMana { applied, .. }
+            | ProposedEvent::EmptyManaPool { applied, .. }
+            | ProposedEvent::Planeswalk { applied, .. }
+            | ProposedEvent::Attach { applied, .. } => applied,
+        }
+    }
+
+    pub fn already_applied(&self, id: &ReplacementId) -> bool {
+        self.applied_set()
+            .contains(&AppliedReplacementKey::for_event(self, *id))
+    }
+
+    pub fn mark_applied(&mut self, id: ReplacementId) {
+        let key = AppliedReplacementKey::for_event(self, id);
+        self.applied_set_mut().insert(key);
+    }
+
+    /// CR 614.1a: whether this is a CreateToken event a replacement has
+    /// already added batches to (a compound token event).
+    pub fn has_appended_token_batches(&self) -> bool {
+        matches!(self, ProposedEvent::CreateToken { appended, .. } if !appended.is_empty())
+    }
+
+    /// The number of tokens a `CreateToken` event (or one batch view of a
+    /// compound one) creates; `None` for any other event.
+    pub fn create_token_count(&self) -> Option<u32> {
+        match self {
+            ProposedEvent::CreateToken { count, .. } => Some(*count),
+            ProposedEvent::ZoneChange { .. }
+            | ProposedEvent::Damage { .. }
+            | ProposedEvent::Draw { .. }
+            | ProposedEvent::SearchFound { .. }
+            | ProposedEvent::Scry { .. }
+            | ProposedEvent::Mill { .. }
+            | ProposedEvent::CoinFlip { .. }
+            | ProposedEvent::RollDice { .. }
+            | ProposedEvent::Explore { .. }
+            | ProposedEvent::Connive { .. }
+            | ProposedEvent::Proliferate { .. }
+            | ProposedEvent::LifeGain { .. }
+            | ProposedEvent::LifeLoss { .. }
+            | ProposedEvent::AddCounter { .. }
+            | ProposedEvent::RemoveCounter { .. }
+            | ProposedEvent::MoveCounter { .. }
+            | ProposedEvent::TokenEntry { .. }
+            | ProposedEvent::Discard { .. }
+            | ProposedEvent::Tap { .. }
+            | ProposedEvent::Untap { .. }
+            | ProposedEvent::TurnFaceUp { .. }
+            | ProposedEvent::Destroy { .. }
+            | ProposedEvent::Sacrifice { .. }
+            | ProposedEvent::BeginTurn { .. }
+            | ProposedEvent::BeginPhase { .. }
+            | ProposedEvent::ProduceMana { .. }
+            | ProposedEvent::EmptyManaPool { .. }
+            | ProposedEvent::Planeswalk { .. }
+            | ProposedEvent::Attach { .. } => None,
+        }
+    }
+
+    /// CR 616.1f + CR 616.2: one single-batch `CreateToken` view per batch of a
+    /// compound token event — the event's own batch first, then each appended
+    /// batch in event order — each carrying the event's `applied` set (CR 614.5:
+    /// the batches are one event). `None` for anything that is not a compound
+    /// token event.
+    pub fn token_batch_views(&self) -> Option<Vec<ProposedEvent>> {
+        if !self.has_appended_token_batches() {
+            return None;
+        }
+        Some(self.clone().into_token_batch_views())
+    }
+
+    /// The consuming form of [`Self::token_batch_views`]. Any other event —
+    /// including a CreateToken with no appended batch — is its own only view.
+    pub fn into_token_batch_views(self) -> Vec<ProposedEvent> {
+        match self {
+            ProposedEvent::CreateToken {
+                owner,
+                spec,
+                copy,
+                enter_tapped,
+                count,
+                appended,
+                redirected_to,
+                applied,
+            } => {
+                let mut views = Vec::with_capacity(appended.len() + 1);
+                views.push(ProposedEvent::CreateToken {
+                    owner,
+                    spec,
+                    copy,
+                    enter_tapped,
+                    count,
+                    appended: Vec::new(),
+                    redirected_to,
+                    applied: applied.clone(),
+                });
+                views.extend(
+                    appended
+                        .into_iter()
+                        .map(|batch| batch.into_event(applied.clone())),
+                );
+                views
+            }
+            event @ (ProposedEvent::ZoneChange { .. }
+            | ProposedEvent::Damage { .. }
+            | ProposedEvent::Draw { .. }
+            | ProposedEvent::SearchFound { .. }
+            | ProposedEvent::Scry { .. }
+            | ProposedEvent::Mill { .. }
+            | ProposedEvent::CoinFlip { .. }
+            | ProposedEvent::RollDice { .. }
+            | ProposedEvent::Explore { .. }
+            | ProposedEvent::Connive { .. }
+            | ProposedEvent::Proliferate { .. }
+            | ProposedEvent::LifeGain { .. }
+            | ProposedEvent::LifeLoss { .. }
+            | ProposedEvent::AddCounter { .. }
+            | ProposedEvent::RemoveCounter { .. }
+            | ProposedEvent::MoveCounter { .. }
+            | ProposedEvent::TokenEntry { .. }
+            | ProposedEvent::Discard { .. }
+            | ProposedEvent::Tap { .. }
+            | ProposedEvent::Untap { .. }
+            | ProposedEvent::TurnFaceUp { .. }
+            | ProposedEvent::Destroy { .. }
+            | ProposedEvent::Sacrifice { .. }
+            | ProposedEvent::BeginTurn { .. }
+            | ProposedEvent::BeginPhase { .. }
+            | ProposedEvent::ProduceMana { .. }
+            | ProposedEvent::EmptyManaPool { .. }
+            | ProposedEvent::Planeswalk { .. }
+            | ProposedEvent::Attach { .. }) => vec![event],
+        }
+    }
+
+    /// CR 614.1a + CR 614.5: reassemble one compound token event from its batch
+    /// views. The first view is the event's own batch; the rest become its
+    /// appended batches in order, each immediately followed by any batches its
+    /// own replacement application appended. The `applied` set is the union of
+    /// the views' sets. `None` for an empty list or a non-CreateToken view.
+    pub fn from_token_batch_views(views: Vec<ProposedEvent>) -> Option<ProposedEvent> {
+        let mut views = views.into_iter();
+        let ProposedEvent::CreateToken {
+            owner,
+            spec,
+            copy,
+            enter_tapped,
+            count,
+            mut appended,
+            redirected_to,
+            mut applied,
+        } = views.next()?
+        else {
+            return None;
+        };
+        for view in views {
+            let ProposedEvent::CreateToken {
+                owner,
+                spec,
+                copy,
+                enter_tapped,
+                count,
+                appended: view_appended,
+                redirected_to: view_redirected_to,
+                applied: view_applied,
+            } = view
+            else {
+                return None;
+            };
+            appended.push(TokenBatch {
+                owner,
+                spec,
+                copy,
+                enter_tapped,
+                count,
+                redirected_to: view_redirected_to,
+            });
+            appended.extend(view_appended);
+            applied.extend(view_applied);
+        }
+        Some(ProposedEvent::CreateToken {
+            owner,
+            spec,
+            copy,
+            enter_tapped,
+            count,
+            appended,
+            redirected_to,
+            applied,
+        })
+    }
+
+    /// CR 614.1a + CR 111.1: every batch of a CreateToken event in event order
+    /// (position 0 is the event's own batch, then its appended batches). `None`
+    /// for any other event.
+    pub fn into_token_batches(self) -> Option<Vec<TokenBatch>> {
+        let ProposedEvent::CreateToken {
+            owner,
+            spec,
+            copy,
+            enter_tapped,
+            count,
+            appended,
+            redirected_to,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let mut batches = Vec::with_capacity(appended.len() + 1);
+        batches.push(TokenBatch {
+            owner,
+            spec,
+            copy,
+            enter_tapped,
+            count,
+            redirected_to,
+        });
+        batches.extend(appended);
+        Some(batches)
+    }
+
+    pub fn affected_player(&self, state: &crate::types::game_state::GameState) -> PlayerId {
+        match self {
+            // CR 614.12 + CR 109.4: A permanent entering under another player's
+            // control (Tergrid's "onto the battlefield under your control",
+            // reanimation "under your control", etc.) carries a
+            // `controller_override`. The object itself is still in its origin
+            // zone — typically a graveyard, where CR 109.4 gives it no controller
+            // so `o.controller` defaults to the owner. "As-it-enters" replacement
+            // effects (Mirrormade's "enter as a copy", CR 707.9) must be offered
+            // to the controller the permanent WOULD have on the battlefield, so
+            // honor the override before falling back to the object's controller.
+            ProposedEvent::ZoneChange {
+                object_id,
+                controller_override,
+                ..
+            } => controller_override
+                .or_else(|| state.objects.get(object_id).map(|o| o.controller))
+                .unwrap_or(PlayerId(0)),
+            ProposedEvent::Tap { object_id, .. }
+            | ProposedEvent::Untap { object_id, .. }
+            | ProposedEvent::TurnFaceUp { object_id, .. }
+            | ProposedEvent::Destroy { object_id, .. }
+            | ProposedEvent::RemoveCounter { object_id, .. }
+            | ProposedEvent::Explore { object_id, .. } => state
+                .objects
+                .get(object_id)
+                .map(|o| o.controller)
+                .unwrap_or(PlayerId(0)),
+            // CR 701.50a: The conniving permanent's controller is the affected
+            // player — they draw/discard and choose the connive replacement order.
+            ProposedEvent::Connive { subject, .. } => subject.controller,
+            ProposedEvent::AddCounter { placement, .. } => match placement {
+                CounterPlacement::Object { object_id, .. } => state
+                    .objects
+                    .get(object_id)
+                    .map(|o| o.controller)
+                    .unwrap_or(PlayerId(0)),
+                CounterPlacement::Player { player_id, .. }
+                | CounterPlacement::Energy { player_id, .. } => *player_id,
+            },
+            ProposedEvent::MoveCounter {
+                source_id,
+                destination_id,
+                stage,
+                ..
+            } => {
+                let affected_id = match stage {
+                    CounterMoveStage::Remove => source_id,
+                    CounterMoveStage::Add => destination_id,
+                };
+                state
+                    .objects
+                    .get(affected_id)
+                    .map(|o| o.controller)
+                    .unwrap_or(PlayerId(0))
+            }
+            ProposedEvent::Damage { target, .. } => match target {
+                TargetRef::Player(pid) => *pid,
+                TargetRef::Object(oid) => state
+                    .objects
+                    .get(oid)
+                    .map(|o| o.controller)
+                    .unwrap_or(PlayerId(0)),
+            },
+            ProposedEvent::Draw { player_id, .. }
+            | ProposedEvent::Scry { player_id, .. }
+            | ProposedEvent::Mill { player_id, .. }
+            | ProposedEvent::Proliferate { player_id, .. }
+            | ProposedEvent::CoinFlip { player_id, .. }
+            | ProposedEvent::RollDice { player_id, .. }
+            | ProposedEvent::LifeGain { player_id, .. }
+            | ProposedEvent::LifeLoss { player_id, .. }
+            | ProposedEvent::Discard { player_id, .. }
+            | ProposedEvent::Sacrifice { player_id, .. }
+            | ProposedEvent::BeginTurn { player_id, .. }
+            | ProposedEvent::BeginPhase { player_id, .. }
+            | ProposedEvent::ProduceMana { player_id, .. }
+            | ProposedEvent::EmptyManaPool { player_id, .. }
+            | ProposedEvent::Planeswalk { player_id, .. } => *player_id,
+            // CR 616.1: a card in a library has no controller, so its owner
+            // chooses among applicable replacements. `None` is reserved for a
+            // nonlibrary selection, where no SearchFound replacement applies.
+            ProposedEvent::SearchFound {
+                searcher,
+                library_owner,
+                ..
+            } => library_owner.unwrap_or(*searcher),
+            ProposedEvent::CreateToken { owner, .. } => *owner,
+            ProposedEvent::TokenEntry { entry_ref, .. } => state
+                .liminal_entries
+                .get(entry_ref)
+                .map(|entry| entry.object.projected().controller)
+                .unwrap_or(PlayerId(0)),
+            // CR 701.3a: The attaching Aura/Equipment's controller is the
+            // affected player — they are the one who would choose a
+            // replacement order (CR 616.1) and bind any "as it becomes
+            // attached, choose" continuation.
+            ProposedEvent::Attach { attachment_id, .. } => state
+                .objects
+                .get(attachment_id)
+                .map(|o| o.controller)
+                .unwrap_or(PlayerId(0)),
+        }
+    }
+
+    /// Returns the primary object affected by this event, if any.
+    pub fn affected_object_id(&self) -> Option<ObjectId> {
+        match self {
+            ProposedEvent::ZoneChange { object_id, .. }
+            | ProposedEvent::Tap { object_id, .. }
+            | ProposedEvent::Untap { object_id, .. }
+            | ProposedEvent::TurnFaceUp { object_id, .. }
+            | ProposedEvent::Destroy { object_id, .. }
+            | ProposedEvent::RemoveCounter { object_id, .. }
+            | ProposedEvent::Discard { object_id, .. }
+            | ProposedEvent::Sacrifice { object_id, .. }
+            | ProposedEvent::Explore { object_id, .. }
+            | ProposedEvent::SearchFound { object_id, .. }
+            // CR 614.1a: the conniving permanent is the affected object the
+            // `valid_card` filter ("a creature you control") is matched against.
+            | ProposedEvent::Connive { object_id, .. } => Some(*object_id),
+            ProposedEvent::TokenEntry { entry_ref, .. } => Some(*entry_ref),
+            ProposedEvent::AddCounter { placement, .. } => placement.object_id(),
+            ProposedEvent::MoveCounter {
+                source_id,
+                destination_id,
+                stage,
+                ..
+            } => Some(match stage {
+                CounterMoveStage::Remove => *source_id,
+                CounterMoveStage::Add => *destination_id,
+            }),
+            // CR 106.3: The mana source (land being tapped) is the affected object —
+            // this is what `valid_card` filters are matched against.
+            ProposedEvent::ProduceMana { source_id, .. } => Some(*source_id),
+            ProposedEvent::Damage { target, .. } => match target {
+                TargetRef::Object(oid) => Some(*oid),
+                TargetRef::Player(_) => None,
+            },
+            ProposedEvent::Draw { .. }
+            | ProposedEvent::Scry { .. }
+            | ProposedEvent::Mill { .. }
+            | ProposedEvent::Proliferate { .. }
+            | ProposedEvent::CoinFlip { .. }
+            | ProposedEvent::RollDice { .. }
+            | ProposedEvent::LifeGain { .. }
+            | ProposedEvent::LifeLoss { .. }
+            | ProposedEvent::CreateToken { .. }
+            | ProposedEvent::BeginTurn { .. }
+            | ProposedEvent::BeginPhase { .. }
+            | ProposedEvent::EmptyManaPool { .. }
+            // CR 701.31: a planeswalk has no affected object — the planar deck
+            // rotation is not an object-scoped event.
+            | ProposedEvent::Planeswalk { .. } => None,
+            // CR 701.3a: the attaching Aura/Equipment is the object
+            // `valid_card` filters (and "as it becomes attached" replacements)
+            // match against.
+            ProposedEvent::Attach { attachment_id, .. } => Some(*attachment_id),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ability::EntryAttackDestination;
+    use crate::types::attack_target::AttackTarget;
+    use crate::types::card_type::CoreType;
+    use crate::types::mana::ManaColor;
+
+    #[test]
+    fn zone_change_library_placement_wire_preserves_presence_and_values() {
+        let event = ProposedEvent::zone_change(ObjectId(7), Zone::Hand, Zone::Library, None);
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            wire["ZoneChange"]["library_placement"],
+            serde_json::Value::Null
+        );
+        assert!(wire["ZoneChange"].get("library_placement").is_some());
+        let mut legacy = wire.clone();
+        legacy["ZoneChange"]
+            .as_object_mut()
+            .unwrap()
+            .remove("library_placement");
+        assert_eq!(
+            serde_json::from_value::<ProposedEvent>(legacy).unwrap(),
+            event
+        );
+        for position in [
+            LibraryPosition::Top,
+            LibraryPosition::Bottom,
+            LibraryPosition::NthFromTop { n: 3 },
+        ] {
+            let mut positioned = wire.clone();
+            positioned["ZoneChange"]["library_placement"] =
+                serde_json::to_value(&position).unwrap();
+            let decoded: ProposedEvent = serde_json::from_value(positioned.clone()).unwrap();
+            assert!(
+                matches!(&decoded, ProposedEvent::ZoneChange { library_placement: Some(actual), .. } if **actual == position)
+            );
+            assert_eq!(serde_json::to_value(decoded).unwrap(), positioned);
+        }
+        let mut malformed = wire;
+        malformed["ZoneChange"]["library_placement"] = serde_json::json!({"type": "NotAPosition"});
+        assert!(serde_json::from_value::<ProposedEvent>(malformed).is_err());
+    }
+
+    #[test]
+    fn replacement_id_equality_and_hash() {
+        let id1 = ReplacementId {
+            source: ObjectId(1),
+            index: 0,
+        };
+        let id2 = ReplacementId {
+            source: ObjectId(1),
+            index: 0,
+        };
+        let id3 = ReplacementId {
+            source: ObjectId(1),
+            index: 1,
+        };
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+
+        let mut set = HashSet::new();
+        set.insert(id1);
+        assert!(set.contains(&id2));
+        assert!(!set.contains(&id3));
+    }
+
+    /// CR 702.16e + CR 615.13 (Matt F4, keyed by ability in R8-F1): the
+    /// protection tally key round-trips through the tagged mirror with its
+    /// matched quality, so paused-batch frames carrying protection
+    /// prevention survive save/load. The pre-quality shape (PR heads only,
+    /// never main) fails closed instead of loading as a quality-less key.
+    #[test]
+    fn protection_key_serde_round_trip() {
+        let key = AppliedReplacementKey::Protection {
+            quality: MatchedProtectionQuality::CardType(CoreType::Artifact),
+        };
+        let json = serde_json::to_string(&key).expect("the key serializes");
+        assert_eq!(
+            json,
+            r#"{"type":"Protection","quality":{"CardType":"Artifact"}}"#
+        );
+        let back: AppliedReplacementKey =
+            serde_json::from_str(&json).expect("the key deserializes");
+        assert_eq!(back, key);
+        assert_eq!(back.source(), ObjectId(0));
+        assert!(serde_json::from_str::<AppliedReplacementKey>(r#"{"type":"Protection"}"#).is_err());
+    }
+
+    #[test]
+    fn add_counter_object_serde_keeps_legacy_flat_shape() {
+        let event = ProposedEvent::AddCounter {
+            placement: CounterPlacement::Object {
+                actor: PlayerId(0),
+                object_id: ObjectId(1),
+                counter_type: CounterType::Plus1Plus1,
+                cause: CounterCause::Other,
+            },
+            count: 1,
+            applied: HashSet::new(),
+        };
+
+        let value = serde_json::to_value(&event).unwrap();
+        let add_counter = value
+            .get("AddCounter")
+            .expect("externally tagged AddCounter variant")
+            .as_object()
+            .expect("AddCounter payload object");
+        assert!(add_counter.get("placement").is_none());
+        assert!(add_counter.get("actor").is_some());
+        assert!(add_counter.get("object_id").is_some());
+        assert!(add_counter.get("counter_type").is_some());
+
+        let roundtrip: ProposedEvent = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            roundtrip,
+            ProposedEvent::AddCounter {
+                placement: CounterPlacement::Object {
+                    actor: PlayerId(0),
+                    object_id: ObjectId(1),
+                    counter_type: CounterType::Plus1Plus1,
+                    ..
+                },
+                count: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn add_counter_object_serde_accepts_legacy_missing_actor() {
+        let event = ProposedEvent::AddCounter {
+            placement: CounterPlacement::Object {
+                actor: PlayerId(0),
+                object_id: ObjectId(1),
+                counter_type: CounterType::Plus1Plus1,
+                cause: CounterCause::Other,
+            },
+            count: 1,
+            applied: HashSet::new(),
+        };
+        let mut value = serde_json::to_value(&event).unwrap();
+        value
+            .get_mut("AddCounter")
+            .and_then(|payload| payload.as_object_mut())
+            .expect("AddCounter payload object")
+            .remove("actor");
+
+        let roundtrip: ProposedEvent = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            roundtrip,
+            ProposedEvent::AddCounter {
+                placement: CounterPlacement::Object {
+                    actor: PlayerId(0),
+                    object_id: ObjectId(1),
+                    counter_type: CounterType::Plus1Plus1,
+                    ..
+                },
+                count: 1,
+                ..
+            }
+        ));
+    }
+
+    /// P1-1: every `CounterCause` field defaults to fail-closed `Other`, and a
+    /// pre-cause save (no `cause` key) loads with `Other`. Revert-fails in both
+    /// directions: remove any `#[serde(default)]` and the legacy half fails to
+    /// deserialize; stop stamping `Other` and the fresh-save assertions fail.
+    #[test]
+    fn counter_cause_default_and_backcompat() {
+        assert_eq!(CounterCause::default(), CounterCause::Other);
+        let placements = [
+            CounterPlacement::Object {
+                actor: PlayerId(0),
+                object_id: ObjectId(1),
+                counter_type: CounterType::Plus1Plus1,
+                cause: CounterCause::Other,
+            },
+            CounterPlacement::Player {
+                actor: PlayerId(0),
+                player_id: PlayerId(1),
+                counter_kind: PlayerCounterKind::Rad,
+                cause: CounterCause::Other,
+            },
+            CounterPlacement::Energy {
+                actor: PlayerId(0),
+                player_id: PlayerId(1),
+                cause: CounterCause::Other,
+            },
+        ];
+        for placement in placements {
+            let event = ProposedEvent::AddCounter {
+                placement,
+                count: 1,
+                applied: HashSet::new(),
+            };
+            let mut wire = serde_json::to_value(&event).unwrap();
+            // Reach-guard: a fresh save actually carries the new field.
+            assert_eq!(wire["AddCounter"]["cause"], serde_json::json!("Other"));
+            wire["AddCounter"].as_object_mut().unwrap().remove("cause");
+            let legacy: ProposedEvent = serde_json::from_value(wire).unwrap();
+            assert!(matches!(
+                legacy,
+                ProposedEvent::AddCounter {
+                    placement: CounterPlacement::Object {
+                        cause: CounterCause::Other,
+                        ..
+                    } | CounterPlacement::Player {
+                        cause: CounterCause::Other,
+                        ..
+                    } | CounterPlacement::Energy {
+                        cause: CounterCause::Other,
+                        ..
+                    },
+                    ..
+                }
+            ));
+        }
+        let moved = ProposedEvent::MoveCounter {
+            actor: PlayerId(0),
+            source_id: ObjectId(1),
+            destination_id: ObjectId(2),
+            counter_type: CounterType::Plus1Plus1,
+            remove_count: 1,
+            add_count: 1,
+            stage: CounterMoveStage::Add,
+            cause: CounterCause::Other,
+            applied: HashSet::new(),
+        };
+        let mut wire = serde_json::to_value(&moved).unwrap();
+        assert_eq!(wire["MoveCounter"]["cause"], serde_json::json!("Other"));
+        wire["MoveCounter"].as_object_mut().unwrap().remove("cause");
+        let legacy: ProposedEvent = serde_json::from_value(wire).unwrap();
+        assert!(matches!(
+            legacy,
+            ProposedEvent::MoveCounter {
+                cause: CounterCause::Other,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mark_applied_and_already_applied() {
+        let mut event = ProposedEvent::Draw {
+            player_id: PlayerId(0),
+            count: 1,
+            stage: DrawEventStage::Individual,
+            applied: HashSet::new(),
+        };
+        let rid = ReplacementId {
+            source: ObjectId(5),
+            index: 0,
+        };
+        assert!(!event.already_applied(&rid));
+        event.mark_applied(rid);
+        assert!(event.already_applied(&rid));
+    }
+
+    #[test]
+    fn move_counter_stage_controls_affected_object() {
+        let remove = ProposedEvent::MoveCounter {
+            actor: PlayerId(0),
+            source_id: ObjectId(1),
+            destination_id: ObjectId(2),
+            counter_type: CounterType::Plus1Plus1,
+            remove_count: 1,
+            add_count: 1,
+            stage: CounterMoveStage::Remove,
+            cause: CounterCause::Other,
+            applied: HashSet::new(),
+        };
+        let add = ProposedEvent::MoveCounter {
+            actor: PlayerId(0),
+            source_id: ObjectId(1),
+            destination_id: ObjectId(2),
+            counter_type: CounterType::Plus1Plus1,
+            remove_count: 1,
+            add_count: 1,
+            stage: CounterMoveStage::Add,
+            cause: CounterCause::Other,
+            applied: HashSet::new(),
+        };
+
+        assert_eq!(remove.affected_object_id(), Some(ObjectId(1)));
+        assert_eq!(add.affected_object_id(), Some(ObjectId(2)));
+    }
+
+    /// SHAPE: `ProposedEvent::EmptyManaPool` survives a serde roundtrip with
+    /// non-empty `units` and `applied` populated. Verifies the new variant
+    /// participates in the discriminated-union tag/content protocol used over
+    /// the WASM boundary and in persisted state snapshots.
+    #[test]
+    fn empty_mana_pool_serde_roundtrip() {
+        use crate::types::mana::UnitDisposition;
+        let event = ProposedEvent::EmptyManaPool {
+            player_id: PlayerId(1),
+            units: vec![
+                UnitDecision {
+                    pool_index: 0,
+                    color: ManaType::Green,
+                    disposition: UnitDisposition::Drop,
+                },
+                UnitDecision {
+                    pool_index: 1,
+                    color: ManaType::Red,
+                    disposition: UnitDisposition::Recolor(ManaType::Colorless),
+                },
+                UnitDecision {
+                    pool_index: 2,
+                    color: ManaType::White,
+                    disposition: UnitDisposition::Keep,
+                },
+            ],
+            applied: {
+                let mut s = HashSet::new();
+                s.insert(AppliedReplacementKey::object(ObjectId(42), 3));
+                s
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ProposedEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn applied_key_keeps_floating_and_step_end_mana_distinct() {
+        let mut applied = HashSet::new();
+        applied.insert(AppliedReplacementKey::floating(0));
+        applied.insert(AppliedReplacementKey::step_end_mana(0));
+
+        assert_eq!(applied.len(), 2);
+        assert!(applied.contains(&AppliedReplacementKey::floating(0)));
+        assert!(applied.contains(&AppliedReplacementKey::step_end_mana(0)));
+    }
+
+    #[test]
+    fn legacy_empty_mana_pool_sentinel_deserializes_to_step_end_mana() {
+        let json = serde_json::json!({
+            "EmptyManaPool": {
+                "player_id": 0,
+                "units": [],
+                "applied": [{ "source": 0, "index": 2 }]
+            }
+        });
+
+        let event: ProposedEvent = serde_json::from_value(json).unwrap();
+        let ProposedEvent::EmptyManaPool { applied, .. } = event else {
+            panic!("expected EmptyManaPool");
+        };
+        assert!(applied.contains(&AppliedReplacementKey::step_end_mana(2)));
+        assert!(!applied.contains(&AppliedReplacementKey::floating(2)));
+    }
+
+    fn batch_spec(name: &str) -> Box<TokenSpec> {
+        Box::new(TokenSpec {
+            characteristics: TokenCharacteristics {
+                display_name: name.to_string(),
+                power: Some(1),
+                toughness: Some(1),
+                loyalty: None,
+                core_types: vec![CoreType::Creature],
+                subtypes: vec![name.to_string()],
+                supertypes: Vec::new(),
+                colors: Vec::new(),
+                keywords: Vec::new(),
+            },
+            script_name: name.to_string(),
+            static_abilities: Vec::new(),
+            enter_with_counters: Vec::new(),
+            tapped: false,
+            enters_attacking: false,
+            attack_request: TokenAttackRequest::Unspecified,
+            sacrifice_at: None,
+            source_id: ObjectId(1),
+            controller: PlayerId(0),
+            attach_to: TokenHostRequest::NotRequested,
+        })
+    }
+
+    fn batch(name: &str, count: u32) -> TokenBatch {
+        TokenBatch {
+            redirected_to: None,
+            owner: PlayerId(0),
+            spec: batch_spec(name),
+            copy: None,
+            enter_tapped: EtbTapState::Unspecified,
+            count,
+        }
+    }
+
+    fn applied_with(index: usize) -> HashSet<AppliedReplacementKey> {
+        HashSet::from([AppliedReplacementKey::object(ObjectId(9), index as u64)])
+    }
+
+    fn compound(primary: &str, appended: Vec<TokenBatch>) -> ProposedEvent {
+        ProposedEvent::CreateToken {
+            redirected_to: None,
+            owner: PlayerId(0),
+            spec: batch_spec(primary),
+            copy: None,
+            enter_tapped: EtbTapState::Unspecified,
+            count: 2,
+            appended,
+            applied: applied_with(0),
+        }
+    }
+
+    /// SHAPE (serialized compatibility): a compound CreateToken round-trips with
+    /// its appended batches, and a plain one omits the key entirely.
+    #[test]
+    fn create_token_appended_serde_roundtrip() {
+        let event = compound("Plant", vec![batch("Squirrel", 2)]);
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json["CreateToken"].get("appended").is_some());
+        let back: ProposedEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(event, back);
+
+        let plain = compound("Plant", Vec::new());
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json["CreateToken"].get("appended").is_none());
+        let back: ProposedEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(plain, back);
+    }
+
+    /// A CreateToken persisted before `appended` existed deserializes with no
+    /// appended batch.
+    #[test]
+    fn create_token_without_appended_key_deserializes_empty() {
+        let mut json = serde_json::to_value(compound("Plant", Vec::new())).unwrap();
+        json["CreateToken"]
+            .as_object_mut()
+            .expect("CreateToken payload object")
+            .remove("appended");
+        let back: ProposedEvent = serde_json::from_value(json).unwrap();
+        let ProposedEvent::CreateToken { appended, .. } = &back else {
+            panic!("expected CreateToken");
+        };
+        assert!(appended.is_empty());
+        assert!(!back.has_appended_token_batches());
+        assert!(back.token_batch_views().is_none());
+    }
+
+    /// CR 614.1a + CR 614.5: splitting a compound event into batch views and
+    /// joining them back is the identity; every view carries the event's
+    /// applied set and no view is itself compound.
+    #[test]
+    fn token_batch_views_split_then_join_is_identity() {
+        let event = compound("Plant", vec![batch("Squirrel", 2), batch("Food", 1)]);
+        let views = event.token_batch_views().expect("compound event has views");
+        assert_eq!(views.len(), 3);
+        for view in &views {
+            assert!(!view.has_appended_token_batches());
+            assert_eq!(view.applied_set(), event.applied_set());
+        }
+        assert_eq!(
+            ProposedEvent::from_token_batch_views(views),
+            Some(event.clone())
+        );
+        assert_eq!(event.clone().into_token_batch_views().len(), 3);
+        assert_eq!(ProposedEvent::from_token_batch_views(Vec::new()), None);
+    }
+
+    /// CR 614.1a: a batch a view's own application appended is placed right
+    /// after that view, and the applied sets are unioned.
+    #[test]
+    fn from_token_batch_views_flattens_view_appended_after_its_view() {
+        let primary = compound("Treasure", vec![batch("Clue", 1)]);
+        let mut second = batch("Squirrel", 1).into_event(applied_with(1));
+        if let ProposedEvent::CreateToken { appended, .. } = &mut second {
+            appended.push(batch("Food", 1));
+        }
+        let joined = ProposedEvent::from_token_batch_views(vec![primary, second])
+            .expect("CreateToken views join");
+        let ProposedEvent::CreateToken {
+            appended, applied, ..
+        } = &joined
+        else {
+            panic!("expected CreateToken");
+        };
+        let names: Vec<_> = appended
+            .iter()
+            .map(|b| b.spec.characteristics.display_name.as_str())
+            .collect();
+        assert_eq!(names, ["Clue", "Squirrel", "Food"]);
+        assert_eq!(applied.len(), 2);
+    }
+
+    /// CR 614.1a + CR 111.1: the event's batches come out primary first, then
+    /// the appended batches in event order.
+    #[test]
+    fn into_token_batches_is_event_ordered() {
+        let event = compound("Plant", vec![batch("Squirrel", 3), batch("Food", 1)]);
+        let batches = event.into_token_batches().expect("CreateToken has batches");
+        let shape: Vec<_> = batches
+            .iter()
+            .map(|b| (b.spec.characteristics.display_name.as_str(), b.count))
+            .collect();
+        assert_eq!(shape, [("Plant", 2), ("Squirrel", 3), ("Food", 1)]);
+        assert!(ProposedEvent::begin_turn(PlayerId(0), false)
+            .into_token_batches()
+            .is_none());
+    }
+
+    #[test]
+    fn token_attack_request_selects_the_destination_by_creation_ordinal() {
+        assert_eq!(TokenAttackRequest::named(Vec::new()), None);
+
+        let request = TokenAttackRequest::named([PlayerId(1), PlayerId(2)])
+            .expect("a non-empty player list names a request");
+        let at = |player: u8| EntryAttackDestination::Exact {
+            target: AttackTarget::Player(PlayerId(player)),
+        };
+        assert_eq!(request.for_entrant(0), at(1));
+        assert_eq!(request.for_entrant(1), at(2));
+        assert_eq!(request.for_entrant(2), at(1));
+
+        for ordinal in 0..3 {
+            assert_eq!(
+                TokenAttackRequest::Unspecified.for_entrant(ordinal),
+                EntryAttackDestination::AnyDefender
+            );
+        }
+    }
+
+    #[test]
+    fn token_attack_request_after_entrants_continues_the_ordinal_sequence() {
+        let request = TokenAttackRequest::named([PlayerId(1), PlayerId(2), PlayerId(3)])
+            .expect("a non-empty player list names a request");
+        for consumed in 0..7 {
+            let resumed = request.after_entrants(consumed);
+            for ordinal in 0..7 {
+                assert_eq!(
+                    resumed.for_entrant(ordinal),
+                    request.for_entrant(consumed + ordinal),
+                    "consumed {consumed}, ordinal {ordinal}"
+                );
+            }
+        }
+        assert_eq!(
+            TokenAttackRequest::Unspecified.after_entrants(3),
+            TokenAttackRequest::Unspecified
+        );
+    }
+
+    fn token_spec_with(attack_request: TokenAttackRequest) -> TokenSpec {
+        TokenSpec {
+            characteristics: TokenCharacteristics {
+                display_name: "Goblin".to_string(),
+                power: Some(1),
+                toughness: Some(1),
+                loyalty: None,
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Goblin".to_string()],
+                supertypes: vec![],
+                colors: vec![ManaColor::Red],
+                keywords: vec![],
+            },
+            script_name: "Goblin".to_string(),
+            static_abilities: vec![],
+            enter_with_counters: vec![],
+            tapped: true,
+            enters_attacking: true,
+            attack_request,
+            sacrifice_at: None,
+            source_id: ObjectId(1),
+            controller: PlayerId(0),
+            attach_to: TokenHostRequest::NotRequested,
+        }
+    }
+
+    fn copy_token_spec_with(attack_request: TokenAttackRequest) -> CopyTokenSpec {
+        let mut state = crate::types::game_state::GameState::new_two_player(42);
+        let id = crate::game::zones::create_object(
+            &mut state,
+            crate::types::identifiers::CardId(1),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        CopyTokenSpec {
+            values: Box::new(crate::game::printed_cards::intrinsic_copiable_values(
+                &state.objects[&id],
+            )),
+            display: crate::game::game_object::DisplayIdentity {
+                display_source: crate::game::game_object::DisplaySource::Token,
+                ..Default::default()
+            },
+            extra_keywords: vec![],
+            additional_modifications: vec![],
+            tapped: true,
+            enters_attacking: true,
+            attack_request,
+            sacrifice_at: None,
+            source_id: ObjectId(1),
+            controller: PlayerId(0),
+            donor: None,
+            double_faced: None,
+        }
+    }
+
+    /// An unspecified request is omitted from the wire, a payload without the
+    /// key reads as unspecified, and a named request round-trips.
+    #[test]
+    fn token_attack_request_wire_shape_is_additive() {
+        let named = TokenAttackRequest::Named {
+            first: PlayerId(1),
+            rest: vec![PlayerId(2)],
+        };
+
+        let plain = serde_json::to_value(token_spec_with(TokenAttackRequest::Unspecified))
+            .expect("serializes");
+        assert!(plain.get("attack_request").is_none(), "{plain}");
+        let back: TokenSpec = serde_json::from_value(plain).expect("reads without the key");
+        assert_eq!(back.attack_request, TokenAttackRequest::Unspecified);
+        let with_named = serde_json::to_value(token_spec_with(named.clone())).expect("serializes");
+        assert!(with_named.get("attack_request").is_some(), "{with_named}");
+        let back: TokenSpec = serde_json::from_value(with_named).expect("round-trips");
+        assert_eq!(back.attack_request, named);
+
+        let plain = serde_json::to_value(copy_token_spec_with(TokenAttackRequest::Unspecified))
+            .expect("serializes");
+        assert!(plain.get("attack_request").is_none(), "{plain}");
+        let back: CopyTokenSpec = serde_json::from_value(plain).expect("reads without the key");
+        assert_eq!(back.attack_request, TokenAttackRequest::Unspecified);
+        let with_named =
+            serde_json::to_value(copy_token_spec_with(named.clone())).expect("serializes");
+        assert!(with_named.get("attack_request").is_some(), "{with_named}");
+        let back: CopyTokenSpec = serde_json::from_value(with_named).expect("round-trips");
+        assert_eq!(back.attack_request, named);
+    }
+
+    /// CR 707.8a: a single-faced copy omits `double_faced` from the wire, a
+    /// payload without the key reads as single-faced, and both faces round-trip.
+    #[test]
+    fn copy_token_double_faced_wire_shape_is_additive() {
+        let plain = serde_json::to_value(copy_token_spec_with(TokenAttackRequest::Unspecified))
+            .expect("serializes");
+        assert!(plain.get("double_faced").is_none(), "{plain}");
+        let back: CopyTokenSpec = serde_json::from_value(plain).expect("reads without the key");
+        assert_eq!(back.double_faced, None);
+
+        let mut spec = copy_token_spec_with(TokenAttackRequest::Unspecified);
+        let hidden = BackFaceData {
+            name: "Sinuous Predator".to_string(),
+            power: Some(4),
+            toughness: Some(4),
+            layout_kind: Some(crate::types::card::LayoutKind::Transform),
+            ..BackFaceData::default()
+        };
+        let faces = CopiedDoubleFaces {
+            hidden: Box::new(hidden),
+            up: CopiedFaceUp::TransformedBack,
+        };
+        spec.double_faced = Some(faces.clone());
+        let with_faces = serde_json::to_value(&spec).expect("serializes");
+        assert!(with_faces.get("double_faced").is_some(), "{with_faces}");
+        let back: CopyTokenSpec = serde_json::from_value(with_faces).expect("round-trips");
+        assert_eq!(back.double_faced, Some(faces));
+    }
+
+    #[test]
+    fn legacy_token_entry_sentinel_deserializes_to_floating() {
+        let json = serde_json::json!({
+            "TokenEntry": {
+                "entry_ref": 99,
+                "applied": [{ "source": 0, "index": 2 }]
+            }
+        });
+
+        let event: ProposedEvent = serde_json::from_value(json).unwrap();
+        let ProposedEvent::TokenEntry { applied, .. } = event else {
+            panic!("expected TokenEntry");
+        };
+        assert!(applied.contains(&AppliedReplacementKey::floating(2)));
+        assert!(!applied.contains(&AppliedReplacementKey::step_end_mana(2)));
+    }
+
+    /// CR 614.12 + CR 611.2e: the zone-change with-entry effect is an optional
+    /// wire field — absent decodes `None`, `None` is omitted, and a carried
+    /// effect round-trips. The derived view reads `RemovedWithEntry` only when
+    /// the carried effect removes all abilities (CR 613.1f), and every other
+    /// proposal carries none.
+    #[test]
+    fn zone_change_with_entry_effect_serde() {
+        let plain = ProposedEvent::zone_change(
+            ObjectId(7),
+            Zone::Graveyard,
+            Zone::Battlefield,
+            Some(ObjectId(3)),
+        );
+        let value = serde_json::to_value(&plain).expect("serializes");
+        assert!(
+            value["ZoneChange"].get("with_entry_effect").is_none(),
+            "None must not be serialized: {value}"
+        );
+        let back: ProposedEvent = serde_json::from_value(value).expect("reads without the key");
+        assert_eq!(back.with_entry_effect(), None);
+        assert_eq!(back.entrant_abilities(), EntrantAbilities::Retained);
+
+        let carrying = |modifications: Vec<ContinuousModification>| {
+            let mut event = plain.clone();
+            let ProposedEvent::ZoneChange {
+                with_entry_effect, ..
+            } = &mut event
+            else {
+                unreachable!("zone_change constructs a ZoneChange");
+            };
+            *with_entry_effect = Some(Box::new(WithEntryEffect {
+                source_id: ObjectId(3),
+                controller: PlayerId(0),
+                modifications,
+            }));
+            event
+        };
+
+        let removed = carrying(vec![
+            ContinuousModification::AddSubtype {
+                subtype: "Skeleton".to_string(),
+            },
+            ContinuousModification::RemoveAllAbilities,
+        ]);
+        let value = serde_json::to_value(&removed).expect("serializes");
+        assert!(
+            value["ZoneChange"].get("with_entry_effect").is_some(),
+            "a carried effect must be serialized: {value}"
+        );
+        let back: ProposedEvent = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(back, removed);
+        assert_eq!(back.with_entry_effect(), removed.with_entry_effect());
+        assert_eq!(back.entrant_abilities(), EntrantAbilities::RemovedWithEntry);
+
+        let retained = carrying(vec![
+            ContinuousModification::AddColor {
+                color: ManaColor::Black,
+            },
+            ContinuousModification::AddSubtype {
+                subtype: "Zombie".to_string(),
+            },
+        ]);
+        let back: ProposedEvent =
+            serde_json::from_value(serde_json::to_value(&retained).expect("serializes"))
+                .expect("round-trips");
+        assert_eq!(back, retained);
+        assert!(back.with_entry_effect().is_some());
+        assert_eq!(back.entrant_abilities(), EntrantAbilities::Retained);
+
+        let begin_turn = ProposedEvent::begin_turn(PlayerId(0), false);
+        assert_eq!(begin_turn.with_entry_effect(), None);
+        assert_eq!(begin_turn.entrant_abilities(), EntrantAbilities::Retained);
+    }
+
+    /// A card in `zone` with `incarnation`, made by the zone primitive on `state`.
+    fn object_in(
+        state: &mut crate::types::game_state::GameState,
+        zone: Zone,
+        incarnation: u64,
+    ) -> ObjectId {
+        let id = crate::game::zones::create_object(
+            state,
+            crate::types::identifiers::CardId(state.next_object_id),
+            PlayerId(0),
+            "Member".to_string(),
+            zone,
+        );
+        state.objects.get_mut(&id).expect("created").incarnation = incarnation;
+        id
+    }
+
+    /// U1 — CR 614.4 + CR 400.7: `entered_earlier` holds exactly for an announced member that
+    /// is now on the battlefield as a new object.
+    #[test]
+    fn co_entrants_entered_earlier_needs_a_changed_battlefield_incarnation() {
+        let mut state = crate::types::game_state::GameState::new_two_player(7);
+        let delivered = object_in(&mut state, Zone::Graveyard, 3);
+        let later = object_in(&mut state, Zone::Graveyard, 5);
+        let exiled = object_in(&mut state, Zone::Graveyard, 2);
+        let left_in_place = object_in(&mut state, Zone::Battlefield, 4);
+        let non_member = object_in(&mut state, Zone::Battlefield, 1);
+        let announced: Vec<ObjectIncarnationRef> = [delivered, later, exiled, left_in_place]
+            .iter()
+            .map(|id| ObjectIncarnationRef::from_object(&state.objects[id]))
+            .collect();
+        let co_entrants =
+            CoEntrants::for_entrant(&announced, ObjectId(9_999)).expect("four members");
+
+        // The earlier member is delivered (a new battlefield object); another is exiled.
+        let moved = state.objects.get_mut(&delivered).expect("member");
+        moved.zone = Zone::Battlefield;
+        moved.incarnation = 4;
+        let moved = state.objects.get_mut(&exiled).expect("member");
+        moved.zone = Zone::Exile;
+        moved.incarnation = 3;
+
+        assert!(co_entrants.entered_earlier(&state.objects[&delivered]));
+        assert!(!co_entrants.entered_earlier(&state.objects[&later]));
+        assert!(!co_entrants.entered_earlier(&state.objects[&exiled]));
+        assert!(!co_entrants.entered_earlier(&state.objects[&left_in_place]));
+        assert!(!co_entrants.entered_earlier(&state.objects[&non_member]));
+    }
+
+    /// U1 — `for_entrant` names every announced member except the entrant itself.
+    #[test]
+    fn co_entrants_for_entrant_omits_the_entrant() {
+        let announced = [
+            ObjectIncarnationRef::of(ObjectId(1), 2),
+            ObjectIncarnationRef::of(ObjectId(3), 4),
+            ObjectIncarnationRef::of(ObjectId(5), 6),
+        ];
+        let co_entrants = CoEntrants::for_entrant(&announced, ObjectId(3)).expect("two others");
+        assert_eq!(
+            co_entrants.as_slice(),
+            &[announced[0], announced[2]],
+            "the entrant is not its own co-entrant"
+        );
+        assert!(
+            CoEntrants::for_entrant(&announced[..1], ObjectId(1)).is_none(),
+            "a lone entrant has no co-entrants"
+        );
+    }
+
+    /// U2 — CR 614.4 + CR 614.12: `co_entrants` is an optional wire field — none is
+    /// omitted, a stamp round-trips, and a proposal without the key or with an empty list
+    /// decodes as none. Only a zone change carries one.
+    #[test]
+    fn zone_change_co_entrants_serde() {
+        let plain = ProposedEvent::zone_change(
+            ObjectId(7),
+            Zone::Graveyard,
+            Zone::Battlefield,
+            Some(ObjectId(3)),
+        );
+        let value = serde_json::to_value(&plain).expect("serializes");
+        assert!(
+            value["ZoneChange"].get("co_entrants").is_none(),
+            "empty must not be serialized: {value}"
+        );
+        let back: ProposedEvent =
+            serde_json::from_value(value.clone()).expect("reads without the key");
+        assert_eq!(back.co_entrants(), None);
+        let mut empty_list = value;
+        empty_list["ZoneChange"]["co_entrants"] = serde_json::json!([]);
+        let back: ProposedEvent = serde_json::from_value(empty_list).expect("reads an empty list");
+        assert_eq!(back, plain, "an empty list reads as no co-entrants");
+
+        let mut stamped = plain.clone();
+        let ProposedEvent::ZoneChange { co_entrants, .. } = &mut stamped else {
+            unreachable!("zone_change constructs a ZoneChange");
+        };
+        *co_entrants = CoEntrants::for_entrant(
+            &[
+                ObjectIncarnationRef::of(ObjectId(7), 1),
+                ObjectIncarnationRef::of(ObjectId(8), 2),
+            ],
+            ObjectId(7),
+        );
+        let value = serde_json::to_value(&stamped).expect("serializes");
+        assert!(
+            value["ZoneChange"].get("co_entrants").is_some(),
+            "a stamp must be serialized: {value}"
+        );
+        let back: ProposedEvent = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(back, stamped);
+        assert_eq!(
+            back.co_entrants().map(CoEntrants::as_slice),
+            Some(&[ObjectIncarnationRef::of(ObjectId(8), 2)][..])
+        );
+
+        assert_eq!(
+            ProposedEvent::begin_turn(PlayerId(0), false).co_entrants(),
+            None
+        );
+    }
+
+    /// CR 614.1c + CR 611.2a: `enter_with_grants` keeps the wire shape of the upstream
+    /// `Vec<EnterWithGrant>` field — omitted when there are none, the same array of grants
+    /// otherwise, and an empty array (or no key) decodes as none. Appending no grant leaves
+    /// none; appending keeps application order.
+    #[test]
+    fn zone_change_enter_with_grants_serde_matches_the_vec_wire_shape() {
+        use crate::types::ability::{AbilityDefinition, AbilityKind, Effect};
+        let grant = |controller: u8| EnterWithGrant {
+            grant: AbilityDefinition::new(AbilityKind::Spell, Effect::RingTemptsYou),
+            controller: PlayerId(controller),
+        };
+        let plain = ProposedEvent::zone_change(
+            ObjectId(7),
+            Zone::Graveyard,
+            Zone::Battlefield,
+            Some(ObjectId(3)),
+        );
+        let value = serde_json::to_value(&plain).expect("serializes");
+        assert!(
+            value["ZoneChange"].get("enter_with_grants").is_none(),
+            "none must not be serialized: {value}"
+        );
+        let mut empty_list = value;
+        empty_list["ZoneChange"]["enter_with_grants"] = serde_json::json!([]);
+        let back: ProposedEvent = serde_json::from_value(empty_list).expect("reads an empty list");
+        assert_eq!(back, plain, "an empty list reads as no grants");
+
+        let mut granted = plain.clone();
+        let ProposedEvent::ZoneChange {
+            enter_with_grants, ..
+        } = &mut granted
+        else {
+            unreachable!("zone_change constructs a ZoneChange");
+        };
+        EnterWithGrants::append(enter_with_grants, std::iter::empty());
+        assert!(
+            enter_with_grants.is_none(),
+            "appending no grant leaves none"
+        );
+        EnterWithGrants::append(enter_with_grants, [grant(0)]);
+        EnterWithGrants::append(enter_with_grants, [grant(1)]);
+        assert_eq!(
+            EnterWithGrants::of(enter_with_grants),
+            &[grant(0), grant(1)]
+        );
+
+        let value = serde_json::to_value(&granted).expect("serializes");
+        assert_eq!(
+            value["ZoneChange"]["enter_with_grants"],
+            serde_json::to_value(vec![grant(0), grant(1)]).expect("serializes"),
+            "the same array a Vec<EnterWithGrant> field writes"
+        );
+        let back: ProposedEvent = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(back, granted);
+    }
+    /// CR 608.2c: the searcher is recorded only for the found
+    /// card's exile; any other destination records nobody, so the delivery's
+    /// legacy ownership fallback never reads the searcher.
+    #[test]
+    fn search_found_performer_is_recorded_only_for_an_exile() {
+        use crate::types::ability::LibraryInstructionActor;
+        let disposition = |destination, actor| BoundSearchFoundDisposition {
+            destination,
+            source: crate::types::identifiers::ObjectIncarnationRef::of(
+                crate::types::identifiers::ObjectId(9),
+                0,
+            ),
+            grant: None,
+            actor,
+        };
+        let searcher = PlayerId(1);
+        assert_eq!(
+            disposition(Zone::Exile, LibraryInstructionActor::LibraryPlayer).performer(searcher),
+            Some(searcher)
+        );
+        assert_eq!(
+            disposition(Zone::Hand, LibraryInstructionActor::LibraryPlayer).performer(searcher),
+            None
+        );
+        assert_eq!(
+            disposition(Zone::Exile, LibraryInstructionActor::Controller).performer(searcher),
+            None
+        );
+    }
+}

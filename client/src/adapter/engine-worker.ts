@@ -1,0 +1,1002 @@
+/**
+ * Engine Web Worker — owns a dedicated WASM instance and handles all engine operations.
+ *
+ * The main thread communicates via postMessage with typed request/response messages.
+ * This worker owns the authoritative game state — the main thread never loads WASM directly.
+ */
+import init, {
+  ping,
+  take_last_panic_message,
+  initialize_game,
+  initialize_multiplayer_host_game,
+  initialize_draft_match_game,
+  initialize_draft_match_host_game,
+  submit_action,
+  drive_contest_js,
+  request_takeback_js,
+  respond_takeback_js,
+  cancel_takeback_js,
+  pending_takeback_js,
+  submit_interaction_js,
+  get_game_state,
+  get_filtered_game_state,
+  set_debug_hand_reveal,
+  get_ai_action_proposal,
+  get_ai_action_proposal_with_diagnostics,
+  get_ai_tactical_action_proposal,
+  get_ai_tactical_action_proposal_with_diagnostics,
+  get_ai_action_proposal_from_scores,
+  get_ai_action_proposal_from_scores_with_diagnostics,
+  get_ai_scored_candidates,
+  submit_ai_action_proposal,
+  buildLlmDecisionRequest,
+  getAiActionProposalFromLlmResponse,
+  llmProviderCatalog,
+  get_legal_actions_for_viewer_js,
+  get_viewer_snapshot_js,
+  get_viewer_transition_snapshot_js,
+  restore_game_state,
+  resume_restored_game_state,
+  resume_multiplayer_host_state,
+  load_card_database,
+  load_combo_table,
+  build_ai_card_subset,
+  evaluate_deck_compatibility_js,
+  evaluateDeckFormatGate,
+  checkDeckPrintingsBounds,
+  customFormatFromLobbyConfig,
+  formatConfigForCustomRules,
+  apply_seat_mutation,
+  project_seat_view,
+  export_game_state_json,
+  clear_game_state,
+  set_multiplayer_mode,
+  estimate_bracket_for_deck,
+  deck_signals_for_deck,
+  has_replay_recording,
+  export_replay_log,
+  load_replay_for_playback,
+  replay_length_js,
+  replay_header_js,
+  replay_seek_js,
+  clear_replay_playback,
+  preview_mana_payment_js,
+  preview_interaction_js,
+  get_card_face_data,
+  get_card_parse_details,
+  get_card_rulings,
+  canonicalCardNames,
+} from "@wasm/engine";
+import * as engineWasm from "@wasm/engine";
+
+import {
+  appliedSubmitResult,
+  isActionOutcome,
+  type ActionRejection,
+  type AiActionProposal,
+  type GameAction,
+  type GameEvent,
+  type LlmClockReading,
+} from "./types";
+import type {
+  InteractionPreviewRequest,
+  InteractionSubmission,
+} from "./generated/interaction";
+import type { BracketDeckRequest, BracketEstimateRequest } from "../types/bracketEstimate";
+import { classifyInitFailure, type InitFailure } from "./init-envelope";
+import { ENGINE_QUERIES, runEngineQuery, type EngineQueryName } from "./engine-queries";
+import { StateCodecRuntime } from "./state-codec-runtime";
+
+// ── Message Protocol ─────────────────────────────────────────────────────
+
+type EngineRequest =
+  | { type: "init"; id: number }
+  | { type: "loadCardDb"; id: number; cardDataText: string }
+  | {
+      type: "initializeGame";
+      id: number;
+      deckData: unknown | null;
+      seed: number;
+      formatConfig: unknown | null;
+      matchConfig: unknown | null;
+      playerCount?: number;
+      firstPlayer?: number;
+      /** Present only for an accepted draft's match: selects the draft-match initializer. */
+      draftSessionMinDeckSize?: number;
+    }
+  | {
+      type: "initializeMultiplayerHostGame";
+      id: number;
+      deckData: unknown | null;
+      seed: number;
+      formatConfig: unknown | null;
+      matchConfig: unknown | null;
+      playerCount?: number;
+      firstPlayer?: number;
+      draftSessionMinDeckSize?: number;
+    }
+  | { type: "submitAction"; id: number; actor: number; action: GameAction }
+  | {
+      type: "driveContest";
+      id: number;
+      nowMs: number;
+      aiPlayers: number[];
+      awayPlayers: number[];
+      clicks: unknown[];
+    }
+  | { type: "requestTakeback"; id: number; actor: number; aiPlayers: number[] }
+  | { type: "respondTakeback"; id: number; actor: number; approve: boolean; aiPlayers: number[] }
+  | { type: "cancelTakeback"; id: number; actor: number }
+  | { type: "pendingTakeback"; id: number }
+  | { type: "submitInteraction"; id: number; actor: number; submission: InteractionSubmission }
+  | { type: "previewManaPayment"; id: number; actor: number; action: GameAction }
+  | { type: "previewInteraction"; id: number; actor: number; request: InteractionPreviewRequest }
+  | { type: "getState"; id: number }
+  | { type: "getFilteredState"; id: number; viewerId: number }
+  | { type: "setDebugHandReveal"; id: number; enabled: boolean }
+  | { type: "getLegalActions"; id: number; viewerId: number }
+  | { type: "getSnapshot"; id: number; viewerId: number }
+  | { type: "getLegalActionsForViewer"; id: number; viewerId: number }
+  | { type: "getViewerSnapshot"; id: number; viewerId: number }
+  | { type: "getViewerTransitionSnapshot"; id: number; viewerId: number; events: GameEvent[] }
+  | { type: "getAiActionProposal"; id: number; difficulty: string; playerId: number }
+  | { type: "getAiActionProposalWithDiagnostics"; id: number; difficulty: string; playerId: number }
+  | { type: "getAiTacticalActionProposal"; id: number; difficulty: string; playerId: number }
+  | { type: "getAiTacticalActionProposalWithDiagnostics"; id: number; difficulty: string; playerId: number }
+  | { type: "getAiScoredCandidates"; id: number; difficulty: string; playerId: number; seed: number }
+  | { type: "getAiActionProposalFromScores"; id: number; scoresJson: string; difficulty: string; playerId: number; seed: number }
+  | { type: "getAiActionProposalFromScoresWithDiagnostics"; id: number; scoresJson: string; difficulty: string; playerId: number; seed: number }
+  | { type: "submitAiActionProposal"; id: number; proposal: AiActionProposal }
+  | {
+      type: "buildLlmDecisionRequest";
+      id: number;
+      difficulty: string;
+      playerId: number;
+      endpointJson: string;
+      historyJson: string;
+      settingsRevision: number;
+      clock: LlmClockReading;
+    }
+  | {
+      type: "getAiActionProposalFromLlmResponse";
+      id: number;
+      playerId: number;
+      fingerprint: string;
+      threadTurn: number | null;
+      provider: string;
+      status: number;
+      responseBody: string;
+      clock: LlmClockReading;
+    }
+  | { type: "llmProviderCatalog"; id: number }
+  | { type: "restoreState"; id: number; stateJson: string }
+  | { type: "resumeRestoredGameState"; id: number; viewerId: number }
+  | { type: "resumeMultiplayerHostState"; id: number; viewerId: number; stateJson: string }
+  | { type: "exportState"; id: number }
+  | { type: "loadCardDbFromUrl"; id: number }
+  | { type: "buildAiCardSubset"; id: number }
+  | { type: "evaluateDeckCompatibility"; id: number; request: unknown }
+  | { type: "evaluateDeckFormatGate"; id: number; request: unknown }
+  | { type: "checkDeckPrintingsBounds"; id: number; printings: unknown }
+  | { type: "customFormatFromLobbyConfig"; id: number; name: string; formatConfig: unknown }
+  | { type: "formatConfigForCustomRules"; id: number; customRules: unknown }
+  | { type: "getCardFaceData"; id: number; cardName: string }
+  | { type: "getCardParseDetails"; id: number; cardName: string }
+  | { type: "getCardRulings"; id: number; cardName: string }
+  | { type: "canonicalCardNames"; id: number; names: string[] }
+  | { type: "query"; id: number; name: EngineQueryName; args: unknown[] }
+  | { type: "resetGame"; id: number }
+  | { type: "setMultiplayerMode"; id: number; enabled: boolean }
+  | { type: "ping"; id: number }
+  | { type: "takeLastPanic"; id: number }
+  | { type: "openStateCodec"; id: number }
+  | { type: "decodeStateCodec"; id: number; sessionId: number; frame: Uint8Array }
+  | { type: "closeStateCodec"; id: number; sessionId: number }
+  | { type: "applySeatMutation"; id: number; stateJson: string; mutationJson: string }
+  | { type: "projectSeatView"; id: number; stateJson: string }
+  | { type: "estimateBracketForDeck"; id: number; request: BracketEstimateRequest }
+  | { type: "deckSignalsForDeck"; id: number; deck: BracketDeckRequest }
+  | { type: "hasReplayRecording"; id: number }
+  | { type: "exportReplayLog"; id: number }
+  | { type: "loadReplayForPlayback"; id: number; replayJson: string }
+  | { type: "replayLength"; id: number }
+  | { type: "replayHeader"; id: number }
+  | { type: "replaySeek"; id: number; target: number }
+  | { type: "clearReplayPlayback"; id: number };
+
+type EngineResponse =
+  | { type: "result"; id: number; data: unknown }
+  | {
+      type: "error";
+      id: number;
+      message: string;
+      bracketViolation?: true;
+      engineOccupied?: true;
+      actionRejection?: ActionRejection;
+    };
+
+// ── State ────────────────────────────────────────────────────────────────
+
+let cardDbLoaded = false;
+/** Set once the WASM module is instantiated by the `init` handler. */
+let wasmInitialized = false;
+/**
+ * Negotiated state-codec sessions for this worker's WASM instance. Decoder
+ * baselines live here, never on the main thread; see `state-codec-runtime.ts`.
+ */
+let stateCodecRuntime: StateCodecRuntime | null = null;
+
+type ComboTableLoadOutcome = "loaded" | "unavailable";
+
+let comboTablePromise: Promise<ComboTableLoadOutcome> | null = null;
+
+function ensureComboTable(): Promise<ComboTableLoadOutcome> {
+  if (!comboTablePromise) {
+    let definitiveMissing = false;
+    const pending: Promise<ComboTableLoadOutcome> = (async () => {
+      try {
+        const response = await fetch(__COMBO_TABLE_URL__);
+        if (response.status === 404) {
+          definitiveMissing = true;
+          return "unavailable";
+        }
+        if (!response.ok) {
+          throw new Error(`Failed to load combo-table.json (${response.status})`);
+        }
+        await load_combo_table(await response.text());
+        return "loaded";
+      } catch {
+        return "unavailable";
+      }
+    })();
+    comboTablePromise = pending;
+    void pending.then((outcome) => {
+      if (outcome === "unavailable" && !definitiveMissing && comboTablePromise === pending) {
+        comboTablePromise = null;
+      }
+    });
+  }
+  return comboTablePromise;
+}
+
+function respond(msg: EngineResponse): void {
+  self.postMessage(msg);
+}
+
+function result(id: number, data: unknown): void {
+  respond({ type: "result", id, data });
+}
+
+function error(id: number, message: string): void {
+  respond({ type: "error", id, message });
+}
+
+function rejectionError(id: number, rejection: ActionRejection): void {
+  respond({ type: "error", id, message: rejection.message, actionRejection: rejection });
+}
+
+function malformedOutcomeError(id: number): void {
+  respond({
+    type: "error",
+    id,
+    message: "The engine rejected that action.",
+    actionRejection: undefined,
+  });
+}
+
+/**
+ * Raise an initialize-envelope failure, preserving its typed discriminator so
+ * `EngineWorkerClient` can rebuild a typed `AdapterError` on the main thread
+ * rather than matching on the message text.
+ */
+function initFailureError(id: number, failure: InitFailure): void {
+  switch (failure.kind) {
+    case "bracketViolation":
+      respond({ type: "error", id, message: failure.message, bracketViolation: true });
+      break;
+    case "engineOccupied":
+      respond({ type: "error", id, message: failure.message, engineOccupied: true });
+      break;
+    case "deckValidation":
+      error(id, failure.message);
+      break;
+  }
+}
+
+// ── Message Handler ──────────────────────────────────────────────────────
+
+self.onmessage = async (e: MessageEvent<EngineRequest>) => {
+  const msg = e.data;
+
+  try {
+    switch (msg.type) {
+      case "init": {
+        if (__ENGINE_WASM_URL__) {
+          await init({ module_or_path: __ENGINE_WASM_URL__ });
+        } else {
+          await init();
+        }
+        wasmInitialized = true;
+        result(msg.id, null);
+        break;
+      }
+
+      case "loadCardDb": {
+        const count = load_card_database(msg.cardDataText);
+        cardDbLoaded = true;
+        result(msg.id, count);
+        break;
+      }
+
+      case "loadCardDbFromUrl": {
+        const resp = await fetch(__CARD_DATA_URL__);
+        if (!resp.ok)
+          throw new Error(
+            `Failed to load card-data.json (${resp.status})`,
+          );
+        const text = await resp.text();
+        const count = load_card_database(text);
+        if (count <= 0) throw new Error("Failed to load card-data.json (no cards loaded)");
+        cardDbLoaded = true;
+        result(msg.id, count);
+        break;
+      }
+
+      case "buildAiCardSubset": {
+        if (!cardDbLoaded) {
+          error(msg.id, "Card database not loaded. Call loadCardDb or loadCardDbFromUrl first.");
+          break;
+        }
+        result(msg.id, build_ai_card_subset());
+        break;
+      }
+
+      case "evaluateDeckCompatibility": {
+        if (!cardDbLoaded) {
+          error(
+            msg.id,
+            "Card database not loaded. Call loadCardDb or loadCardDbFromUrl first.",
+          );
+          break;
+        }
+        const data = evaluate_deck_compatibility_js(msg.request);
+        result(msg.id, data);
+        break;
+      }
+
+      // The ENFORCING sibling of `evaluateDeckCompatibility`: always returns a
+      // definite `{ compatible, reasons }`, never a tri-state. Used by the P2P
+      // host's per-guest deck-kick gate, which must not inherit the UI-hint
+      // path's "no opinion" answer for Custom formats.
+      case "evaluateDeckFormatGate": {
+        if (!cardDbLoaded) {
+          error(
+            msg.id,
+            "Card database not loaded. Call loadCardDb or loadCardDbFromUrl first.",
+          );
+          break;
+        }
+        result(msg.id, evaluateDeckFormatGate(msg.request));
+        break;
+      }
+
+      // Resource bounds on one guest deck's printings sidecar, for the P2P host's
+      // admission. The engine throws its reason on abuse; the outer try/catch
+      // returns that throw as an `error` response. Reads no card database, so it
+      // does not gate on one.
+      case "checkDeckPrintingsBounds": {
+        checkDeckPrintingsBounds(msg.printings);
+        result(msg.id, null);
+        break;
+      }
+
+      // Custom-format save/select. Neither call touches the card database —
+      // they are pure format-schema conversions — so neither gates on it.
+      case "customFormatFromLobbyConfig": {
+        result(msg.id, customFormatFromLobbyConfig(msg.name, msg.formatConfig));
+        break;
+      }
+
+      case "formatConfigForCustomRules": {
+        result(msg.id, formatConfigForCustomRules(msg.customRules));
+        break;
+      }
+
+      case "getCardFaceData": {
+        result(msg.id, get_card_face_data(msg.cardName));
+        break;
+      }
+
+      case "getCardParseDetails": {
+        result(msg.id, get_card_parse_details(msg.cardName));
+        break;
+      }
+
+      case "getCardRulings": {
+        result(msg.id, get_card_rulings(msg.cardName));
+        break;
+      }
+
+      case "canonicalCardNames": {
+        result(msg.id, canonicalCardNames(msg.names));
+        break;
+      }
+
+      case "query": {
+        if (ENGINE_QUERIES[msg.name].needsCardDb && !cardDbLoaded) {
+          error(msg.id, "Card database not loaded. Call loadCardDb or loadCardDbFromUrl first.");
+          break;
+        }
+        // The client types `args` against `name`; the worker boundary carries them untyped.
+        result(msg.id, runEngineQuery(engineWasm, msg.name, msg.args as never));
+        break;
+      }
+
+      case "initializeGame": {
+        if (!cardDbLoaded && msg.deckData) {
+          error(
+            msg.id,
+            "Card database not loaded. Call loadCardDb or loadCardDbFromUrl first.",
+          );
+          break;
+        }
+        // The engine's deck-resolve path reads this table to carry combo floors into each seat's estimated tier.
+        await ensureComboTable();
+        // The draft session's minimum selects the distinct draft-match
+        // initializer; the generic one takes no minimum at all.
+        const gameResult = msg.draftSessionMinDeckSize === undefined
+          ? initialize_game(
+            msg.deckData ?? null,
+            msg.seed,
+            msg.formatConfig ?? null,
+            msg.matchConfig ?? null,
+            msg.playerCount ?? undefined,
+            msg.firstPlayer ?? undefined,
+          )
+          : initialize_draft_match_game(
+            msg.deckData ?? null,
+            msg.seed,
+            msg.formatConfig ?? null,
+            msg.matchConfig ?? null,
+            msg.playerCount ?? undefined,
+            msg.firstPlayer ?? undefined,
+            msg.draftSessionMinDeckSize,
+          );
+        const failure = classifyInitFailure(gameResult);
+        if (failure) {
+          initFailureError(msg.id, failure);
+          break;
+        }
+        result(msg.id, {
+          events: gameResult.events ?? [],
+          log_entries: gameResult.log_entries ?? [],
+        });
+        break;
+      }
+
+      case "initializeMultiplayerHostGame": {
+        if (!cardDbLoaded && msg.deckData) {
+          error(
+            msg.id,
+            "Card database not loaded. Call loadCardDb or loadCardDbFromUrl first.",
+          );
+          break;
+        }
+        // The engine's deck-resolve path reads this table to carry combo floors into each seat's estimated tier.
+        await ensureComboTable();
+        // The host entry point refuses an engine that already holds a game and
+        // claims the multiplayer flag alongside the install — both inside this
+        // one synchronous handler, so no other posted message can interleave.
+        // The draft session's minimum selects the distinct draft-match
+        // initializer; the generic one takes no minimum at all.
+        const gameResult = msg.draftSessionMinDeckSize === undefined
+          ? initialize_multiplayer_host_game(
+            msg.deckData ?? null,
+            msg.seed,
+            msg.formatConfig ?? null,
+            msg.matchConfig ?? null,
+            msg.playerCount ?? undefined,
+            msg.firstPlayer ?? undefined,
+          )
+          : initialize_draft_match_host_game(
+            msg.deckData ?? null,
+            msg.seed,
+            msg.formatConfig ?? null,
+            msg.matchConfig ?? null,
+            msg.playerCount ?? undefined,
+            msg.firstPlayer ?? undefined,
+            msg.draftSessionMinDeckSize,
+          );
+        const failure = classifyInitFailure(gameResult);
+        if (failure) {
+          initFailureError(msg.id, failure);
+          break;
+        }
+        result(msg.id, {
+          events: gameResult.events ?? [],
+          log_entries: gameResult.log_entries ?? [],
+        });
+        break;
+      }
+
+      case "submitAction": {
+        const outcome = submit_action(msg.actor, msg.action);
+        if (typeof outcome === "string") {
+          // Rust's submit_action error contract: returns the error string
+          // on failure. `NOT_INITIALIZED:` prefix signals state-loss —
+          // forward verbatim so the adapter can classify it as STATE_LOST.
+          error(msg.id, outcome);
+          break;
+        }
+        if (!isActionOutcome(outcome)) {
+          malformedOutcomeError(msg.id);
+          break;
+        }
+        if (outcome.status === "rejected") {
+          rejectionError(msg.id, outcome.rejection);
+          break;
+        }
+        result(msg.id, appliedSubmitResult(outcome));
+        break;
+      }
+
+      case "driveContest": {
+        const outcome = drive_contest_js(
+          msg.nowMs,
+          Uint8Array.from(msg.aiPlayers),
+          Uint8Array.from(msg.awayPlayers),
+          msg.clicks,
+        );
+        if (typeof outcome === "string") {
+          error(msg.id, outcome);
+          break;
+        }
+        result(msg.id, outcome);
+        break;
+      }
+
+      case "requestTakeback": {
+        result(msg.id, request_takeback_js(msg.actor, Uint8Array.from(msg.aiPlayers)));
+        break;
+      }
+
+      case "respondTakeback": {
+        result(
+          msg.id,
+          respond_takeback_js(msg.actor, msg.approve, Uint8Array.from(msg.aiPlayers)),
+        );
+        break;
+      }
+
+      case "cancelTakeback": {
+        result(msg.id, cancel_takeback_js(msg.actor));
+        break;
+      }
+
+      case "pendingTakeback": {
+        result(msg.id, pending_takeback_js() ?? null);
+        break;
+      }
+
+      case "submitInteraction": {
+        const outcome = submit_interaction_js(msg.actor, msg.submission);
+        if (typeof outcome === "string") {
+          error(msg.id, outcome);
+          break;
+        }
+        if (!isActionOutcome(outcome)) {
+          malformedOutcomeError(msg.id);
+          break;
+        }
+        if (outcome.status === "rejected") {
+          rejectionError(msg.id, outcome.rejection);
+          break;
+        }
+        const actionResult = outcome.result as { events?: unknown[]; log_entries?: unknown[] };
+        result(msg.id, {
+          events: actionResult.events ?? [],
+          log_entries: actionResult.log_entries ?? [],
+        });
+        break;
+      }
+
+      case "previewManaPayment": {
+        const outcome = preview_mana_payment_js(msg.actor, msg.action);
+        if (typeof outcome === "string") {
+          error(msg.id, outcome);
+          break;
+        }
+        if (!isActionOutcome(outcome)) {
+          malformedOutcomeError(msg.id);
+          break;
+        }
+        if (outcome.status === "rejected") {
+          rejectionError(msg.id, outcome.rejection);
+          break;
+        }
+        result(msg.id, outcome.result);
+        break;
+      }
+
+      case "previewInteraction": {
+        const outcome = preview_interaction_js(msg.actor, msg.request);
+        if (typeof outcome === "string") {
+          error(msg.id, outcome);
+          break;
+        }
+        if (!isActionOutcome(outcome)) {
+          malformedOutcomeError(msg.id);
+          break;
+        }
+        if (outcome.status === "rejected") {
+          rejectionError(msg.id, outcome.rejection);
+          break;
+        }
+        result(msg.id, outcome.result);
+        break;
+      }
+
+      case "getState": {
+        const state = get_game_state();
+        // null means the WASM thread-local `GAME_STATE` is None. Previously
+        // we substituted a fresh default state here, which would poison
+        // IndexedDB via the dispatch.ts saveGame call. Surface as a real
+        // error so the adapter classifies it STATE_LOST and the recovery
+        // layer can rehydrate from the last-known-good state.
+        if (state === null) {
+          error(msg.id, "NOT_INITIALIZED: get_game_state returned null");
+          break;
+        }
+        result(msg.id, state);
+        break;
+      }
+
+      case "getFilteredState": {
+        const state = get_filtered_game_state(msg.viewerId);
+        if (state === null) {
+          error(msg.id, "NOT_INITIALIZED: get_filtered_game_state returned null");
+          break;
+        }
+        result(msg.id, state);
+        break;
+      }
+
+      case "setDebugHandReveal": {
+        set_debug_hand_reveal(msg.enabled);
+        result(msg.id, null);
+        break;
+      }
+
+      case "getLegalActions": {
+        const r = get_legal_actions_for_viewer_js(msg.viewerId);
+        if (r === null) {
+          error(msg.id, "NOT_INITIALIZED: get_legal_actions_for_viewer_js returned null");
+          break;
+        }
+        result(msg.id, r);
+        break;
+      }
+
+      case "getSnapshot": {
+        // Atomicity guarantee: these two reads form ONE synchronous block with
+        // no yield point between them, and the only engine mutation
+        // (`submit_action`) is itself a single synchronous call. This handler
+        // is `async` and handlers CAN interleave at await points (e.g.
+        // submitAction's Debug/CreateCard card-DB fetch), so the absence of an
+        // `await` between the two calls below is exactly what makes the pair
+        // atomic: a snapshot can never observe a half-applied action, nor
+        // straddle two engine versions.
+        const state = get_game_state();
+        const legalResult = get_legal_actions_for_viewer_js(msg.viewerId);
+        if (state === null || legalResult === null) {
+          error(msg.id, "NOT_INITIALIZED: get_game_state/get_legal_actions_for_viewer_js returned null");
+          break;
+        }
+        result(msg.id, { state, legalResult });
+        break;
+      }
+
+      case "getLegalActionsForViewer": {
+        const r = get_legal_actions_for_viewer_js(msg.viewerId);
+        if (r === null) {
+          error(msg.id, "NOT_INITIALIZED: get_legal_actions_for_viewer_js returned null");
+          break;
+        }
+        result(msg.id, r);
+        break;
+      }
+
+      case "getViewerSnapshot": {
+        const r = get_viewer_snapshot_js(msg.viewerId);
+        if (r === null) {
+          error(msg.id, "NOT_INITIALIZED: get_viewer_snapshot_js returned null");
+          break;
+        }
+        result(msg.id, r);
+        break;
+      }
+
+      case "getViewerTransitionSnapshot": {
+        const r = get_viewer_transition_snapshot_js(msg.viewerId, msg.events);
+        if (typeof r === "string") {
+          error(msg.id, r);
+          break;
+        }
+        if (r === null) {
+          error(msg.id, "NOT_INITIALIZED: get_viewer_transition_snapshot_js returned null");
+          break;
+        }
+        result(msg.id, r);
+        break;
+      }
+
+      case "getAiActionProposal": {
+        const proposal = get_ai_action_proposal(msg.difficulty, msg.playerId);
+        result(msg.id, proposal ?? null);
+        break;
+      }
+
+      case "getAiActionProposalWithDiagnostics": {
+        result(msg.id, get_ai_action_proposal_with_diagnostics(msg.difficulty, msg.playerId) ?? null);
+        break;
+      }
+
+      case "getAiTacticalActionProposal": {
+        result(msg.id, get_ai_tactical_action_proposal(msg.difficulty, msg.playerId) ?? null);
+        break;
+      }
+
+      case "getAiTacticalActionProposalWithDiagnostics": {
+        result(msg.id, get_ai_tactical_action_proposal_with_diagnostics(msg.difficulty, msg.playerId) ?? null);
+        break;
+      }
+
+      case "getAiScoredCandidates": {
+        result(msg.id, get_ai_scored_candidates(msg.difficulty, msg.playerId, BigInt(msg.seed)) ?? []);
+        break;
+      }
+
+      case "getAiActionProposalFromScores": {
+        result(
+          msg.id,
+          get_ai_action_proposal_from_scores(
+            msg.scoresJson,
+            msg.difficulty,
+            msg.playerId,
+            BigInt(msg.seed),
+          ) ?? null,
+        );
+        break;
+      }
+
+      case "getAiActionProposalFromScoresWithDiagnostics": {
+        result(msg.id, get_ai_action_proposal_from_scores_with_diagnostics(msg.scoresJson, msg.difficulty, msg.playerId, BigInt(msg.seed)) ?? null);
+        break;
+      }
+
+      case "buildLlmDecisionRequest": {
+        result(
+          msg.id,
+          buildLlmDecisionRequest(
+            msg.difficulty,
+            msg.playerId,
+            msg.endpointJson,
+            msg.historyJson,
+            msg.settingsRevision,
+            msg.clock.wallMs,
+            msg.clock.monotonicMs,
+          ) ?? null,
+        );
+        break;
+      }
+
+      case "getAiActionProposalFromLlmResponse": {
+        result(
+          msg.id,
+          getAiActionProposalFromLlmResponse(
+            msg.playerId,
+            msg.fingerprint,
+            msg.threadTurn,
+            msg.provider,
+            msg.status,
+            msg.responseBody,
+            msg.clock.wallMs,
+            msg.clock.monotonicMs,
+          ) ?? null,
+        );
+        break;
+      }
+
+      case "llmProviderCatalog": {
+        result(msg.id, llmProviderCatalog());
+        break;
+      }
+
+      case "submitAiActionProposal": {
+        const outcome = submit_ai_action_proposal(
+          msg.proposal.token,
+          msg.proposal.actor,
+          msg.proposal.action,
+        );
+        result(msg.id, outcome);
+        break;
+      }
+
+      case "restoreState": {
+        restore_game_state(msg.stateJson);
+        result(msg.id, null);
+        break;
+      }
+
+      case "resumeRestoredGameState": {
+        const presentation = resume_restored_game_state();
+        result(msg.id, {
+          presentation,
+          snapshot: {
+            state: get_game_state(),
+            legalResult: get_legal_actions_for_viewer_js(msg.viewerId),
+          },
+        });
+        break;
+      }
+
+      case "resumeMultiplayerHostState": {
+        const presentation = resume_multiplayer_host_state(msg.stateJson);
+        result(msg.id, {
+          presentation,
+          snapshot: {
+            state: get_game_state(),
+            legalResult: get_legal_actions_for_viewer_js(msg.viewerId),
+          },
+        });
+        break;
+      }
+
+      case "exportState": {
+        const json = export_game_state_json();
+        result(msg.id, json);
+        break;
+      }
+
+      case "resetGame": {
+        clear_game_state();
+        result(msg.id, null);
+        break;
+      }
+
+      case "setMultiplayerMode": {
+        set_multiplayer_mode(msg.enabled);
+        result(msg.id, null);
+        break;
+      }
+
+      case "ping": {
+        result(msg.id, ping());
+        break;
+      }
+
+      // ── Negotiated state-codec sessions ──────────────────────────────
+      // Decoder sessions are transport plumbing: they read frames and retain
+      // their own baselines. They never load card data, touch GAME_STATE, or
+      // expose game state on the main thread.
+
+      case "openStateCodec": {
+        if (!wasmInitialized) {
+          error(msg.id, "Engine is not initialized.");
+          break;
+        }
+        stateCodecRuntime ??= new StateCodecRuntime(engineWasm);
+        result(msg.id, stateCodecRuntime.open());
+        break;
+      }
+
+      case "decodeStateCodec": {
+        const runtime = stateCodecRuntime;
+        if (!runtime) {
+          error(msg.id, "State codec session was never opened.");
+          break;
+        }
+        result(msg.id, runtime.decode(msg.sessionId, msg.frame));
+        break;
+      }
+
+      case "closeStateCodec": {
+        stateCodecRuntime?.close(msg.sessionId);
+        result(msg.id, null);
+        break;
+      }
+
+      case "takeLastPanic": {
+        // Pulls + clears the panic captured by the Rust panic hook in
+        // engine-wasm/src/lib.rs. Called by the adapter after a STATE_LOST
+        // sentinel so we can distinguish a transient state-loss (no panic)
+        // from a real engine crash (panic captured) — the latter must NOT
+        // be retried because the same input will re-panic.
+        result(msg.id, take_last_panic_message() ?? null);
+        break;
+      }
+
+      case "applySeatMutation": {
+        const delta = apply_seat_mutation(msg.stateJson, msg.mutationJson);
+        result(msg.id, delta ?? null);
+        break;
+      }
+
+      case "projectSeatView": {
+        const view = project_seat_view(msg.stateJson);
+        result(msg.id, view ?? null);
+        break;
+      }
+
+      case "estimateBracketForDeck": {
+        // Pure, stateless — does not require an active game state. Returns
+        // null only when the deck has no commander; the caller has already
+        // ensured that the card database is loaded.
+        await ensureComboTable();
+        const estimate = estimate_bracket_for_deck(msg.request);
+        result(msg.id, estimate ?? null);
+        break;
+      }
+
+      case "deckSignalsForDeck": {
+        const signals = deck_signals_for_deck(msg.deck);
+        result(msg.id, signals ?? null);
+        break;
+      }
+
+      // ── Replay system ────────────────────────────────────────────────
+      // Recording lives alongside GAME_STATE in WASM (see initializeGame /
+      // submitAction above) — these calls just surface it. Playback
+      // (loadReplayForPlayback / replaySeek / replayLength / replayHeader /
+      // clearReplayPlayback) is independent of GAME_STATE entirely.
+
+      case "hasReplayRecording": {
+        result(msg.id, has_replay_recording());
+        break;
+      }
+
+      case "exportReplayLog": {
+        // export_replay_log / load_replay_for_playback return Result<T, JsValue>
+        // on the Rust side — wasm-bindgen throws on Err, which the outer
+        // try/catch around this switch already converts to an error response.
+        result(msg.id, export_replay_log());
+        break;
+      }
+
+      case "loadReplayForPlayback": {
+        // Replay reconstruction resolves the recorded decks again, so it must
+        // see the same combo floors as live-game initialization.
+        await ensureComboTable();
+        result(msg.id, load_replay_for_playback(msg.replayJson));
+        break;
+      }
+
+      case "replayLength": {
+        result(msg.id, replay_length_js());
+        break;
+      }
+
+      case "replayHeader": {
+        result(msg.id, replay_header_js() ?? null);
+        break;
+      }
+
+      case "replaySeek": {
+        // replay_seek_js returns Result<JsValue, JsValue> on the Rust side —
+        // `null` only for "no replay loaded"; a reconstruction desync throws,
+        // which the outer try/catch around this switch converts to an error
+        // response instead of silently returning null for both cases.
+        result(msg.id, replay_seek_js(msg.target));
+        break;
+      }
+
+      case "clearReplayPlayback": {
+        clear_replay_playback();
+        result(msg.id, null);
+        break;
+      }
+    }
+  } catch (err) {
+    error(msg.id, err instanceof Error ? err.message : String(err));
+  }
+};

@@ -1,0 +1,328 @@
+use crate::game::quantity::resolve_quantity;
+use crate::types::ability::{
+    Effect, EffectError, EffectKind, ResolvedAbility, SkipScope, StepSkipTarget,
+};
+use crate::types::events::GameEvent;
+use crate::types::game_state::{GameState, PendingCombatPhaseSkip};
+
+/// CR 614.10a: "Skip your next N [step] steps." — increments the per-player
+/// step-skip counter for the named step. The turn system consumes the counter
+/// only when that step would otherwise occur. "Skips their next combat phase"
+/// arms one phase-level skip per occurrence instead.
+pub fn resolve(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    let Effect::SkipNextStep {
+        target,
+        step,
+        count,
+        scope,
+    } = &ability.effect
+    else {
+        return Err(EffectError::MissingParam(
+            "expected SkipNextStep effect".into(),
+        ));
+    };
+
+    let Some(player) = super::resolve_player_for_context_ref(state, ability, target) else {
+        return Ok(());
+    };
+
+    let idx = player.0 as usize;
+    match scope {
+        // CR 614.10 + CR 614.10a: turn-scoped skip (False Peace / Empty City
+        // Ruse). Each resolution arms one independent skip, so increment the
+        // per-player `pending` count rather than overwriting — two skips aimed
+        // at the same player before their next turn must skip combat on their
+        // next *two* non-skipped turns. It ignores `count` (turn-binding subsumes
+        // counting) and does NOT touch `steps_to_skip`. Each pending skip waits
+        // past skipped turns and binds to a non-skipped turn in `start_next_turn`.
+        SkipScope::AllOfNextTurn => {
+            if idx >= state.combat_phase_skip_next_turn.len() {
+                state
+                    .combat_phase_skip_next_turn
+                    .resize_with(idx + 1, Default::default);
+            }
+            state.combat_phase_skip_next_turn[idx].pending += 1;
+        }
+        SkipScope::NextOccurrence => {
+            let n =
+                resolve_quantity(state, count, ability.controller, ability.source_id).max(0) as u32;
+            if n > 0 {
+                match step {
+                    // CR 614.10a: occurrence-scoped skip — increment the per-player
+                    // step counter; the turn system consumes it when the step would
+                    // occur.
+                    StepSkipTarget::Step(step) => {
+                        if idx >= state.steps_to_skip.len() {
+                            state.steps_to_skip.resize_with(idx + 1, Default::default);
+                        }
+                        *state.steps_to_skip[idx].entry(*step).or_default() += n;
+                    }
+                    // CR 500.11 + CR 614.10: a whole phase is skipped as one unit,
+                    // so it is pending at phase level, keeping the effect's duration
+                    // (CR 514.2: Moment of Silence's "this turn").
+                    StepSkipTarget::CombatPhase => {
+                        state.pending_combat_phase_skips.extend((0..n).map(|_| {
+                            PendingCombatPhaseSkip {
+                                player,
+                                duration: ability.duration.clone(),
+                            }
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    events.push(GameEvent::EffectResolved {
+        kind: EffectKind::SkipNextStep,
+        source_id: ability.source_id,
+        subject: None,
+    });
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ability::{AbilityKind, Duration, QuantityExpr, SpellContext, TargetFilter};
+    use crate::types::game_state::CombatPhaseSkipState;
+    use crate::types::identifiers::ObjectId;
+    use crate::types::phase::Phase;
+    use crate::types::player::PlayerId;
+
+    fn make_ability(step: StepSkipTarget, count: QuantityExpr) -> ResolvedAbility {
+        make_ability_scoped(step, count, SkipScope::NextOccurrence)
+    }
+
+    fn make_ability_scoped(
+        step: StepSkipTarget,
+        count: QuantityExpr,
+        scope: SkipScope,
+    ) -> ResolvedAbility {
+        ResolvedAbility {
+            coin_branches: None,
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
+            detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
+            effect: Effect::SkipNextStep {
+                target: TargetFilter::Controller,
+                step,
+                count,
+                scope,
+            },
+            controller: PlayerId(0),
+            original_controller: None,
+            scoped_player: None,
+            target_chooser: None,
+            source_id: ObjectId(1),
+            cast_occurrence: None,
+            source_incarnation: None,
+            announced_source_incarnation: None,
+            trigger_source: None,
+            trigger_definition_ref: None,
+            delayed_origin: None,
+            force_block_attacker: None,
+            target_incarnations: Vec::new(),
+            target_pins: Vec::new(),
+            legacy_selected_target_incarnations: Vec::new(),
+            chosen_target_slots: Default::default(),
+            illegal_target_slots: Vec::new(),
+            unjudged_target_slots: Vec::new(),
+            illegal_local_target_slots: Vec::new(),
+            declared_player_target_slots: Vec::new(),
+            targets: vec![],
+            kind: AbilityKind::Spell,
+            sub_ability: None,
+            else_ability: None,
+            duration: None,
+            condition: None,
+            context: SpellContext::default(),
+            optional_targeting: false,
+            optional: false,
+            optional_player: None,
+            optional_for: None,
+            multi_target: None,
+            target_constraints: Vec::new(),
+            target_choice_timing: crate::types::ability::TargetChoiceTiming::Stack,
+            description: None,
+            selected_mode_labels: Vec::new(),
+            modal_instruction_ordinal: None,
+            player_scope: None,
+            starting_with: None,
+            chosen_x: None,
+            cost_paid_object: None,
+            noted_mana_payment: None,
+            cost_paid_objects: Vec::new(),
+            effect_context_object: None,
+            amassed_army_object: None,
+            ability_index: None,
+            may_trigger_origin: None,
+            repeat_for: None,
+            min_x_value: 0,
+            announced_x: None,
+            cant_be_copied: false,
+            illegal_targets_disposition: Default::default(),
+            copy_count_status: crate::types::ability::CopyCountStatus::Pending,
+            forward_result: false,
+            unless_pay: None,
+            distribution: None,
+            distribute: None,
+            target_selection_mode: crate::types::ability::TargetSelectionMode::Chosen,
+            chosen_players: Vec::new(),
+            repeat_until: None,
+            replacement_applied: Default::default(),
+            sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
+            target_reads: Default::default(),
+            entry_onset: crate::types::ability::ContinuousEffectOnset::WhenFollowed,
+            sibling_condition: crate::types::ability::SiblingCondition::Dependent,
+            instruction_join: crate::types::ability::InstructionJoin::Own,
+            modal: None,
+            mode_abilities: vec![],
+            parent_target_missing_reason: None,
+            activation_cost_reduction: None,
+            activation_record: None,
+            announced_usage_key: None,
+            control_change_instruction: None,
+        }
+    }
+
+    #[test]
+    fn skip_next_step_increments_step_counter() {
+        let mut state = GameState::default();
+        let mut events = Vec::new();
+        let ability = make_ability(
+            StepSkipTarget::Step(Phase::Untap),
+            QuantityExpr::Fixed { value: 1 },
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.steps_to_skip[0].get(&Phase::Untap), Some(&1));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            GameEvent::EffectResolved {
+                kind: EffectKind::SkipNextStep,
+                ..
+            }
+        )));
+    }
+
+    /// CR 500.11 + CR 614.10: a whole combat phase is pending as one phase-level
+    /// skip, never as step counters a combat in progress could use up.
+    #[test]
+    fn skip_combat_phase_arms_one_phase_level_skip_per_occurrence() {
+        let mut state = GameState::default();
+        let mut events = Vec::new();
+        let ability = make_ability(
+            StepSkipTarget::CombatPhase,
+            QuantityExpr::Fixed { value: 2 },
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let unlimited = PendingCombatPhaseSkip {
+            player: PlayerId(0),
+            duration: None,
+        };
+        assert_eq!(
+            state.pending_combat_phase_skips,
+            vec![unlimited.clone(), unlimited]
+        );
+        assert!(
+            state.steps_to_skip.iter().all(|skips| skips.is_empty()),
+            "a phase skip must not write step counters"
+        );
+    }
+
+    /// CR 514.2: the skip keeps the effect's duration so cleanup can end it.
+    #[test]
+    fn skip_combat_phase_carries_the_effect_duration() {
+        let mut state = GameState::default();
+        let mut events = Vec::new();
+        let mut ability = make_ability(
+            StepSkipTarget::CombatPhase,
+            QuantityExpr::Fixed { value: 1 },
+        );
+        ability.duration = Some(Duration::UntilEndOfTurn);
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.pending_combat_phase_skips,
+            vec![PendingCombatPhaseSkip {
+                player: PlayerId(0),
+                duration: Some(Duration::UntilEndOfTurn),
+            }]
+        );
+    }
+
+    /// CR 614.10 + CR 614.10a: an `AllOfNextTurn` combat skip arms one pending
+    /// turn-scoped skip (no turn bound yet) and must NOT write the per-step
+    /// `steps_to_skip` counter (turn-binding subsumes counting).
+    #[test]
+    fn all_of_next_turn_arms_pending_and_leaves_steps_empty() {
+        let mut state = GameState::default();
+        let mut events = Vec::new();
+        let ability = make_ability_scoped(
+            StepSkipTarget::CombatPhase,
+            QuantityExpr::Fixed { value: 1 },
+            SkipScope::AllOfNextTurn,
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.combat_phase_skip_next_turn[0],
+            CombatPhaseSkipState {
+                pending: 1,
+                active: false
+            },
+            "AllOfNextTurn must arm exactly one pending skip and bind no turn yet"
+        );
+        // steps_to_skip must stay empty — turn-scope does not use the counter.
+        assert!(
+            state.steps_to_skip.is_empty() || state.steps_to_skip[0].is_empty(),
+            "AllOfNextTurn must not write steps_to_skip"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            GameEvent::EffectResolved {
+                kind: EffectKind::SkipNextStep,
+                ..
+            }
+        )));
+    }
+
+    /// CR 614.10a: two `AllOfNextTurn` skips aimed at the same player before
+    /// their next turn are independent — they accumulate to `pending: 2` rather
+    /// than collapsing to one (each will bind to a separate non-skipped turn).
+    #[test]
+    fn stacked_all_of_next_turn_skips_accumulate_pending() {
+        let mut state = GameState::default();
+        let mut events = Vec::new();
+        let ability = make_ability_scoped(
+            StepSkipTarget::CombatPhase,
+            QuantityExpr::Fixed { value: 1 },
+            SkipScope::AllOfNextTurn,
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.combat_phase_skip_next_turn[0],
+            CombatPhaseSkipState {
+                pending: 2,
+                active: false
+            },
+            "two stacked turn-scoped skips must accumulate, not overwrite"
+        );
+    }
+}

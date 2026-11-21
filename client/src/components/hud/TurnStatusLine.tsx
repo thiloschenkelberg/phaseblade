@@ -1,0 +1,218 @@
+import type { ReactNode } from "react";
+import { Trans, useTranslation } from "react-i18next";
+
+import type { WaitingReasonId } from "../../game/waitingForRegistry.ts";
+import { usePriorityAttentionClass } from "../../hooks/usePriorityAttention.ts";
+import { useSeatColor } from "../../hooks/useSeatColor.ts";
+import { useTurnStatus } from "../../hooks/useTurnStatus.ts";
+import { getOpponentDisplayName } from "../../stores/multiplayerStore.ts";
+import { usePreferencesStore } from "../../stores/preferencesStore.ts";
+import { GameplayTooltip } from "../ui/GameplayTooltip.tsx";
+
+/**
+ * Persistent one-line "who has priority / why" narration. Fills the gap where
+ * the action rail goes quiet because the local player is waiting on someone
+ * else — the engine knows exactly who and why; this just renders it.
+ *
+ * Reads the single `useTurnStatus()` authority. Framing is driven by
+ * `canIActNow` (spectator- and turn-control-safe), never by a raw seat compare,
+ * so spectators and Mindslaver-controlled turns get correct copy. Rendered as
+ * an `aria-live` status region so the changing state is announced.
+ *
+ * `compact` (short landscape screens) shows only a colored dot and the name of
+ * whoever holds the decision, so the action rail fits beside the player HUD.
+ */
+export function TurnStatusLine({ compact = false }: { compact?: boolean } = {}) {
+  const { t } = useTranslation("game");
+  const { waitingSeatId, canIActNow, reason } = useTurnStatus();
+  // Hook must run unconditionally (before the early return). Resolves NEUTRAL
+  // for a null seat, which is never rendered thanks to the guard below.
+  const waitingSeatColor = useSeatColor(waitingSeatId);
+  const attentionClass = usePriorityAttentionClass(canIActNow);
+  const pulseBorder = usePreferencesStore((s) => s.priorityAlertVisual);
+
+  // Nothing pending to narrate (between turns, mid-animation, game over).
+  if (waitingSeatId == null) return null;
+
+  const reasonText = reason ? t(`status.reason.${reason.id}`, reason.params) : "";
+
+  // Your decision reads as a positive prompt and carries a border for the whole
+  // time the decision is yours, independent of the timed attention cue; the
+  // border pulses while the Glow preference is on and is static with it off or
+  // under reduced motion. Waiting on someone else reads as a muted, patient
+  // state. The controller's pending alert adds a CSS-only
+  // ring/glow, stronger after escalation, when visual alerts are enabled.
+  // Reduced motion keeps the ring static. Other seats retain their identity
+  // color in the name, inside <Trans> so localization can reorder the sentence.
+  const tone = canIActNow
+    ? "border-emerald-400/40 bg-emerald-950/70 text-emerald-50"
+    : "border-white/12 bg-slate-950/75 text-slate-200";
+  const turnBorderClass = canIActNow
+    ? `priority-turn-border${pulseBorder ? " priority-turn-border-pulse" : ""}`
+    : "";
+
+  // The pill carries WHO holds the pending decision; a small icon badge overlapping
+  // its corner carries WHAT that decision is (attack / block / target / pay / …),
+  // so the "who + what" reads at a glance without a long sentence. The badge
+  // supersedes the old leading dot — it owns the seat-color tint
+  // AND the reason glyph in one mark. The full sentence still lives in the
+  // hover/focus tooltip (reusing the pre-existing verbose `*Reason` strings — no new
+  // i18n keys), which only mounts when a reason exists. `group`/`relative` are
+  // required for GameplayTooltip's CSS `group-hover` + the badge's absolute anchor,
+  // so the pill can no longer be `pointer-events-none` — fine, it lives in the
+  // interactive action rail, not over the board.
+  const badgeTone = canIActNow
+    ? "border-emerald-300/50 bg-emerald-400 text-emerald-950"
+    : "border-white/20 bg-slate-900/95";
+
+  const statusSentence = canIActNow ? (
+    t("status.yourPriority")
+  ) : (
+    <Trans
+      t={t}
+      i18nKey="status.waitingFor"
+      values={{ player: getOpponentDisplayName(waitingSeatId) }}
+      components={{ player: <span style={{ color: waitingSeatColor }} /> }}
+    />
+  );
+
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className={`group relative flex max-w-[min(22rem,calc(100vw-1.25rem))] items-center rounded-[8px] border px-2.5 py-1 text-[11px] font-medium tracking-wide shadow-[0_8px_20px_rgba(15,23,42,0.38)] ${compact ? "gap-1" : ""} ${tone} ${turnBorderClass} ${attentionClass} [@media(max-height:500px)]:px-2 [@media(max-height:500px)]:py-0.5 [@media(max-height:500px)]:text-[10px]`}
+    >
+      {compact ? (
+        // The dot and the name replace the corner badge and the sentence on
+        // screen; the sentence stays as screen-reader text so the live region
+        // still announces the whole status.
+        <>
+          <span
+            aria-hidden
+            className={`h-1.5 w-1.5 shrink-0 rounded-full ${canIActNow ? "bg-emerald-400" : ""}`}
+            style={canIActNow ? undefined : { backgroundColor: waitingSeatColor }}
+          />
+          <span aria-hidden className="truncate">
+            {canIActNow ? t("player.you") : getOpponentDisplayName(waitingSeatId)}
+          </span>
+          <span className="sr-only">{statusSentence}</span>
+        </>
+      ) : (
+        <>
+          <span
+            aria-hidden
+            className={`pointer-events-none absolute -left-1 -top-1 z-10 flex h-4 w-4 items-center justify-center rounded-[5px] border shadow-[0_2px_6px_rgba(0,0,0,0.45)] ${badgeTone}`}
+            style={canIActNow ? undefined : { color: waitingSeatColor, borderColor: `${waitingSeatColor}99` }}
+          >
+            <ReasonIcon reasonId={reason?.id} />
+          </span>
+          <span className="truncate">{statusSentence}</span>
+        </>
+      )}
+      {reasonText && (
+        <GameplayTooltip className="w-56">
+          {canIActNow ? (
+            t("status.yourPriorityReason", { reason: reasonText })
+          ) : (
+            <Trans
+              t={t}
+              i18nKey="status.waitingForReason"
+              values={{ player: getOpponentDisplayName(waitingSeatId), reason: reasonText }}
+              components={{ player: <span style={{ color: waitingSeatColor }} /> }}
+            />
+          )}
+        </GameplayTooltip>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Glyphs for the overlap badge, keyed by the `status.reason.*` suffix. Each is a
+ * stroke-based 16-viewBox fragment (matching the app's inline-SVG convention) so
+ * it inherits the badge's `currentColor` tint. The map groups reasons that share
+ * a visual (all priority windows → hourglass; both trigger/stack decisions →
+ * layers); anything unmapped falls back to the hourglass, mirroring
+ * `waitingForReason`'s own graceful default so a new engine variant degrades to a
+ * generic "waiting" mark rather than a blank badge.
+ */
+const REASON_ICON_PATHS: Record<string, ReactNode> = {
+  // Sword — declaring attackers / combat priority.
+  declareAttackers: (
+    <>
+      <path d="M13.5 2.5 L6.5 9.5" />
+      <path d="M4 12 L7 9" />
+      <path d="M2.5 13.5 L4.2 11.8" />
+    </>
+  ),
+  // Shield — declaring blockers.
+  declareBlockers: <path d="M8 2 L13 4 V8 C13 11 8 14 8 14 C8 14 3 11 3 8 V4 Z" />,
+  // Flame — assigning combat damage.
+  assigningDamage: (
+    <path d="M8 2 C10 5 11 6.2 11 9 A3 3 0 0 1 5 9 C5 7.6 5.6 6.8 6.4 6 C6.6 7.4 7.4 7.6 8 6.8 C8.4 5.4 8 3.4 8 2 Z" />
+  ),
+  // Crosshair — choosing targets.
+  choosingTargets: (
+    <>
+      <circle cx="8" cy="8" r="4.5" />
+      <path d="M8 1 V3.5 M8 12.5 V15 M1 8 H3.5 M12.5 8 H15" />
+      <circle cx="8" cy="8" r="0.9" fill="currentColor" stroke="none" />
+    </>
+  ),
+  // Droplet — paying a cost.
+  payingCost: <path d="M8 2 C8 2 4 7 4 10 A4 4 0 0 0 12 10 C12 7 8 2 8 2 Z" />,
+  // Circular arrow — mulligan.
+  mulligan: (
+    <>
+      <path d="M12.5 6 A5 5 0 1 0 13 9.5" />
+      <path d="M12.5 2.5 V6 H9" />
+    </>
+  ),
+  // Card with a down arrow — discarding.
+  discarding: (
+    <>
+      <rect x="4.5" y="2.5" width="7" height="7.5" rx="1" />
+      <path d="M8 11.5 V14.5 M6.5 13 L8 14.5 L9.5 13" />
+    </>
+  ),
+  // Stacked layers — ordering triggers / responding to the stack.
+  orderingTriggers: (
+    <>
+      <path d="M8 2 L14 5 L8 8 L2 5 Z" />
+      <path d="M2 8 L8 11 L14 8" />
+      <path d="M2 11 L8 14 L14 11" />
+    </>
+  ),
+  // Hourglass — generic priority windows / thinking.
+  priority: (
+    <path d="M4 2 H12 M4 14 H12 M4.5 2 C4.5 5 8 7 8 8 C8 9 4.5 11 4.5 14 M11.5 2 C11.5 5 8 7 8 8 C8 9 11.5 11 11.5 14" />
+  ),
+};
+
+// Reasons that share a glyph with a canonical key above.
+REASON_ICON_PATHS.priorityCombat = REASON_ICON_PATHS.declareAttackers;
+REASON_ICON_PATHS.respondingToStack = REASON_ICON_PATHS.orderingTriggers;
+REASON_ICON_PATHS.priorityMain = REASON_ICON_PATHS.priority;
+REASON_ICON_PATHS.thinking = REASON_ICON_PATHS.priority;
+
+/** Reason glyph for the overlap badge. Looks up the shared path set by reason
+ *  id; unmapped or absent reasons fall back to the generic hourglass. Purely
+ *  decorative — the words live in the tooltip. */
+function ReasonIcon({ reasonId }: { reasonId?: WaitingReasonId }) {
+  const name = reasonId ?? "";
+  const glyph = REASON_ICON_PATHS[name] ?? REASON_ICON_PATHS.priority;
+  return (
+    <svg
+      aria-hidden
+      viewBox="0 0 16 16"
+      className="h-2.5 w-2.5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      {glyph}
+    </svg>
+  );
+}

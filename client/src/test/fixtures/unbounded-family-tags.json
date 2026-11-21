@@ -1,0 +1,20 @@
+{
+  "CardsDrawn": "cards",
+  "Casts": "casts",
+  "CombatPhases": "combats",
+  "Counter": "counters",
+  "DamageDealt": "damage",
+  "DeathTriggers": "triggers",
+  "Energy": "counters",
+  "EtbTriggers": "triggers",
+  "ExtraTurns": "turns",
+  "LandfallTriggers": "triggers",
+  "LibraryDelta": "mill",
+  "Life": "life",
+  "LtbTriggers": "triggers",
+  "Mana": "mana",
+  "Poison": "counters",
+  "SacTriggers": "triggers",
+  "TokensCreated": "tokens",
+  "Trigger": "triggers"
+}

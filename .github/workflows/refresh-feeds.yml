@@ -1,0 +1,66 @@
+name: Refresh Metagame Feeds
+
+on:
+  schedule:
+    # Run daily at 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh-feeds:
+    name: Scrape & Commit Feeds
+    # Forks inherit the schedule but not CI_PAT, so a fork run only fails and
+    # spams the owner. Keep the daily scrape on the canonical repository.
+    if: github.repository == 'phase-rs/phase'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-shared-key: rust-feed-scraper
+
+      - name: Build feed-scraper
+        run: cargo build --release -p feed-scraper
+
+      - name: Scrape MTGGoldfish metagame feeds
+        run: |
+          cargo run --release -p feed-scraper -- mtggoldfish \
+            --format standard,modern,pioneer,commander \
+            --output-dir client/public/feeds/ \
+            --top 10 \
+            --delay 1500
+
+      # Runs even when the MTGGoldfish scrape fails, so one source going down
+      # still refreshes the other. Either failure still fails the job.
+      - name: Fetch TopDeck.gg cEDH feed
+        if: ${{ !cancelled() }}
+        env:
+          TOPDECK_API_KEY: ${{ secrets.TOPDECK_API_KEY }}
+        run: |
+          cargo run --release -p feed-scraper -- topdeck \
+            --output client/public/feeds/topdeck-cedh.json
+
+      - name: Check for changes
+        if: ${{ !cancelled() }}
+        id: diff
+        run: |
+          git diff --quiet client/public/feeds/mtggoldfish-*.json client/public/feeds/topdeck-cedh.json && echo "changed=false" >> "$GITHUB_OUTPUT" || echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update feed refresh PR
+        if: ${{ !cancelled() && steps.diff.outputs.changed == 'true' }}
+        uses: ./.github/actions/create-auto-merge-pr
+        with:
+          token: ${{ secrets.CI_PAT }}
+          add-paths: |
+            client/public/feeds/mtggoldfish-*.json
+            client/public/feeds/topdeck-cedh.json
+          commit-message: "chore: refresh metagame feeds"
+          branch: chore/refresh-metagame-feeds
+          title: "chore: refresh metagame feeds"
+          body: "Automated daily metagame feed refresh from MTGGoldfish and TopDeck.gg."

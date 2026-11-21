@@ -1,0 +1,414 @@
+{
+  "search": {
+    "title": "Buscar",
+    "subtitle": "Añade cartas a la lista actual.",
+    "reset": "Restablecer",
+    "textPlaceholder": "Buscar cartas...",
+    "allTypes": "Todos los tipos",
+    "cardType": "Tipo de carta",
+    "browseFormatFilter": "Legal en formato",
+    "cmcMax": "CMC máx.:",
+    "sets": "Colecciones",
+    "addSetPlaceholder": "Añadir código de colección...",
+    "addSet": "Añadir",
+    "removeSet": "Quitar {{name}}",
+    "emptyHint": "Añade un filtro para empezar a explorar",
+    "searching": "Buscando...",
+    "searchFailed": "La búsqueda falló",
+    "results_one": "{{count}} resultado",
+    "results_other": "{{count}} resultados",
+    "browseFormat": {
+      "all": "Todas las cartas"
+    }
+  },
+  "filters": {
+    "title": "Filtros",
+    "close": "Cerrar filtros",
+    "done": "Listo",
+    "search": "Buscar"
+  },
+  "deck": {
+    "backToDeck": "Volver al mazo",
+    "listView": "Vista de lista",
+    "stackView": "Vista de pila",
+    "groupType": "Tipo",
+    "groupColor": "Color",
+    "groupByType": "Agrupar por tipo",
+    "groupByColor": "Agrupar por color"
+  },
+  "tabs": {
+    "ariaLabel": "Superficie del constructor de mazos",
+    "deck": "Mazo",
+    "info": "Info"
+  },
+  "toolbar": {
+    "menu": "Menú",
+    "deckBuilder": "Constructor de mazos",
+    "untitledDeck": "Mazo sin título",
+    "deckName": "Nombre del mazo",
+    "format": "Formato",
+    "bracket": "Nivel",
+    "saved": "Guardado ✓",
+    "clone": "Clonar",
+    "cloneTitle": "Guardar una copia con un nombre nuevo",
+    "loadDeck": "Cargar mazo...",
+    "nameToSave": "Pon un nombre al mazo para guardarlo",
+    "savedToastTitle": "Mazo guardado",
+    "savedToastDescription": "\"{{name}}\" se guardó en tus mazos.",
+    "clonedToastTitle": "Mazo clonado",
+    "clonedToastDescription": "Se guardó una copia como \"{{name}}\"."
+  },
+  "unsaved": {
+    "title": "Cambios sin guardar",
+    "dismiss": "Descartar diálogo",
+    "bodyLeaving": "Tienes cambios sin guardar en este mazo. ¿Guardarlos antes de salir?",
+    "bodyLoading": "Tienes cambios sin guardar en este mazo. ¿Guardarlos antes de cargar otro mazo?",
+    "discard": "Descartar",
+    "saveAndContinue": "Guardar y continuar"
+  },
+  "saveConflict": {
+    "title": "El mazo cambió en otro lugar",
+    "bodyChanged": "\"{{name}}\" cambió en otro lugar desde que este editor lo abrió o lo guardó por última vez, así que no se guardó nada. Carga la versión guardada para verla (se descartarán tus cambios sin guardar) o guarda tu versión de todos modos.",
+    "bodyDeleted": "\"{{name}}\" se eliminó en otro lugar desde que este editor lo abrió o lo guardó por última vez, así que no se guardó nada. Guarda tu versión de todos modos.",
+    "loadSaved": "Cargar versión guardada",
+    "saveMine": "Guardar mi versión"
+  },
+  "card": {
+    "moveToSideboard": "Mover un/a {{name}} al banquillo",
+    "moveToMain": "Mover un/a {{name}} al mazo principal",
+    "removeOne": "Quitar un/a {{name}}",
+    "addOne": "Añadir una {{name}}",
+    "copyLimit": "{{name}} está en el límite de copias",
+    "makeCommander": "Establecer a {{name}} como comandante",
+    "makeCommanderTitle": "Establecer esta carta como mi comandante",
+    "chooseArtFor": "Elegir ilustración para {{name}}",
+    "alternateArtTap": "Ilustración alternativa disponible — toca para elegir",
+    "alternateArtRightClick": "Ilustración alternativa disponible — haz clic derecho para elegir",
+    "unsupportedExpand_one": "{{count}} mecánica no compatible; expandir detalles",
+    "unsupportedExpand_other": "{{count}} mecánicas no compatibles; expandir detalles",
+    "unsupportedTitle_one": "{{count}} mecánica no compatible — haz clic para expandir",
+    "unsupportedTitle_other": "{{count}} mecánicas no compatibles — haz clic para expandir",
+    "moveToTarget": "Mover un/a {{name}} a {{target}}"
+  },
+  "grid": {
+    "allFormats": "Todos",
+    "addCard": "Añadir {{name}}",
+    "notLegal": "{{name}} - No es legal en {{format}}",
+    "notFormat": "No es {{format}}"
+  },
+  "deckList": {
+    "currentList": "Lista actual",
+    "import": "Importar",
+    "importTitle": "Importar mazo desde texto (formato MTGA o .dck)",
+    "export": "Exportar",
+    "exportTitle": "Exportar mazo",
+    "mainTab": "Principal ({{count}})",
+    "sideboardTab": "Banquillo ({{count}})",
+    "mainDeckHeading_one": "Mazo principal ({{count}} carta)",
+    "mainDeckHeading_other": "Mazo principal ({{count}} cartas)",
+    "sideboardUnlimited": "Banquillo ({{count}})",
+    "sideboardLimited": "Banquillo ({{count}}/{{max}})",
+    "sideboardExceeds": "El banquillo supera el límite de {{max}} cartas",
+    "sideboardEmptyHint": "Pasa el cursor sobre una carta del mazo principal y haz clic en → para moverla aquí.",
+    "group": {
+      "Creatures": "Criaturas",
+      "Planeswalkers": "Planeswalkers",
+      "Instants": "Instantáneos",
+      "Sorceries": "Conjuros",
+      "Artifacts": "Artefactos",
+      "Enchantments": "Encantamientos",
+      "Battles": "Batallas",
+      "Lands": "Tierras",
+      "Other": "Otros"
+    },
+    "colorGroup": {
+      "White": "Blanco",
+      "Blue": "Azul",
+      "Black": "Negro",
+      "Red": "Rojo",
+      "Green": "Verde",
+      "Multicolor": "Multicolor",
+      "Colorless": "Incoloro",
+      "Lands": "Tierras"
+    },
+    "importModalTitle": "Importar mazo",
+    "pastePlaceholder": "Pega la lista del mazo (formato MTGA o .dck)...",
+    "fromFile": "Desde archivo",
+    "parse": "Analizar",
+    "parsing": "Analizando…",
+    "parseError": "No se encontraron cartas. Pega un mazo en formato MTGA o .dck.",
+    "exportModalTitle": "Exportar mazo",
+    "saveToFile": "Guardar en archivo",
+    "copied": "¡Copiado!",
+    "copy": "Copiar",
+    "maybeboardTab": "A considerar ({{count}})",
+    "mainName": "Principal",
+    "sideboardName": "Banquillo",
+    "maybeboardName": "A considerar",
+    "maybeboard": "A considerar ({{count}})",
+    "maybeboardEmptyHint": "Cartas que estás valorando. Toca → A considerar en una carta del mazo para guardarla aquí.",
+    "commanderHeading": "Comandante",
+    "removeCommander": "Quitar a {{name}} como comandante"
+  },
+  "moveList": {
+    "empty": "Vacío"
+  },
+  "stack": {
+    "deckView": "Vista del mazo",
+    "visualDeckStack": "Pila visual del mazo",
+    "mainBadge": "Principal {{count}}",
+    "sideboardBadge": "Banquillo {{count}}",
+    "emptyHint": "Las cartas añadidas aparecerán aquí como una pila escalonada.",
+    "commanderBadge": "Comandante",
+    "commanderLane": "Comandante",
+    "mainDeckLane": "Mazo principal",
+    "noCommander": "Ningún comandante seleccionado.",
+    "mainEmpty": "Las cartas del mazo principal aparecerán aquí.",
+    "cardCount_one": "{{count}} carta",
+    "cardCount_other": "{{count}} cartas",
+    "mainSideBadge": "{{main}} principal + {{side}} banquillo",
+    "groupCards_one": "{{count}} carta",
+    "groupCards_other": "{{count}} cartas",
+    "group": {
+      "Creatures": "Criaturas",
+      "Planeswalkers": "Planeswalkers",
+      "Instants": "Instantáneos",
+      "Sorceries": "Conjuros",
+      "Artifacts": "Artefactos",
+      "Enchantments": "Encantamientos",
+      "Battles": "Batallas",
+      "Lands": "Tierras",
+      "Other": "Otros"
+    },
+    "colorGroup": {
+      "White": "Blanco",
+      "Blue": "Azul",
+      "Black": "Negro",
+      "Red": "Rojo",
+      "Green": "Verde",
+      "Multicolor": "Multicolor",
+      "Colorless": "Incoloro",
+      "Lands": "Tierras"
+    },
+    "sideboardGroup": "Banquillo",
+    "addOne": "Añadir una {{name}}",
+    "copyLimit": "{{name}} está en el límite de copias",
+    "removeOne": "Quitar un/a {{name}}",
+    "removeCommander": "Quitar a {{name}} como comandante",
+    "maybeboardBadge": "A considerar {{count}}",
+    "mainName": "Principal",
+    "sideboardName": "Banquillo",
+    "maybeboardName": "A considerar",
+    "mainMaybeBadge": "{{main}} principal + {{side}} maybe",
+    "maybeboardGroup": "A considerar"
+  },
+  "printingPicker": {
+    "title": "Elegir ilustración",
+    "noPrintings": "No hay impresiones alternativas disponibles para esta carta.",
+    "filterPlaceholder": "Filtrar por colección o número de coleccionista…",
+    "filterAriaLabel": "Filtrar impresiones",
+    "count_one": "{{count}} impresión",
+    "count_other": "{{count}} impresiones",
+    "countMatching_one": "{{count}} impresión que coincide con “{{query}}”",
+    "countMatching_other": "{{count}} impresiones que coinciden con “{{query}}”",
+    "useDefault": "Usar predeterminada",
+    "noMatches": "Ninguna impresión coincide con tu filtro.",
+    "noImage": "Sin imagen",
+    "showMore_one": "Mostrar más ({{count}} restante)",
+    "showMore_other": "Mostrar más ({{count}} restantes)"
+  },
+  "stats": {
+    "formatLegality": "Legalidad del formato",
+    "engineCoverage": "Cobertura del motor",
+    "unsupportedTitle": "No compatibles:\n{{list}}"
+  },
+  "commanderPanel": {
+    "heading": "Comandante",
+    "noCommander": "Ningún comandante seleccionado",
+    "remove": "Quitar",
+    "identity": "Identidad:",
+    "setAsCommander": "Establecer como comandante:",
+    "cardCount": "{{count}}/{{expected}} cartas",
+    "cardCountNoMinimum_one": "{{count}} carta",
+    "cardCountNoMinimum_few": "{{count}} cartas",
+    "cardCountNoMinimum_many": "{{count}} cartas",
+    "cardCountNoMinimum_other": "{{count}} cartas",
+    "singletonViolations": "Infracciones de singleton: {{cards}}",
+    "colorViolations": "Infracciones de identidad de color: {{cards}}",
+    "signatureSpell": {
+      "heading": "Hechizo de firma",
+      "noSignatureSpell": "No hay hechizo de firma seleccionado",
+      "setAsSignatureSpell": "Establecer como hechizo de firma:",
+      "remove": "Eliminar hechizo de firma",
+      "mustBeInstantOrSorcery": "El hechizo de firma debe ser un instantáneo o conjuro",
+      "outsideColorIdentity": "{{name}}: fuera de la identidad de color del Rompejuramentos"
+    },
+    "companion": {
+      "heading": "Compañero",
+      "noCompanion": "No se seleccionó compañero",
+      "remove": "Quitar compañero"
+    }
+  },
+  "manaCurve": {
+    "title": "Curva de maná",
+    "colors": "Colores"
+  },
+  "legality": {
+    "legal": "Legal",
+    "banned": "Prohibida",
+    "restricted": "Restringida",
+    "notLegal": "No legal"
+  },
+  "contextMenu": {
+    "chooseArt": "Elegir ilustración…",
+    "noAlternates": "Sin impresiones alternativas",
+    "clearOverride": "Borrar anulación de ilustración"
+  },
+  "bracket": {
+    "card": {
+      "estimatedLabel": "Bracket estimado",
+      "tierName": "B{{tier}} {{label}}",
+      "tierShort": "B{{tier}}",
+      "declaredNone": "Declarado: ninguno",
+      "declared": "Declarado: B{{tier}} {{label}}",
+      "youMarker": "Tú",
+      "belowFloor": "Declaraste B{{declared}}, pero este mazo no puede estar por debajo de B{{floor}}. La IA juega tu B{{declared}} declarado.",
+      "partialCoverage_one": "No se encontró {{count}} nombre de carta; los recuentos pueden ser bajos",
+      "partialCoverage_few": "No se encontraron {{count}} nombres de cartas; los recuentos pueden ser bajos",
+      "partialCoverage_many": "No se encontraron {{count}} nombres de cartas; los recuentos pueden ser bajos",
+      "partialCoverage_other": "No se encontraron {{count}} nombres de cartas; los recuentos pueden ser bajos",
+      "combosUnchecked": "Los combos de dos cartas no se comprobaron en esta compilación. Responde la pregunta de combos de arriba para incluirlos.",
+      "tabsLabel": "Detalles del bracket",
+      "tabWhy": "Por qué B{{tier}}",
+      "tabBringDown": "Bajarlo",
+      "commanderTag": "Comandante",
+      "listComma": ", ",
+      "listOr": " o ",
+      "why": {
+        "nothingRaises": "Nada en este mazo lo eleva por encima de B2, donde empieza toda estimación.",
+        "rulesOutB1": "Esto descarta declarar B1:"
+      },
+      "reason": {
+        "cardRule": "{{axis}}: {{count}}",
+        "comboStandalone": "Combo de dos cartas",
+        "comboEarly": "Combo temprano de dos cartas",
+        "ownerAnswer": "Tu respuesta sobre combos",
+        "ownerIntended": "Indicaste que este mazo tiene un combo de dos cartas intencionado.",
+        "ownerIntendedEarly": "Indicaste que este mazo tiene un combo de dos cartas temprano.",
+        "ownerIntendedLate": "Indicaste que este mazo tiene un combo de dos cartas que se arma tarde.",
+        "comboFromTable": "(combo)"
+      },
+      "combo": {
+        "assembles": "se arma por {{cost}} de maná"
+      },
+      "explain": {
+        "cardRule": "B{{tier}} permite hasta {{allowed}}; este mazo tiene {{observed}}.",
+        "cardRuleNone": "B{{tier}} no permite ninguna; este mazo tiene {{observed}}.",
+        "comboStandalone": "B1 y B2 no permiten combos infinitos de dos cartas intencionados.",
+        "comboEarly": "B3 solo permite combos de dos cartas si se arman tarde (más de {{ceiling}} de maná).",
+        "ownerAnswer": "phase no puede comprobar esta respuesta; usa lo que indicaste. Cámbiala en la pregunta de combos de arriba."
+      },
+      "source": "{{document}}, {{published}} ↗",
+      "ladder": {
+        "removeAll_one": "Quítala:",
+        "removeAll_few": "Quita las {{count}}:",
+        "removeAll_many": "Quita las {{count}}:",
+        "removeAll_other": "Quita las {{count}}:",
+        "removeSome_one": "Quita {{count}} de:",
+        "removeSome_few": "Quita {{count}} de:",
+        "removeSome_many": "Quita {{count}} de:",
+        "removeSome_other": "Quita {{count}} de:",
+        "breakCombo": "Rompe el combo",
+        "removeOneOf": "Quita una de:",
+        "removeThis": "Quita:",
+        "replaceCommander_one": "Para bajar más también hace falta otro comandante:",
+        "replaceCommander_few": "Para bajar más también hacen falta {{count}} comandantes distintos:",
+        "replaceCommander_many": "Para bajar más también hacen falta {{count}} comandantes distintos:",
+        "replaceCommander_other": "Para bajar más también hacen falta {{count}} comandantes distintos:",
+        "changeComboAnswer": "Cambia tu respuesta sobre combos en la pregunta de arriba.",
+        "footnote": "B2 es lo más bajo que llega la estimación; B1 depende de la temática del mazo."
+      }
+    },
+    "unavailable": "La estimación de nivel necesita datos de cartas que aún no se han cargado.",
+    "addCommander": "Añade un comandante para ver tu estimación de nivel.",
+    "axis": {
+      "gameChangers": "Game Changers",
+      "massLandDenial": "Negación masiva de tierras",
+      "extraTurns": "Turnos extra",
+      "efficientTutors": "Tutores eficientes"
+    },
+    "combo": {
+      "attribution": "Datos de combos: {{attribution}}, captura del {{date}}",
+      "outcome": {
+        "wins": "Gana la partida",
+        "unbounded": "{{resource}} sin límite"
+      },
+      "resource": {
+        "mana": "maná",
+        "damage": "daño",
+        "lifeLoss": "pérdida de vidas",
+        "lifegain": "ganancia de vidas",
+        "mill": "milleo",
+        "draw": "robo de cartas",
+        "tokens": "fichas",
+        "combat": "fases de combate",
+        "turns": "turnos"
+      }
+    },
+    "dataVersion": "Datos: {{version}}",
+    "aboutBrackets": "Acerca de los niveles ↗",
+    "estimatedChip": "Estimado: B{{tier}}",
+    "estimatedChipFull": "Nivel estimado: B{{tier}} {{label}}",
+    "manualChip": "B{{tier}}",
+    "manualChipFull": "Nivel declarado: B{{tier}} {{label}}"
+  },
+  "bracketPicker": {
+    "ariaLabel": "Nivel del mazo",
+    "unrated": "Sin clasificar"
+  },
+  "signals": {
+    "title": "Señales del mazo",
+    "disclaimer": "Estadísticas descriptivas del texto de carta analizado del mazo. No son criterios de nivel y nunca cambian la estimación.",
+    "avgManaValue": "Valor de maná promedio (no tierras): {{value}}",
+    "notMeasurable": "no medible",
+    "noCommander": "Añade un comandante para ver las señales del mazo.",
+    "unavailable": "Las señales del mazo necesitan datos de cartas, que aún no se han cargado.",
+    "unresolved": "No se encontraron {{n}} nombres de cartas en los datos de cartas.",
+    "kind": {
+      "counterspells": "Contrahechizos",
+      "spot_removal": "Remoción puntual",
+      "sweepers": "Limpiamesas",
+      "card_advantage": "Ventaja de cartas",
+      "free_interaction": "Interacción gratuita",
+      "mana_producers": "Productores de maná",
+      "land_fetch": "Búsqueda de tierras",
+      "rituals": "Rituales",
+      "extra_land_drops": "Tierras adicionales por turno"
+    }
+  },
+  "comboBarometer": {
+    "ariaLabel": "Combo infinito de dos cartas",
+    "question": "¿Combo infinito intencional de dos cartas?",
+    "undeclared": "Sin respuesta",
+    "noneIntended": "Ninguno intencional",
+    "intended": "Intencional",
+    "windowAriaLabel": "¿Cuándo puede montarse?",
+    "windowUnstated": "Sin especificar",
+    "windowEarly": "Juego temprano",
+    "windowLate": "Solo juego tardío"
+  },
+  "warnings": {
+    "commanderCount": "El mazo tiene {{count}} cartas (necesita exactamente {{expected}})",
+    "singleton": "{{name}}: copias múltiples (formato singleton)",
+    "colorIdentity": "{{name}}: fuera de la identidad de color del comandante",
+    "minimumCount": "El mazo tiene {{count}} cartas (mínimo 60)",
+    "maxCopies": "{{name}}: {{count}} copias (máx. 4)",
+    "companionInMain": "{{name}} es tu compañero pero también está en el mazo principal — esto infringe su condición de construcción de mazo. Quítalo del mazo principal para usarlo como compañero."
+  },
+  "switcher": {
+    "starred": "Destacados",
+    "unfiled": "Sin clasificar",
+    "searchPlaceholder": "Buscar mazos…",
+    "noMatches": "No hay mazos"
+  }
+}

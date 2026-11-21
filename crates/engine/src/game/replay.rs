@@ -1,0 +1,1320 @@
+//! Deterministic action-based replay reconstruction.
+//!
+//! A recorded game (`ReplayLog`) carries no per-turn state — only the inputs
+//! needed to reconstruct its starting state (`ReplayHeader`) and the ordered
+//! sequence of actions that were submitted and accepted. Because `apply` is a
+//! pure reducer over a `GameState` seeded from a fixed RNG seed, replaying the
+//! same actions against the same starting state reproduces the original game
+//! exactly. `ReplayPlayer` wraps that reconstruction with sparse checkpoint
+//! caching so scrubbing to an arbitrary point doesn't re-simulate the whole
+//! game from turn 1 every time.
+
+use std::collections::BTreeMap;
+
+use thiserror::Error;
+
+use crate::database::{CardDatabase, ComboTable};
+use crate::types::game_state::{GameState, WaitingFor};
+use crate::types::player::PlayerId;
+use crate::types::replay::{
+    RecordedAction, RecordedActionKind, ReplayHeader, ReplayLog,
+    COMBAT_DAMAGE_WINDOW_FORMAT_VERSION, REPLAY_FORMAT_VERSION,
+};
+
+use super::deck_loading::{load_and_hydrate_decks, resolve_deck_list};
+use super::engine::{
+    apply, apply_verified_ai_priority_pass, resolve_all_ready_access, resolve_all_ready_prefix,
+    start_game, start_game_winner_plays_first, start_game_with_starting_player,
+    ResolveAllReadyAccess,
+};
+
+/// Checkpoints are cached every `CHECKPOINT_INTERVAL` actions, bounding cache
+/// size to roughly `len / CHECKPOINT_INTERVAL` snapshots while keeping any
+/// `seek` to at most this many replayed actions from the nearest one.
+/// `GameState::clone()` is O(log n) (the `im`-backed structural-sharing
+/// containers documented in CLAUDE.md), so caching at this granularity is
+/// cheap relative to re-running `apply` from scratch.
+const CHECKPOINT_INTERVAL: u32 = 20;
+
+#[derive(Debug, Error)]
+pub enum ReplayError {
+    #[error("replay is missing its format version")]
+    MissingFormatVersion,
+    #[error(
+        "unsupported replay format version {version}; this engine supports versions 2 through {}",
+        REPLAY_FORMAT_VERSION
+    )]
+    UnsupportedFormatVersion { version: u32 },
+    /// An action that was recorded as having succeeded failed to re-apply
+    /// during reconstruction. This means the recording and the engine version
+    /// replaying it have diverged (e.g. an engine change altered behavior for
+    /// a state this recording depends on) — it is not a normal rules outcome.
+    #[error("replay action {index} desynced reconstruction: {message}")]
+    Desync { index: u32, message: String },
+    /// The header carries deck data (the recorded game was not started with
+    /// empty libraries) but no `CardDatabase` was supplied to resolve it.
+    /// Silently skipping deck hydration in this case would reconstruct a
+    /// *different* starting state (empty libraries) than the one the
+    /// original game actually had — a wrong-but-quiet result is worse than
+    /// failing loudly here.
+    #[error(
+        "replay requires a card database to resolve its recorded deck data, but none was loaded"
+    )]
+    MissingCardDatabase,
+}
+
+/// Reconstruct the state immediately after `start_game` (before any recorded
+/// action has been applied) from a `ReplayHeader` alone. Reuses the same
+/// canonical init sequence every transport (WASM, server-core) already
+/// shares — see `load_and_hydrate_decks` — so reconstruction can't drift from
+/// how the original game was actually started.
+///
+/// Errors with `ReplayError::MissingCardDatabase` when `header.deck_data` is
+/// `Some` but `db` is `None` — that combination can only reconstruct a
+/// wrong starting state (empty libraries instead of the recorded deck), so
+/// it isn't accepted silently. `db: None` is only valid when
+/// `header.deck_data` is also `None` (a format that genuinely starts with
+/// empty libraries).
+///
+/// Reconstructs a current-format (`REPLAY_FORMAT_VERSION`) header.
+pub fn reconstruct_initial_state(
+    header: &ReplayHeader,
+    db: Option<&std::sync::Arc<CardDatabase>>,
+    combos: &ComboTable,
+) -> Result<GameState, ReplayError> {
+    reconstruct_initial_state_for_version(header, db, combos, REPLAY_FORMAT_VERSION)
+}
+
+/// `reconstruct_initial_state` for a recording made in `format_version`, which
+/// selects how a contest-started (`first_player: None`) game begins.
+fn reconstruct_initial_state_for_version(
+    header: &ReplayHeader,
+    db: Option<&std::sync::Arc<CardDatabase>>,
+    combos: &ComboTable,
+    format_version: u32,
+) -> Result<GameState, ReplayError> {
+    let mut state = GameState::new(
+        header.format_config.clone(),
+        header.player_count,
+        header.seed,
+    );
+    // CR 732.2a: project the combo-detector opt-in onto `loop_detection` via the
+    // single authority shared by every transport, so a replay of a detector-on
+    // game reconstructs with the same runtime gate the original game had.
+    state.set_match_config(header.match_config);
+
+    // Mirror `initialize_game`: local WASM games always run with
+    // `debug_mode = true`, and sandbox games (`allow_debug_actions`) pre-seed
+    // `debug_permitted` for every seat before the first action. Without this,
+    // a replay that contains `GrantDebugPermission` or `RevokeDebugPermission`
+    // actions (which are NOT `GameAction::Debug(_)` and therefore DO get
+    // recorded) applies them against an empty `debug_permitted` set instead of
+    // the pre-seeded one, producing a different permission state — and any
+    // subsequent `Debug(_)` actions replayed through `apply` fail outright
+    // because `debug_mode` would be `false`.
+    state.debug_mode = true;
+    if state.format_config.allow_debug_actions {
+        for i in 0..header.player_count {
+            state.debug_permitted.insert(PlayerId(i));
+        }
+    }
+
+    match (&header.deck_data, db) {
+        (Some(deck_data), Some(db)) => {
+            let payload = resolve_deck_list(db, combos, deck_data);
+            // Compatible action logs reconstruct basic-land art using the current
+            // catalog. Trusted full-state restore keeps the saved appearance.
+            load_and_hydrate_decks(&mut state, &payload, Some(&**db));
+            state.all_card_names = db.card_names().into();
+            // CR 707.2 + CR 202.3: a replayed Momir game draws its random
+            // creatures from the whole corpus at resolution time, so the
+            // reconstructed state needs the same draw source a live game gets.
+            crate::game::install_card_db(&mut state, std::sync::Arc::clone(db));
+        }
+        (Some(_), None) => return Err(ReplayError::MissingCardDatabase),
+        (None, _) => {}
+    }
+
+    match (header.first_player, format_version) {
+        (Some(0), _) => start_game_with_starting_player(&mut state, PlayerId(0)),
+        (Some(1), _) => start_game_with_starting_player(&mut state, PlayerId(1)),
+        // CR 103.1: recordings before version 4 have no recorded choice; the
+        // contest winner took the first turn.
+        (_, 2 | 3) => start_game_winner_plays_first(&mut state),
+        _ => start_game(&mut state),
+    };
+    Ok(state)
+}
+
+/// Deterministic playback over a `ReplayLog`. Holds sparse cached
+/// checkpoints (see `CHECKPOINT_INTERVAL`) so repeated scrubbing doesn't
+/// re-simulate the whole game on every call.
+#[derive(Debug)]
+pub struct ReplayPlayer {
+    log: ReplayLog,
+    checkpoints: BTreeMap<u32, GameState>,
+    /// Holds the most recently reconstructed state when `seek` lands on a
+    /// non-checkpoint-aligned index, so `seek` can return a borrow of `self`
+    /// without caching every single scrubbed-through position.
+    scratch: Option<GameState>,
+}
+
+impl ReplayPlayer {
+    /// Build a player for `log`, eagerly reconstructing the index-0
+    /// (post-`start_game`) checkpoint. `db` is forwarded to
+    /// `reconstruct_initial_state`, which errors if `log.header.deck_data`
+    /// is `Some` and `db` is `None` — see that function's doc comment.
+    pub fn load(
+        log: ReplayLog,
+        db: Option<&std::sync::Arc<CardDatabase>>,
+        combos: &ComboTable,
+    ) -> Result<Self, ReplayError> {
+        let version = match log.format_version {
+            Some(version @ 2..=REPLAY_FORMAT_VERSION) => version,
+            Some(version) => return Err(ReplayError::UnsupportedFormatVersion { version }),
+            None => return Err(ReplayError::MissingFormatVersion),
+        };
+        validate_resolve_all_boundaries(&log)?;
+        let initial = reconstruct_initial_state_for_version(&log.header, db, combos, version)?;
+        let mut checkpoints = BTreeMap::new();
+        checkpoints.insert(0, initial);
+        Ok(Self {
+            log,
+            checkpoints,
+            scratch: None,
+        })
+    }
+
+    /// Total number of recorded actions. Valid `seek` targets are `0..=len()`.
+    pub fn len(&self) -> u32 {
+        self.log.actions.len() as u32
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.log.actions.is_empty()
+    }
+
+    pub fn header(&self) -> &ReplayHeader {
+        &self.log.header
+    }
+
+    pub fn action_at(&self, index: u32) -> Option<&RecordedAction> {
+        self.log.actions.get(index as usize)
+    }
+
+    /// Reconstruct and return the state immediately after action `target`
+    /// has been applied (`target == 0` is the post-`start_game` state before
+    /// any action). Clamped to `len()`.
+    pub fn seek(&mut self, target: u32) -> Result<&GameState, ReplayError> {
+        let target = target.min(self.len());
+
+        if self.checkpoints.contains_key(&target) {
+            return Ok(self.checkpoints.get(&target).expect("just checked"));
+        }
+
+        let state = self.replay_from_nearest_checkpoint(target)?;
+        if target.is_multiple_of(CHECKPOINT_INTERVAL) || target == self.len() {
+            self.checkpoints.insert(target, state);
+            return Ok(self.checkpoints.get(&target).expect("just inserted"));
+        }
+
+        self.scratch = Some(state);
+        Ok(self.scratch.as_ref().expect("just set"))
+    }
+
+    fn replay_from_nearest_checkpoint(&self, target: u32) -> Result<GameState, ReplayError> {
+        let (&start_idx, base) = self
+            .checkpoints
+            .range(..=target)
+            .next_back()
+            .expect("index 0 checkpoint is always present");
+        let mut state = base.clone();
+        for (offset, recorded) in self.log.actions[start_idx as usize..target as usize]
+            .iter()
+            .enumerate()
+        {
+            let first_strike_done_before = state
+                .combat
+                .as_ref()
+                .is_some_and(|combat| combat.first_strike_done);
+            let applied = match recorded.kind {
+                RecordedActionKind::Submitted => {
+                    apply(&mut state, recorded.actor, recorded.action.clone())
+                }
+                RecordedActionKind::VerifiedAiPriorityPass { semantic_owner } => {
+                    let contract =
+                        crate::ai_support::AiDecisionContract::issue(&state, semantic_owner);
+                    apply_verified_ai_priority_pass(
+                        &mut state,
+                        recorded.actor,
+                        &contract,
+                        recorded.action.clone(),
+                    )
+                }
+            };
+            applied.map_err(|e| ReplayError::Desync {
+                index: recorded.seq,
+                message: e.to_string(),
+            })?;
+            reject_pre_window_combat_recording(
+                self.log.format_version,
+                first_strike_done_before,
+                &state,
+                recorded.seq,
+            )?;
+            let after_action_count = start_idx + offset as u32 + 1;
+            for boundary in self
+                .log
+                .resolve_all_boundaries
+                .iter()
+                .filter(|boundary| boundary.after_action_count == after_action_count)
+            {
+                if !matches!(state.waiting_for, WaitingFor::ResolveAllReady { .. }) {
+                    return Err(ReplayError::Desync {
+                        index: recorded.seq,
+                        message: "Resolve All boundary was due without a Ready latch".to_string(),
+                    });
+                }
+                if resolve_all_ready_access(&state, boundary.requester)
+                    != ResolveAllReadyAccess::Admitted
+                {
+                    return Err(ReplayError::Desync {
+                        index: recorded.seq,
+                        message:
+                            "Resolve All boundary requester is not entitled to the Ready latch"
+                                .to_string(),
+                    });
+                }
+                resolve_all_ready_prefix(&mut state, boundary.requester).map_err(|error| {
+                    ReplayError::Desync {
+                        index: recorded.seq,
+                        message: format!("Resolve All boundary is not reproducible: {error}"),
+                    }
+                })?;
+            }
+        }
+        Ok(state)
+    }
+}
+
+/// CR 510.3 + CR 510.4: a recording made before
+/// `COMBAT_DAMAGE_WINDOW_FORMAT_VERSION` dealt a first-strike combat's two
+/// damage steps inside one recorded action when the first step left the stack
+/// empty. The current engine stops between them, so replaying that action ends
+/// one step earlier and every following recorded action stays legal — the
+/// replay would reconstruct a different game without any rejected action to
+/// flag it. Reaching that window from the action that completed the first step
+/// (`first_strike_done` was not yet set when the action began) is exactly the
+/// case a pre-window recording cannot reproduce, so it is rejected explicitly.
+/// A first-strike step that left a trigger on the stack already opened the
+/// window before, and its later actions find `first_strike_done` already set,
+/// so those recordings keep replaying.
+fn reject_pre_window_combat_recording(
+    format_version: Option<u32>,
+    first_strike_done_before: bool,
+    state: &GameState,
+    index: u32,
+) -> Result<(), ReplayError> {
+    let recorded_without_window =
+        format_version.is_some_and(|version| version < COMBAT_DAMAGE_WINDOW_FORMAT_VERSION);
+    if recorded_without_window
+        && !first_strike_done_before
+        && matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && super::combat_damage::between_combat_damage_steps(state)
+    {
+        return Err(ReplayError::Desync {
+            index,
+            message: format!(
+                "recording predates replay format version \
+                 {COMBAT_DAMAGE_WINDOW_FORMAT_VERSION}: it dealt both combat damage steps in \
+                 one action, but the engine now gives priority between them (CR 510.3, CR 510.4)"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_resolve_all_boundaries(log: &ReplayLog) -> Result<(), ReplayError> {
+    let boundary_error = |after_action_count: u32, message: &str| ReplayError::Desync {
+        index: after_action_count.saturating_sub(1),
+        message: message.to_string(),
+    };
+
+    if log.format_version == Some(2) && !log.resolve_all_boundaries.is_empty() {
+        return Err(boundary_error(
+            log.resolve_all_boundaries[0].after_action_count,
+            "version 2 replay cannot contain Resolve All boundaries",
+        ));
+    }
+
+    let action_count = log.actions.len() as u32;
+    let mut previous = 0;
+    for boundary in &log.resolve_all_boundaries {
+        if boundary.after_action_count == 0 || boundary.after_action_count > action_count {
+            return Err(boundary_error(
+                boundary.after_action_count,
+                "Resolve All boundary anchor is outside the action sequence",
+            ));
+        }
+        if boundary.after_action_count <= previous {
+            return Err(boundary_error(
+                boundary.after_action_count,
+                "Resolve All boundaries must be unique and strictly ordered",
+            ));
+        }
+        previous = boundary.after_action_count;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::game::zones::create_object;
+    use crate::types::ability::{
+        AbilityDefinition, AbilityKind, Effect, QuantityExpr, ResolvedAbility, TargetFilter,
+        TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef,
+    };
+    use crate::types::actions::{GameAction, ResolveAllConsentDecision, ResolveAllScope};
+    use crate::types::card_type::CoreType;
+    use crate::types::events::GameEvent;
+    use crate::types::format::FormatConfig;
+    use crate::types::game_state::{
+        AutoPassMode, ProductionOverride, StackEntry, StackEntryKind, StackResolutionPolicy,
+        TurnBoundary, WaitingFor,
+    };
+    use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
+    use crate::types::mana::{
+        ManaSourceOutput, ManaSourcePenalty, ManaSourceSelection, ManaType, TapsForManaSelection,
+    };
+    use crate::types::match_config::MatchConfig;
+    use crate::types::phase::Phase;
+    use crate::types::replay::RecordedResolveAll;
+    use crate::types::zones::Zone;
+
+    fn two_player_header(seed: u64) -> ReplayHeader {
+        ReplayHeader {
+            format_config: FormatConfig::standard(),
+            match_config: MatchConfig::default(),
+            player_count: 2,
+            first_player: Some(0),
+            seed,
+            deck_data: None,
+        }
+    }
+
+    /// If the live state is sitting on a priority decision, return the
+    /// `(actor, action)` pair that passes it — the simplest fully-generic
+    /// action available regardless of deck contents, which is exactly why
+    /// this test can run with `deck_data: None` (no CardDatabase needed).
+    fn next_priority_pass(state: &GameState) -> Option<(PlayerId, GameAction)> {
+        match state.waiting_for {
+            WaitingFor::Priority { player } => Some((player, GameAction::PassPriority)),
+            _ => None,
+        }
+    }
+
+    fn no_op_entry(id: u64, controller: PlayerId) -> StackEntry {
+        let object_id = ObjectId(id);
+        StackEntry {
+            id: object_id,
+            source_id: object_id,
+            controller,
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: object_id,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    Vec::new(),
+                    object_id,
+                    controller,
+                )),
+            },
+        }
+    }
+
+    fn recheck_fixture_state() -> GameState {
+        let mut state = GameState::new_two_player(42);
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        // P0's own entry: P1 has no standing pass over it
+        // (`priority::standing_priority_pass`), so the session is retained.
+        state.stack.push_back(StackEntry {
+            id: ObjectId(70_200),
+            source_id: ObjectId(70_200),
+            controller: PlayerId(0),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: ObjectId(70_200),
+                ability: Box::new(crate::types::ability::ResolvedAbility::new(
+                    Effect::NoOp,
+                    Vec::new(),
+                    ObjectId(70_200),
+                    PlayerId(0),
+                )),
+            },
+        });
+        let object_id = create_object(
+            &mut state,
+            CardId(70_201),
+            PlayerId(1),
+            "Replay Recheck Action".to_string(),
+            Zone::Battlefield,
+        );
+        let object = state
+            .objects
+            .get_mut(&object_id)
+            .expect("created battlefield object");
+        object.card_types.core_types.push(CoreType::Artifact);
+        Arc::make_mut(&mut object.abilities).push(AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        ));
+        state
+    }
+
+    #[test]
+    fn verified_ai_stack_pass_replays_with_live_private_session_state() {
+        let initial = recheck_fixture_state();
+        let contract = crate::ai_support::AiDecisionContract::issue(&initial, PlayerId(0));
+        let mut live = initial.clone();
+        apply_verified_ai_priority_pass(
+            &mut live,
+            PlayerId(0),
+            &contract,
+            GameAction::PassPriority,
+        )
+        .expect("the live verified pass applies");
+
+        let header = two_player_header(42);
+        let mut log = ReplayLog::new(header);
+        log.push_verified_ai_priority_pass(PlayerId(0), PlayerId(0));
+        let mut checkpoints = BTreeMap::new();
+        checkpoints.insert(0, initial);
+        let mut player = ReplayPlayer {
+            log,
+            checkpoints,
+            scratch: None,
+        };
+        let replayed = player.seek(1).expect("the marker must replay");
+
+        assert_eq!(replayed, &live, "replay must use the same engine seam");
+        assert_eq!(replayed.state_revision, live.state_revision);
+        assert_eq!(
+            replayed
+                .stack_resolution_session
+                .as_ref()
+                .map(|session| (session.cursor, session.policy)),
+            Some((0, StackResolutionPolicy::RecheckNoMeaningfulPriorityAction)),
+            "the retained private cursor and policy must match live application"
+        );
+    }
+
+    #[test]
+    fn load_rejects_missing_format_version_before_reconstruction() {
+        let mut log = ReplayLog::new(two_player_header(1));
+        log.format_version = None;
+        let error = ReplayPlayer::load(log, None, &ComboTable::default())
+            .expect_err("legacy replay must be rejected");
+        assert!(matches!(error, ReplayError::MissingFormatVersion));
+    }
+
+    #[test]
+    fn load_rejects_unknown_format_version_before_reconstruction() {
+        let mut log = ReplayLog::new(two_player_header(1));
+        log.format_version = Some(REPLAY_FORMAT_VERSION + 1);
+        let error = ReplayPlayer::load(log, None, &ComboTable::default())
+            .expect_err("future replay must be rejected");
+        assert!(matches!(
+            error,
+            ReplayError::UnsupportedFormatVersion { version }
+                if version == REPLAY_FORMAT_VERSION + 1
+        ));
+    }
+
+    #[test]
+    fn version_two_rejects_resolve_all_boundaries() {
+        let mut legacy = ReplayLog::new(two_player_header(2));
+        legacy.format_version = Some(2);
+        ReplayPlayer::load(legacy.clone(), None, &ComboTable::default())
+            .expect("v2 replay without Resolve All boundaries remains readable");
+
+        legacy.resolve_all_boundaries.push(RecordedResolveAll {
+            after_action_count: 1,
+            requester: PlayerId(0),
+        });
+        let error = ReplayPlayer::load(legacy, None, &ComboTable::default())
+            .expect_err("v2 cannot represent an atomic Resolve All boundary");
+        assert!(matches!(
+            error,
+            ReplayError::Desync { message, .. }
+                if message == "version 2 replay cannot contain Resolve All boundaries"
+        ));
+    }
+
+    /// A header for a game started by the engine's own d20 contest.
+    fn contest_header(format_config: FormatConfig, player_count: u8, seed: u64) -> ReplayHeader {
+        ReplayHeader {
+            format_config,
+            match_config: MatchConfig::default(),
+            player_count,
+            first_player: None,
+            seed,
+            deck_data: None,
+        }
+    }
+
+    /// The first seed whose contest winner satisfies `wanted`, with that winner.
+    fn seed_whose_winner(
+        format_config: &FormatConfig,
+        player_count: u8,
+        wanted: impl Fn(PlayerId) -> bool,
+    ) -> (u64, PlayerId) {
+        (0..256u64)
+            .find_map(|seed| {
+                let mut probe = GameState::new(format_config.clone(), player_count, seed);
+                start_game(&mut probe)
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        GameEvent::StartingPlayerContest { winner, .. } => Some(*winner),
+                        _ => None,
+                    })
+                    .filter(|&winner| wanted(winner))
+                    .map(|winner| (seed, winner))
+            })
+            .expect("a seed with the wanted contest winner within 256 seeds")
+    }
+
+    fn load_at_version(header: &ReplayHeader, format_version: u32) -> ReplayPlayer {
+        let mut log = ReplayLog::new(header.clone());
+        log.format_version = Some(format_version);
+        ReplayPlayer::load(log, None, &ComboTable::default()).expect("a supported version loads")
+    }
+
+    /// CR 103.1: a version-4 recording starts at the prompt and replays the
+    /// recorded choice.
+    #[test]
+    fn recorded_choice_replays_from_the_prompt() -> Result<(), ReplayError> {
+        let header = contest_header(FormatConfig::standard(), 2, 42);
+        let mut live = reconstruct_initial_state(&header, None, &ComboTable::default())?;
+        let WaitingFor::ChooseStartingPlayer { player: winner, .. } = live.waiting_for else {
+            panic!("a current-format contest header reconstructs to the CR 103.1 choice");
+        };
+        let starter = PlayerId(1 - winner.0);
+        let answer = GameAction::ChooseStartingPlayer { player: starter };
+        apply(&mut live, winner, answer.clone()).expect("the chooser names the other seat");
+        let mut log = ReplayLog::new(header);
+        log.push_action(winner, answer);
+
+        let mut player = ReplayPlayer::load(log, None, &ComboTable::default())?;
+        assert_eq!(player.len(), 1, "the choice is the one recorded action");
+        assert!(matches!(
+            player.seek(0)?.waiting_for,
+            WaitingFor::ChooseStartingPlayer { player: chooser, .. } if chooser == winner
+        ));
+        let replayed = player.seek(1)?;
+        assert_eq!(replayed.current_starting_player, starter);
+        assert_eq!(
+            replayed.current_starting_player,
+            live.current_starting_player
+        );
+        assert_eq!(replayed.turn_number, live.turn_number);
+        Ok(())
+    }
+
+    /// CR 103.1: versions 2 and 3 predate the recorded choice, so their
+    /// contest winner takes the first turn; the version, not the header,
+    /// selects the route.
+    #[test]
+    fn pre_choice_recordings_start_with_the_roll_winner() {
+        let format_config = FormatConfig::standard();
+        let (seed, winner) = seed_whose_winner(&format_config, 2, |winner| winner == PlayerId(1));
+        let header = contest_header(format_config, 2, seed);
+
+        for version in [3, 2] {
+            let mut player = load_at_version(&header, version);
+            let start = player.seek(0).expect("the start reconstructs");
+            assert_eq!(start.turn_number, 1, "version {version}");
+            assert_eq!(start.current_starting_player, winner, "version {version}");
+            assert!(
+                !matches!(start.waiting_for, WaitingFor::ChooseStartingPlayer { .. }),
+                "version {version} has no recorded choice to wait for"
+            );
+        }
+
+        let mut current = load_at_version(&header, REPLAY_FORMAT_VERSION);
+        assert!(matches!(
+            current.seek(0).expect("the start reconstructs").waiting_for,
+            WaitingFor::ChooseStartingPlayer { player, .. } if player == winner
+        ));
+    }
+
+    /// CR 103.1a: a version-3 Two-Headed Giant recording was started by its raw
+    /// roll winner, even a team's second seat, so it replays that start.
+    #[test]
+    fn pre_choice_two_headed_giant_recording_starts_the_raw_winner() {
+        let format_config = FormatConfig::two_headed_giant();
+        let (seed, winner) = seed_whose_winner(&format_config, 4, |winner| {
+            winner == PlayerId(1) || winner == PlayerId(3)
+        });
+        let header = contest_header(format_config, 4, seed);
+
+        let mut legacy = load_at_version(&header, 3);
+        let start = legacy.seek(0).expect("the start reconstructs");
+        assert_eq!(start.current_starting_player, winner);
+        assert_eq!(start.seat_order[0], winner);
+
+        let representative = if winner == PlayerId(1) {
+            PlayerId(0)
+        } else {
+            PlayerId(2)
+        };
+        let mut current = load_at_version(&header, REPLAY_FORMAT_VERSION);
+        assert!(matches!(
+            current.seek(0).expect("the start reconstructs").waiting_for,
+            WaitingFor::ChooseStartingPlayer { player, .. } if player == representative
+        ));
+    }
+
+    #[test]
+    fn version_three_rejects_invalid_resolve_all_boundary_anchors() {
+        let mut base = ReplayLog::new(two_player_header(3));
+        base.push_action(PlayerId(0), GameAction::PassPriority);
+        base.push_action(PlayerId(1), GameAction::PassPriority);
+
+        let mut zero = base.clone();
+        zero.resolve_all_boundaries.push(RecordedResolveAll {
+            after_action_count: 0,
+            requester: PlayerId(0),
+        });
+        let mut past_end = base.clone();
+        past_end.resolve_all_boundaries.push(RecordedResolveAll {
+            after_action_count: 3,
+            requester: PlayerId(0),
+        });
+        let mut unordered = base.clone();
+        unordered.resolve_all_boundaries = vec![
+            RecordedResolveAll {
+                after_action_count: 2,
+                requester: PlayerId(0),
+            },
+            RecordedResolveAll {
+                after_action_count: 1,
+                requester: PlayerId(1),
+            },
+        ];
+        let mut duplicate = base;
+        duplicate.resolve_all_boundaries = vec![
+            RecordedResolveAll {
+                after_action_count: 1,
+                requester: PlayerId(0),
+            },
+            RecordedResolveAll {
+                after_action_count: 1,
+                requester: PlayerId(1),
+            },
+        ];
+
+        for malformed in [zero, past_end, unordered, duplicate] {
+            let error = ReplayPlayer::load(malformed, None, &ComboTable::default())
+                .expect_err("v3 boundary anchors must be in-range, unique, and ordered");
+            assert!(matches!(error, ReplayError::Desync { .. }));
+        }
+    }
+
+    #[test]
+    fn due_resolve_all_boundary_requires_a_ready_latch() {
+        let mut log = ReplayLog::new(two_player_header(4));
+        log.push_action(PlayerId(0), GameAction::PassPriority);
+        log.push_resolve_all_boundary(PlayerId(0));
+
+        let mut replay =
+            ReplayPlayer::load(log, None, &ComboTable::default()).expect("boundary shape is valid");
+        let error = replay
+            .seek(1)
+            .expect_err("a due Resolve All boundary must not be silently ignored");
+        assert!(matches!(
+            error,
+            ReplayError::Desync { message, .. }
+                if message == "Resolve All boundary was due without a Ready latch"
+        ));
+    }
+
+    #[test]
+    fn due_resolve_all_boundary_rejects_a_legacy_boundary_after_engine_owned_resolution() {
+        let header = two_player_header(5);
+        let mut initial = GameState::new_two_player(header.seed);
+        initial.stack.push_back(no_op_entry(1, PlayerId(0)));
+        let mut log = ReplayLog::new(header);
+
+        let begin = GameAction::BeginResolveAll {
+            max_resolutions: 0,
+            scope: ResolveAllScope::Shared,
+        };
+        let mut consent = initial.clone();
+        apply(&mut consent, PlayerId(0), begin.clone())
+            .expect("P0 can begin Resolve All from priority");
+        log.push_action(PlayerId(0), begin);
+        let WaitingFor::ResolveAllConsent { epoch, .. } = consent.waiting_for else {
+            panic!(
+                "P1 should be asked for consent, got {:?}",
+                consent.waiting_for
+            );
+        };
+        let grant = GameAction::RespondResolveAllConsent {
+            epoch,
+            decision: ResolveAllConsentDecision::Grant,
+        };
+        log.push_action(PlayerId(1), grant);
+        log.push_resolve_all_boundary(PlayerId(2));
+
+        let mut replay =
+            ReplayPlayer::load(log, None, &ComboTable::default()).expect("boundary shape is valid");
+        replay.checkpoints.insert(0, initial);
+        let error = replay
+            .seek(2)
+            .expect_err("new Resolve All actions resolve through the engine without a Ready latch");
+        assert!(matches!(
+            error,
+            ReplayError::Desync { message, .. }
+                if message == "Resolve All boundary was due without a Ready latch"
+        ));
+    }
+
+    #[test]
+    fn current_version_roundtrips_semantic_mana_source_selections() {
+        let source = ObjectIncarnationRef::of(ObjectId(7), 3);
+        let aura = ObjectIncarnationRef::of(ObjectId(9), 2);
+        let action = GameAction::TapLandForMana {
+            selection: ManaSourceSelection {
+                source,
+                ability_index: None,
+                mana_type: ManaType::Green,
+                output: crate::types::mana::ManaSourceOutput::Concrete(ManaType::Green),
+                atomic_combination: None,
+                restrictions: Vec::new(),
+                penalty: ManaSourcePenalty::None,
+                taps_for_mana: vec![TapsForManaSelection {
+                    source: aura,
+                    occurrence: TriggerDefinitionOccurrenceRef::Printed {
+                        base_set: TriggerBaseSetInstanceRef::INITIAL,
+                        printed_index: 0,
+                    },
+                    production_override: ProductionOverride::SingleColor(ManaType::Red),
+                }],
+            },
+        };
+        let mut log = ReplayLog::new(two_player_header(5));
+        log.push_action(PlayerId(0), action.clone());
+
+        let json = serde_json::to_string(&log).expect("serialize replay v2");
+        let restored: ReplayLog = serde_json::from_str(&json).expect("deserialize replay v2");
+
+        assert_eq!(restored.format_version, Some(REPLAY_FORMAT_VERSION));
+        assert_eq!(restored.actions.len(), 1);
+        assert_eq!(restored.actions[0].action, action);
+    }
+
+    #[test]
+    fn legacy_colored_tap_land_action_preserves_its_selected_output() {
+        let action: GameAction = serde_json::from_value(serde_json::json!({
+            "type": "TapLandForMana",
+            "data": {
+                "selection": {
+                    "source": { "object_id": 7, "incarnation": 3 },
+                    "ability_index": null,
+                    "mana_type": "Green",
+                    "atomic_combination": null,
+                    "restrictions": [],
+                    "penalty": "None",
+                    "taps_for_mana": []
+                }
+            }
+        }))
+        .expect("pre-output replay actions should deserialize");
+
+        let GameAction::TapLandForMana { selection } = action else {
+            panic!("legacy action must retain its TapLandForMana shape");
+        };
+        assert_eq!(
+            selection.output,
+            ManaSourceOutput::Concrete(ManaType::Green),
+            "a legacy colored row selected its mana_type, not colorless mana"
+        );
+    }
+
+    #[test]
+    fn replay_player_reconstructs_every_recorded_index() {
+        let header = two_player_header(99);
+        let mut live = reconstruct_initial_state(&header, None, &ComboTable::default())
+            .expect("deck_data is None, so reconstruction cannot fail");
+
+        let mut log = ReplayLog::new(header);
+        let mut live_snapshots = vec![live.clone()];
+
+        // Pass priority a handful of times — enough to walk through several
+        // phases of turn 1 without reaching turn 2's draw step (which would
+        // lose the game to CR 704.5b against an empty library).
+        for _ in 0..8 {
+            let Some((actor, action)) = next_priority_pass(&live) else {
+                break;
+            };
+            apply(&mut live, actor, action.clone())
+                .expect("passing priority while waiting on it is always legal");
+            log.push_action(actor, action);
+            live_snapshots.push(live.clone());
+        }
+
+        assert!(
+            log.actions.len() >= 4,
+            "expected several priority passes to have been recorded"
+        );
+        assert_eq!(log.actions.len(), live_snapshots.len() - 1);
+
+        let mut player = ReplayPlayer::load(log, None, &ComboTable::default())
+            .expect("deck_data is None, so load cannot fail");
+        assert_eq!(player.len(), live_snapshots.len() as u32 - 1);
+
+        for (index, expected) in live_snapshots.iter().enumerate() {
+            let got = player
+                .seek(index as u32)
+                .unwrap_or_else(|e| panic!("seek({index}) desynced: {e}"));
+            assert_eq!(
+                got.turn_number, expected.turn_number,
+                "turn_number at {index}"
+            );
+            assert_eq!(got.phase, expected.phase, "phase at {index}");
+            assert_eq!(
+                got.active_player, expected.active_player,
+                "active_player at {index}"
+            );
+            assert_eq!(
+                got.waiting_for, expected.waiting_for,
+                "waiting_for at {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_player_reconstructs_a_legacy_atomic_resolve_all_boundary() {
+        let header = two_player_header(101);
+        let mut initial = GameState::new_two_player(header.seed);
+        initial.stack.push_back(no_op_entry(1, PlayerId(0)));
+        for player in [PlayerId(0), PlayerId(1)] {
+            initial.auto_pass.insert(
+                player,
+                AutoPassMode::UntilTurnBoundary {
+                    until: TurnBoundary::EndOfCurrentTurn,
+                },
+            );
+        }
+
+        let begin = GameAction::BeginResolveAll {
+            max_resolutions: 0,
+            scope: ResolveAllScope::Shared,
+        };
+        apply(&mut initial, PlayerId(0), begin).expect("P0 begins Resolve All consent");
+        let WaitingFor::ResolveAllConsent { epoch, .. } = initial.waiting_for else {
+            panic!(
+                "P1 should be asked for consent, got {:?}",
+                initial.waiting_for
+            );
+        };
+        let run = initial
+            .resolve_all_consent_run
+            .as_mut()
+            .expect("the consent prompt retains its private run");
+        run.auto_pass_baseline = None;
+        initial.auto_pass.remove(&PlayerId(0));
+
+        let mut live = initial.clone();
+        let mut log = ReplayLog::new(header);
+        let grant = GameAction::RespondResolveAllConsent {
+            epoch,
+            decision: ResolveAllConsentDecision::Grant,
+        };
+        apply(&mut live, PlayerId(1), grant.clone()).expect("P1 grants Resolve All consent");
+        log.push_action(PlayerId(1), grant);
+        assert!(matches!(
+            live.waiting_for,
+            WaitingFor::ResolveAllReady { .. }
+        ));
+
+        resolve_all_ready_prefix(&mut live, PlayerId(0))
+            .expect("the fixture's Resolve All prefix is representable");
+        log.push_resolve_all_boundary(PlayerId(0));
+
+        let mut replay = ReplayPlayer::load(log, None, &ComboTable::default())
+            .expect("the atomic boundary is replayable");
+        replay.checkpoints.insert(0, initial);
+        let replay_len = replay.len();
+        let reconstructed = replay
+            .seek(replay_len)
+            .expect("ReplayPlayer applies the Resolve All boundary")
+            .clone();
+
+        assert_eq!(reconstructed, live);
+    }
+
+    #[test]
+    fn replay_player_seeks_out_of_order_and_caches_correctly() {
+        let header = two_player_header(42);
+        let mut live = reconstruct_initial_state(&header, None, &ComboTable::default())
+            .expect("deck_data is None, so reconstruction cannot fail");
+        let mut log = ReplayLog::new(header);
+
+        for _ in 0..6 {
+            let Some((actor, action)) = next_priority_pass(&live) else {
+                break;
+            };
+            apply(&mut live, actor, action.clone()).unwrap();
+            log.push_action(actor, action);
+        }
+        let total = log.actions.len() as u32;
+        assert!(total >= 3);
+
+        let mut player = ReplayPlayer::load(log, None, &ComboTable::default())
+            .expect("deck_data is None, so load cannot fail");
+
+        // Seek forward, then back, then forward again — exercises both the
+        // checkpoint-cache hit path and the nearest-checkpoint replay path.
+        let last = player.seek(total).unwrap().clone();
+        let first = player.seek(0).unwrap().clone();
+        let last_again = player.seek(total).unwrap().clone();
+
+        assert_eq!(first.turn_number, 1);
+        assert_eq!(last.waiting_for, last_again.waiting_for);
+        assert_eq!(last.phase, last_again.phase);
+    }
+
+    #[test]
+    fn reconstruct_initial_state_fails_loudly_without_card_database() {
+        let mut header = two_player_header(13);
+        header.deck_data = Some(crate::game::deck_loading::DeckList::default());
+
+        let err = reconstruct_initial_state(&header, None, &ComboTable::default())
+            .expect_err("deck_data present with no CardDatabase must error, not silently reconstruct empty libraries");
+        assert!(matches!(err, ReplayError::MissingCardDatabase));
+
+        // ReplayPlayer::load propagates the same failure.
+        let log = ReplayLog::new(header);
+        let load_err = ReplayPlayer::load(log, None, &ComboTable::default())
+            .expect_err("load must surface the same MissingCardDatabase failure");
+        assert!(matches!(load_err, ReplayError::MissingCardDatabase));
+    }
+
+    #[test]
+    fn sandbox_game_reconstruct_pre_seeds_debug_permitted_matching_initialize_game() {
+        // `initialize_game` seeds `debug_permitted` for every seat when
+        // `allow_debug_actions` is true. Without the parallel seeding in
+        // `reconstruct_initial_state`, a replay that contains
+        // `GrantDebugPermission` or `RevokeDebugPermission` actions (which
+        // are recorded, unlike `Debug(_)` ones) applies them against an
+        // empty set, producing a different permission state and desyncing
+        // the reconstruction from the original game.
+        let sandbox_config = FormatConfig::standard().with_sandbox();
+        let header = ReplayHeader {
+            format_config: sandbox_config,
+            match_config: MatchConfig::default(),
+            player_count: 2,
+            first_player: Some(0),
+            seed: 7,
+            deck_data: None,
+        };
+
+        let state = reconstruct_initial_state(&header, None, &ComboTable::default())
+            .expect("deck_data is None, so reconstruction cannot fail");
+
+        // Both seats must be in debug_permitted, mirroring initialize_game.
+        assert!(
+            state.debug_mode,
+            "sandbox reconstruct must have debug_mode = true, matching initialize_game"
+        );
+        assert!(
+            state.debug_permitted.contains(&PlayerId(0)),
+            "seat 0 must be in debug_permitted after sandbox reconstruction"
+        );
+        assert!(
+            state.debug_permitted.contains(&PlayerId(1)),
+            "seat 1 must be in debug_permitted after sandbox reconstruction"
+        );
+
+        // A non-sandbox game must leave debug_permitted empty.
+        let non_sandbox_header = two_player_header(7);
+        let non_sandbox =
+            reconstruct_initial_state(&non_sandbox_header, None, &ComboTable::default())
+                .expect("non-sandbox deck_data is None");
+        assert!(
+            non_sandbox.debug_permitted.is_empty(),
+            "non-sandbox reconstruct must leave debug_permitted empty"
+        );
+
+        // Replaying a RevokeDebugPermission action against the correctly
+        // pre-seeded state must produce the same permission set as the live
+        // game — if the set were empty (the pre-fix bug), remove would be a
+        // no-op and the reconstructed state would diverge.
+        let mut live = reconstruct_initial_state(&header, None, &ComboTable::default()).unwrap();
+        let mut log = ReplayLog::new(header.clone());
+
+        apply(
+            &mut live,
+            PlayerId(0),
+            GameAction::RevokeDebugPermission {
+                player_id: PlayerId(1),
+            },
+        )
+        .expect("host revoking P1 permission must be accepted in a sandbox game");
+        log.push_action(
+            PlayerId(0),
+            GameAction::RevokeDebugPermission {
+                player_id: PlayerId(1),
+            },
+        );
+        assert!(
+            live.debug_permitted.contains(&PlayerId(0)),
+            "host must still be in debug_permitted after revoking P1"
+        );
+        assert!(
+            !live.debug_permitted.contains(&PlayerId(1)),
+            "P1 must be removed from debug_permitted after revoke"
+        );
+
+        // Reconstruct to the same point via replay.
+        let mut player = ReplayPlayer::load(log, None, &ComboTable::default()).unwrap();
+        let replayed = player.seek(1).unwrap();
+        assert_eq!(
+            replayed.debug_permitted, live.debug_permitted,
+            "replayed debug_permitted must match live game after RevokeDebugPermission"
+        );
+    }
+
+    #[test]
+    fn replay_player_seek_clamps_to_length_and_handles_empty_log() {
+        let header = two_player_header(7);
+        let log = ReplayLog::new(header);
+        let mut player = ReplayPlayer::load(log, None, &ComboTable::default())
+            .expect("deck_data is None, so load cannot fail");
+
+        assert_eq!(player.len(), 0);
+        assert!(player.is_empty());
+
+        // Seeking past the end of an empty log clamps to 0, not an error.
+        let state = player
+            .seek(50)
+            .expect("empty log still has the initial state");
+        assert_eq!(state.turn_number, 1);
+    }
+
+    /// A recording of an unblocked printed attacker (a 1/1 Fencing Ace with double
+    /// strike, or a vanilla 2/2 Grizzly Bears), driven action by action until
+    /// `stop` holds, returning `(initial state, recorded log, live state)`; `no_mercy`
+    /// gives the defender No Mercy. Every
+    /// action is applied to the live state and recorded with its actor, so the
+    /// log is what a writer produces and the live state is what it must replay to.
+    fn combat_recording(
+        double_strike: bool,
+        no_mercy: bool,
+        format_version: u32,
+        stop: impl Fn(&GameState) -> bool,
+    ) -> (GameState, ReplayLog, GameState) {
+        use crate::game::combat::AttackTarget;
+        use crate::game::scenario::{GameScenario, P0, P1};
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        if no_mercy {
+            scenario
+                .add_creature_from_oracle(
+                    P1,
+                    "No Mercy",
+                    0,
+                    0,
+                    "Whenever a creature deals damage to you, destroy it.",
+                )
+                .as_enchantment();
+        }
+        let attacker = {
+            if double_strike {
+                let mut builder = scenario.add_creature(P0, "Fencing Ace", 1, 1);
+                builder.double_strike();
+                builder.id()
+            } else {
+                scenario.add_creature(P0, "Grizzly Bears", 2, 2).id()
+            }
+        };
+        let initial = scenario.build().state().clone();
+
+        let mut log = ReplayLog::new(two_player_header(1));
+        log.format_version = Some(format_version);
+        let mut live = initial.clone();
+        for _ in 0..32 {
+            if stop(&live) {
+                return (initial, log, live);
+            }
+            let (actor, action) = match live.waiting_for.clone() {
+                WaitingFor::Priority { player } => (player, GameAction::PassPriority),
+                WaitingFor::DeclareAttackers { player, .. } => (
+                    player,
+                    GameAction::DeclareAttackers {
+                        attacks: vec![(attacker, AttackTarget::Player(P1))],
+                        bands: vec![],
+                    },
+                ),
+                WaitingFor::DeclareBlockers { player, .. } => (
+                    player,
+                    GameAction::DeclareBlockers {
+                        assignments: vec![],
+                    },
+                ),
+                other => panic!("unexpected decision while recording the combat: {other:?}"),
+            };
+            apply(&mut live, actor, action.clone()).expect("the live action applies");
+            log.push_action(actor, action);
+        }
+        panic!("the combat did not reach the wanted state within the action budget");
+    }
+
+    fn player_from(initial: &GameState, log: ReplayLog) -> ReplayPlayer {
+        let mut checkpoints = BTreeMap::new();
+        checkpoints.insert(0, initial.clone());
+        ReplayPlayer {
+            log,
+            checkpoints,
+            scratch: None,
+        }
+    }
+
+    fn first_step_window(state: &GameState) -> bool {
+        matches!(state.waiting_for, WaitingFor::Priority { .. })
+            && crate::game::combat_damage::between_combat_damage_steps(state)
+    }
+
+    fn defender_life(state: &GameState) -> i32 {
+        state.players[1].life
+    }
+
+    /// CR 510.3 + CR 510.4: a version-4 recording of a double striker's combat
+    /// dealt both hits in the action that completed the first step. The current
+    /// engine stops in the window after the first hit, so replaying that action
+    /// would silently end one hit earlier (19 life instead of 18): it is
+    /// rejected explicitly instead, at the action that reaches the window.
+    #[test]
+    fn pre_window_recording_of_a_double_strike_combat_is_rejected() {
+        let (initial, log, live) = combat_recording(true, false, 4, first_step_window);
+        assert_eq!(defender_life(&live), 19, "the first hit has landed");
+        let last = log.actions.len() as u32;
+
+        let mut player = player_from(&initial, log);
+        player
+            .seek(last - 1)
+            .expect("everything before the window still replays");
+        let error = player
+            .seek(last)
+            .expect_err("the action that reaches the window cannot be reproduced");
+        assert!(matches!(
+            error,
+            ReplayError::Desync { index, ref message }
+                if index == last - 1 && message.contains("CR 510.3")
+        ));
+    }
+
+    /// The same recording at the current version replays exactly: the writer
+    /// recorded the window, so the replay stops in it as the live game did.
+    #[test]
+    fn current_recording_of_a_double_strike_combat_replays_to_the_window() {
+        let (initial, log, live) =
+            combat_recording(true, false, REPLAY_FORMAT_VERSION, first_step_window);
+        let last = log.actions.len() as u32;
+
+        let mut player = player_from(&initial, log);
+        let replayed = player.seek(last).expect("a current recording replays");
+        assert_eq!(defender_life(replayed), 19);
+        assert_eq!(replayed, &live);
+    }
+
+    /// Control: a pre-window recording without first or double strike has one
+    /// combat damage step and no window, so it keeps replaying.
+    #[test]
+    fn pre_window_recording_without_first_strike_keeps_replaying() {
+        let (initial, log, live) = combat_recording(false, false, 4, |state| {
+            matches!(state.waiting_for, WaitingFor::Priority { .. })
+                && state
+                    .combat
+                    .as_ref()
+                    .is_some_and(|combat| combat.regular_damage_done)
+        });
+        assert_eq!(defender_life(&live), 18, "the single hit has landed");
+        let last = log.actions.len() as u32;
+
+        let mut player = player_from(&initial, log);
+        let replayed = player.seek(last).expect("a one-step combat replays");
+        assert_eq!(defender_life(replayed), 18);
+    }
+
+    /// Passes priority on the live state and records it, until the regular
+    /// combat damage step has been dealt.
+    fn record_passes_through_the_regular_step(live: &mut GameState, log: &mut ReplayLog) {
+        for _ in 0..8 {
+            if live
+                .combat
+                .as_ref()
+                .is_some_and(|combat| combat.regular_damage_done)
+            {
+                return;
+            }
+            let WaitingFor::Priority { player } = live.waiting_for else {
+                panic!("expected a priority window, got {:?}", live.waiting_for);
+            };
+            apply(live, player, GameAction::PassPriority).expect("the pass applies");
+            log.push_action(player, GameAction::PassPriority);
+        }
+        panic!("the regular combat damage step was not reached within the pass budget");
+    }
+
+    /// #692 control: a pre-window recording whose first-strike step left a
+    /// trigger on the stack (No Mercy) already had that window, so it keeps
+    /// replaying — through the pass that resolves the trigger and leaves an empty
+    /// stack in the window, which is only safe because the first step was
+    /// complete before that action began.
+    #[test]
+    fn pre_window_recording_with_a_first_strike_trigger_keeps_replaying() {
+        let (initial, mut log, mut live) = combat_recording(true, true, 4, first_step_window);
+        let window = log.actions.len() as u32;
+        record_passes_through_the_regular_step(&mut live, &mut log);
+        let last = log.actions.len() as u32;
+        assert!(last > window, "the recording continues past the window");
+
+        let mut player = player_from(&initial, log);
+        let replayed = player
+            .seek(last)
+            .expect("a recording that already had the window keeps replaying");
+        assert_eq!(replayed, &live);
+    }
+
+    /// A replay that resumes from a checkpoint cached inside the window reads
+    /// `first_strike_done` from that checkpoint, so the first action after it is
+    /// not mistaken for the one that completed the first step.
+    #[test]
+    fn replay_resumed_from_a_checkpoint_inside_the_window_is_not_rejected() {
+        let (initial, mut log, mut live) = combat_recording(true, true, 4, first_step_window);
+        let window = log.actions.len() as u32;
+        record_passes_through_the_regular_step(&mut live, &mut log);
+        let last = log.actions.len() as u32;
+
+        let mut player = player_from(&initial, log);
+        let in_window = player.seek(window).expect("the window replays").clone();
+        player.checkpoints.insert(window, in_window);
+        let replayed = player
+            .seek(last)
+            .expect("resuming from the window checkpoint replays");
+        assert_eq!(replayed, &live);
+    }
+}

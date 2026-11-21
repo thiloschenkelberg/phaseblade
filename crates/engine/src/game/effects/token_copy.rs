@@ -1,0 +1,8361 @@
+use crate::game::filter::{matches_target_filter, FilterContext};
+use crate::game::game_object::ObjectIncarnationRefExt;
+use crate::game::game_object::{
+    BackFaceData, DisplayIdentity, DisplaySource, GameObject, MergeKind,
+};
+use crate::game::layers::{compute_current_copiable_values, remove_core_type, remove_subtype_set};
+use crate::game::quantity::resolve_quantity;
+use crate::game::{targeting, zones};
+use crate::types::ability::{
+    ChosenAttribute, ContinuousModification, CopiableValues, Effect, EffectError, EffectKind,
+    EntryAttackDestination, ResolvedAbility, StaticDefinition, TargetFilter, TargetRef,
+    TriggerCondition, TriggerDefinition,
+};
+use crate::types::card::{LayoutKind, PrintedLoyalty};
+#[cfg(test)]
+use crate::types::counter::{CounterMatch, CounterType};
+use crate::types::events::GameEvent;
+use crate::types::game_state::{
+    CopyTokenEntryTail, GameState, LiminalEntry, OfferedBatchCustody, PendingCopyTokenBatch,
+    PendingCopyTokenResolution, PendingCounterPostAction, PendingLiminalEntryResume, WaitingFor,
+};
+use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
+use crate::types::keywords::Keyword;
+use crate::types::player::PlayerId;
+use crate::types::proposed_event::{
+    CopiedDoubleFaces, CopyTokenSpec, CounterCause, EtbTapState, ProposedEvent,
+    TokenCharacteristics, TokenSpec,
+};
+use crate::types::resolution::ChildStackDepth;
+use crate::types::resolved_commands::{
+    ResolvedCopyBodyModifications, ResolvedTokenBody, ResolvedTokenCreationCommand,
+};
+use crate::types::zones::Zone;
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
+
+/// CR 707.2 / CR 707.5: Create a token that's a copy of a permanent.
+/// Copies copiable characteristics from the target to a newly created token.
+///
+/// CR 707.2 + CR 614.1a: When `count` resolves to N > 1 (e.g. Rite of
+/// Replication kicked = 5), N independent copy-tokens are created. The
+/// per-source count is additionally routed through the `CreateToken`
+/// replacement pipeline so token-count-doubling replacements (Doubling Season,
+/// Adrix and Nev, Parallel Lives, Anointed Procession, Mondrak) apply uniformly
+/// to copy-token creation, exactly as they do to predefined `Effect::Token`.
+pub fn resolve(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    // Extract fields from effect
+    let (
+        target_filter,
+        owner_filter,
+        source_filter,
+        enters_attacking,
+        attack_destination,
+        tapped,
+        count_expr,
+        extra_keywords,
+        additional_modifications,
+    ) = match &ability.effect {
+        Effect::CopyTokenOf {
+            target,
+            owner,
+            source_filter,
+            enters_attacking,
+            attack_destination,
+            tapped,
+            count,
+            extra_keywords,
+            additional_modifications,
+        } => (
+            target,
+            owner,
+            source_filter,
+            *enters_attacking,
+            attack_destination,
+            *tapped,
+            count.clone(),
+            extra_keywords.clone(),
+            additional_modifications.clone(),
+        ),
+        _ => return Err(EffectError::MissingParam("CopyTokenOf".to_string())),
+    };
+    let (count, enters_attacking, attack_request) = super::token::resolve_token_batch(
+        state,
+        ability,
+        &count_expr,
+        enters_attacking,
+        attack_destination,
+    );
+
+    // CR 109.4 + CR 111.2: The token's creator (and therefore controller) is
+    // determined by the `owner` filter. Resolved once, before the creation
+    // loops, through the same single-authority helper `Effect::Token` uses so
+    // "target opponent creates a token that's a copy of it" places the copy
+    // under the chosen opponent's control rather than the trigger controller's.
+    let Some(token_owner) =
+        crate::game::effects::token::resolve_token_owner(state, ability, owner_filter)
+    else {
+        return crate::game::effects::token::no_token(state, ability, events);
+    };
+
+    // Step 1: Resolve the copy source list.
+    // CR 608.2c + 603.10a: LTB self-trigger patterns such as Vaultborn Tyrant
+    // ("create a token that's a copy of it") and Ochre Jelly's delayed trigger
+    // emit `target: ParentTarget` / `SelfRef` with empty `ability.targets`.
+    // In a top-level trigger there is no parent chain, so the anaphor refers to
+    // the source object itself. `TriggeringSource` is deliberately excluded:
+    // it resolves via `state.current_trigger_event`, not `source_id`.
+    //
+    // CR 115.1d + CR 601.2c: For "any number of target X" / "for each of them,
+    // create a token …" (e.g., Twinflame), `ability.targets` carries N >= 1
+    // object refs and the resolver creates one copy per target.
+    //
+    // Zone-eligibility: unlike `Bounce` / `ChangeZone`, a copy source other
+    // than the ability's own source is read live through `copy_source`
+    // (`compute_current_copiable_values`, which is zone-agnostic) — so such
+    // a source in the graveyard is fine.
+    //
+    // CR 109.4 + CR 115.1: `CopyTokenOf` may carry a *player* target in
+    // `ability.targets` — the `owner` slot for "target opponent creates a
+    // token that's a copy of it" (Wedding Ring). The copy *source* axis is
+    // object-only, so a context-ref source (`ParentTarget` / `None`) would
+    // otherwise see the owner player as a non-empty `ability.targets` and
+    // fail to fall back to the source object. Resolve against an
+    // object-only view so the two axes never cross-contaminate.
+    let object_only_ability;
+    let resolution_ability = if ability
+        .targets
+        .iter()
+        .any(|t| matches!(t, TargetRef::Player(_)))
+    {
+        let mut narrowed = ability.clone();
+        // An occurrence projection: object occurrences keep their pins.
+        let objects: Vec<usize> = narrowed
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| matches!(t, TargetRef::Object(_)))
+            .map(|(position, _)| position)
+            .collect();
+        narrowed.project_target_occurrences(&objects);
+        object_only_ability = narrowed;
+        &object_only_ability
+    } else {
+        ability
+    };
+
+    // CR 608.2h + CR 707.2: "a copy of this creature" (`SelfRef`) reads its own
+    // source through `copy_source`, which supplies the source's last-known
+    // copiable values once it has left the zone the ability identified it in.
+    // An inferred own-source "copy of it" (`ParentTarget` / `None` with no
+    // propagated targets) reads the source the same way, so a departed source
+    // still supplies its last-known copiable values (Nacatl War-Pride ruling).
+    let reads_own_source = copies_own_source(&ability.effect)
+        || (source_filter.is_none()
+            && targeting::infers_own_source(state, resolution_ability, target_filter));
+    let copy_sources: Vec<CopySource> = if reads_own_source {
+        copy_source(state, ability, CopySourceReferent::OwnSource)
+            .into_iter()
+            .collect()
+    } else {
+        let copy_source_ids: Vec<ObjectId> = if let Some(source_filter) = source_filter {
+            let zones = {
+                let explicit_zones = source_filter.extract_zones();
+                if explicit_zones.is_empty() {
+                    vec![Zone::Battlefield]
+                } else {
+                    explicit_zones
+                }
+            };
+            let filter_ctx = FilterContext::from_ability(ability);
+            zones
+                .into_iter()
+                .flat_map(|zone| targeting::zone_object_ids(state, zone))
+                .filter(|id| matches_target_filter(state, *id, source_filter, &filter_ctx))
+                .collect()
+        } else if matches!(target_filter, TargetFilter::CostPaidObject) {
+            // CR 400.7: resolve through the shared live-reference guard — a
+            // referent that changed zones is a new object and must not become the
+            // copy source (no fallback to a same-id object).
+            // An ABSENT referent is a malformed ability (nothing was ever bound) and
+            // stays a parameter error. A PRESENT but stale referent is different:
+            // the object was bound and then became a new object (CR 400.7), so the
+            // copy has no legal source and resolves as a clean no-op through the
+            // empty-source path below, which still emits `EffectResolved`.
+            //
+            // CR 608.2c + CR 701.68c: an earlier instruction of this resolution
+            // can bind the referent instead of a cost ("the blighted creature"),
+            // so the read goes through the shared ladder. Absence stays an error
+            // for either binder: a chain whose producer can produce nothing is
+            // gated at that producer, so only a chain with no producer reaches it.
+            if ability.cost_paid_object.is_none() && ability.effect_context_object.is_none() {
+                return Err(EffectError::MissingParam(
+                    "CopyTokenOf requires a cost-paid object".to_string(),
+                ));
+            }
+            crate::game::effects::resolved_effect_object_ids(state, ability, target_filter)
+        } else if matches!(
+            target_filter,
+            TargetFilter::TrackedSet { .. } | TargetFilter::TrackedSetFiltered { .. }
+        ) {
+            let effective_filter =
+                crate::game::targeting::resolve_tracked_set_sentinel(state, target_filter.clone());
+            let id = match &effective_filter {
+                TargetFilter::TrackedSet { id } | TargetFilter::TrackedSetFiltered { id, .. } => {
+                    *id
+                }
+                _ => unreachable!("tracked-set filter resolved to non-tracked filter"),
+            };
+            let filter_ctx = FilterContext::from_ability(ability);
+            state
+                .tracked_object_sets
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|id| matches_target_filter(state, *id, &effective_filter, &filter_ctx))
+                .collect()
+        } else {
+            // CR 608.2c + 603.10a: Delegate to the unified 3-tier dispatch so
+            // `None` / `ParentTarget` fall back to source only when
+            // `ability.targets` is empty. An own-source `SelfRef`, or an
+            // inferred own-source `ParentTarget` / `None`, never reaches this
+            // branch: it is read through `copy_source` above, which never reads
+            // `ability.targets`, so a chained `CopyTokenOf { target: SelfRef }`
+            // sub-ability cannot inherit the parent's targets via chain
+            // propagation in `effects::mod.rs::resolve_ability_chain` (issue
+            // #323 class).
+            crate::game::effects::resolved_effect_object_ids(
+                state,
+                resolution_ability,
+                target_filter,
+            )
+        };
+        copy_source_ids
+            .into_iter()
+            .map(|id| {
+                copy_source(state, ability, CopySourceReferent::Object(id))
+                    .ok_or(EffectError::ObjectNotFound(id))
+            })
+            .collect::<Result<_, _>>()?
+    };
+
+    // CR 609.3 + CR 101.3: "Do as much as possible" — when the copy source
+    // resolves empty, `CopyTokenOf` is a clean zero-token no-op rather than an
+    // error. This is required for an unattached Springheart Nantuko: its
+    // `target: AttachedTo` host resolves empty when the card is not bestowed
+    // onto a creature, so the copy makes nothing and the chained
+    // `Not(IfYouDo)` Insect-token fallback can still fire. `EffectResolved` is
+    // still emitted so the chain treats the effect as resolved.
+    if copy_sources.is_empty() {
+        // No tokens created — clear the per-resolution token-id ledger so a
+        // downstream "the token created this way" anaphor does not pick up a
+        // stale id from an earlier resolution. Engine bookkeeping, not a
+        // CR-specified rule.
+        state.last_created_token_ids = Vec::new();
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+            subject: None,
+        });
+        return Ok(());
+    }
+
+    // CR 707.2 + CR 115.1d: Create `count` independent copy-tokens per copy
+    // source. All source values were read in Step 1, before the first creation,
+    // so later SBAs (e.g., legendary rule) see identical copies. The drain can
+    // pause and resume when the `CreateToken` replacement pipeline requires a
+    // CR 616.1 choice.
+    let mut remaining = VecDeque::with_capacity(copy_sources.len());
+    for source in copy_sources {
+        // CR 707.8a: read before `source.values` moves into the spec.
+        let double_faced = copied_double_faces(state, &source);
+        remaining.push_back(PendingCopyTokenBatch {
+            owner: token_owner,
+            count,
+            copy: Box::new(CopyTokenSpec {
+                values: Box::new(source.values),
+                // Created copy-tokens derive their descriptor from their
+                // own base at injection (copy exceptions included), so the
+                // source's captured body is deliberately not carried here.
+                display: DisplayIdentity {
+                    token_art: None,
+                    ..source.display
+                },
+                extra_keywords: extra_keywords.clone(),
+                additional_modifications: additional_modifications.clone(),
+                tapped,
+                enters_attacking,
+                attack_request: attack_request.clone(),
+                sacrifice_at: ability.duration.clone(),
+                source_id: ability.source_id,
+                controller: ability.controller,
+                // CR 608.2h + CR 707.9b: carry the donor incarnation Step 1
+                // bound so donor-referential exceptions halve donor values.
+                donor: Some(source.incarnation),
+                double_faced,
+            }),
+        });
+    }
+
+    drive_copy_token_batches(
+        state,
+        remaining,
+        EffectKind::from(&ability.effect),
+        ability.source_id,
+        events,
+    );
+
+    Ok(())
+}
+
+/// CR 707.2 + CR 608.2h: which copy source a copy effect reads.
+pub(crate) enum CopySourceReferent {
+    /// The ability's own source ("a copy of this creature"), bound to the
+    /// incarnation the ability captured.
+    OwnSource,
+    /// An object the effect's route identified at resolution.
+    Object(ObjectId),
+}
+
+/// CR 707.2: one copy source as a copy effect reads it: the incarnation it
+/// was read from, its copiable values, and the display identity the copy
+/// records with them (not copiable).
+pub(crate) struct CopySource {
+    pub(crate) incarnation: ObjectIncarnationRef,
+    pub(crate) values: CopiableValues,
+    pub(crate) display: DisplayIdentity,
+}
+
+impl CopySource {
+    /// CR 707.2: the current copiable values of an object that is still the
+    /// copy source.
+    fn live(state: &GameState, id: ObjectId) -> Option<Self> {
+        let values = compute_current_copiable_values(state, id)?;
+        let source = state.objects.get(&id)?;
+        Some(Self {
+            incarnation: ObjectIncarnationRef::from_object(source),
+            values,
+            display: source.display_identity(),
+        })
+    }
+
+    /// CR 608.2h + CR 707.2: the last-known copiable values of the exact
+    /// incarnation `incarnation`, recorded as it left a public zone. The
+    /// display routing is derived as the departed-source reader in
+    /// `replacement::create_entry_copy_spec_for_replacement` derives it.
+    fn last_known(state: &GameState, incarnation: ObjectIncarnationRef) -> Option<Self> {
+        let values = state
+            .lki_copiable_values_by_incarnation
+            .get(&incarnation.object_id)?
+            .get(&incarnation.incarnation)?
+            .clone();
+        let token_image_ref = state
+            .lki_by_incarnation
+            .get(&incarnation.object_id)
+            .and_then(|history| history.get(&incarnation.incarnation))
+            .and_then(|lki| lki.token_image_ref.clone());
+        Some(Self {
+            incarnation,
+            values,
+            display: DisplayIdentity {
+                display_source: if token_image_ref.is_some() {
+                    DisplaySource::Token
+                } else {
+                    DisplaySource::Card
+                },
+                printed_ref: None,
+                token_image_ref,
+                token_art: None,
+            },
+        })
+    }
+}
+
+/// CR 608.2h + CR 707.2 + CR 400.7: the single authority for what a copy
+/// effect copies from a specific copy source, shared by `CopyTokenOf` and
+/// `BecomeCopy`. The ability's own source is copied with its current
+/// copiable values while it is still the incarnation the ability captured;
+/// once that object has left the public zone it was identified in, with its
+/// last-known copiable values for that exact incarnation. A later object
+/// under the same storage id is a new object and is never the source.
+/// `None` when the source supplies neither. The stack's bulk copy admission
+/// (`token::try_resolve_copy_batch`) reads it too, on each member's swapped
+/// ability, so admission and handler read one copy source per member.
+pub(crate) fn copy_source(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    referent: CopySourceReferent,
+) -> Option<CopySource> {
+    match referent {
+        CopySourceReferent::Object(id) => CopySource::live(state, id),
+        CopySourceReferent::OwnSource if ability.source_is_current(state) => {
+            CopySource::live(state, ability.source_id)
+        }
+        CopySourceReferent::OwnSource => {
+            CopySource::last_known(state, captured_own_source(ability)?)
+        }
+    }
+}
+
+/// CR 707.8a: the faces a token copy of `source` gets. `None` unless the copy
+/// source is a live double-faced permanent or double-faced card whose faces the
+/// token can carry; the token is then single-faced, with the copiable values of
+/// the face that's up (CR 707.8). A departed donor read through last-known
+/// information also gives `None`, a known gap rather than the CR 707.8a answer.
+///
+/// [`transform::stored_double_face`](crate::game::transform::stored_double_face)
+/// answers whether the donor is double-faced. The checks here are the copy's own:
+/// the donor must still be the object the copy read, a meld card's back face is
+/// not an other face a token can have, and a copied prepare spell or Room half is
+/// stored beside the faces (`GameObject::double_faced_token_alternative`).
+pub(crate) fn copied_double_faces(
+    state: &GameState,
+    source: &CopySource,
+) -> Option<CopiedDoubleFaces> {
+    // CR 400.7: the faces are read only from the object the copy read its values
+    // from, never from a later object under the same id. A departed donor read
+    // through last-known information therefore gives none, and its token is
+    // single-faced. That is a known gap, not the CR 707.8a answer, which would
+    // make that token double-faced too. Examples: Blade of Selves ("Equipped
+    // creature has myriad.") after the attacker has left; Saw in Half.
+    // Last-known information records no other face. The gap predates this change.
+    let obj = state
+        .objects
+        .get(&source.incarnation.object_id)
+        .filter(|obj| ObjectIncarnationRef::from_object(obj) == source.incarnation)?;
+    // CR 712.1 + CR 111.10i: only a double-faced card or double-faced token has an
+    // other face. `stored_double_face` refuses a face-down stash (CR 708.2), a
+    // merged permanent (CR 730.2i), a Room and every single-faced alternative.
+    let stored = crate::game::transform::stored_double_face(obj)?;
+    // Meld is refused. CR 712.4b: a meld card's back face determines
+    // characteristics only as half of a melded permanent; CR 712.4c: meld cards
+    // can't transform. `Mutate | Augment` were already refused above (CR 730.2i).
+    match obj.merge_kind {
+        Some(MergeKind::Meld) => return None,
+        Some(MergeKind::Mutate | MergeKind::Augment) | None => {}
+    }
+    if stored.layout_kind == Some(LayoutKind::Meld) {
+        return None;
+    }
+    // CR 712.8d/e/f: the token is up on the face its source showed.
+    let up = crate::game::transform::face_up(obj);
+    let hidden = if obj.layer1_copy_effect.is_some() {
+        // CR 707.8a + CR 613.2: each face is the copied object's face "as modified
+        // by any other copy effects that apply to that object", so under a Layer-1
+        // copy effect the other face takes the copied values, as the face up does.
+        let mut scratch = scratch_face_object();
+        crate::game::printed_cards::install_copiable_values_as_base(&mut scratch, &source.values);
+        let mut face = crate::game::printed_cards::snapshot_object_base_face(&scratch);
+        face.layout_kind = stored.layout_kind;
+        face.is_swap_snapshot = stored.is_swap_snapshot;
+        face
+    } else {
+        // CR 707.2: the stored face is that face's copiable values.
+        stored.clone()
+    };
+    Some(CopiedDoubleFaces {
+        hidden: Box::new(hidden),
+        up,
+    })
+}
+
+/// CR 707.8a + CR 707.9a/b/d: a double-faced copy token's stored face with the
+/// copy's exceptions applied, as they apply to the face that's up. Soul
+/// Separator's rulings: "If you copy a double-faced creature card with Soul
+/// Separator's ability, the resulting Spirit token will be a double-faced token.
+/// The listed exceptions will apply to both the front and back faces of the
+/// Spirit token." and "If the copied creature card has an ability that defines
+/// its power and toughness, such as that of Sage of Ancient Lore, the Spirit
+/// token will still have base power and toughness 1/1."
+///
+/// `cda_overriding` prunes the characteristic-defining abilities the exceptions
+/// override (CR 707.9d), `extra_keywords` are granted (CR 707.9a) and `stamped`
+/// are stamped through the one copy-exception folder (CR 707.9b). Every one of
+/// them writes the face's base, so the exceptions survive the token's own
+/// transforms. Returns the face unchanged when all three are empty.
+pub(crate) fn fold_copy_exceptions_into_face(
+    face: &BackFaceData,
+    cda_overriding: &[ContinuousModification],
+    extra_keywords: &[Keyword],
+    stamped: &[ContinuousModification],
+    all_creature_types: &[String],
+) -> BackFaceData {
+    if cda_overriding.is_empty() && extra_keywords.is_empty() && stamped.is_empty() {
+        return face.clone();
+    }
+    let mut scratch = scratch_face_object();
+    crate::game::printed_cards::apply_back_face_to_object(&mut scratch, face.clone());
+    let pruned = super::copy_exception::prune_copy_exception_overridden_cdas(
+        &scratch.base_static_definitions,
+        cda_overriding,
+    );
+    scratch.base_static_definitions = Arc::new(pruned.definitions.clone());
+    scratch.static_definitions = Arc::new(pruned.definitions).into();
+    super::token::grant_copy_extra_keywords(&mut scratch, extra_keywords);
+    apply_immediate_copy_token_modifications_to_object(&mut scratch, stamped, all_creature_types);
+    let mut folded = crate::game::printed_cards::snapshot_object_base_face(&scratch);
+    folded.layout_kind = face.layout_kind;
+    folded.is_swap_snapshot = face.is_swap_snapshot;
+    folded
+}
+
+/// A detached object a stored face is installed on to be read back as a face. It
+/// never enters `GameState`.
+fn scratch_face_object() -> GameObject {
+    GameObject::new(
+        ObjectId(0),
+        CardId(0),
+        PlayerId(0),
+        String::new(),
+        Zone::Battlefield,
+    )
+}
+
+/// CR 707.2: whether `effect` copies its ability's own source: "a copy of
+/// this creature" as a token (`CopyTokenOf`) or as a permanent becoming a copy
+/// (`BecomeCopy`), and the keyword handlers that build such a copy (Myriad,
+/// CR 702.116a; Encore, CR 702.141a).
+pub(crate) fn copies_own_source(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::CopyTokenOf {
+            target: TargetFilter::SelfRef,
+            source_filter: None,
+            ..
+        } | Effect::BecomeCopy {
+            target: TargetFilter::SelfRef,
+            ..
+        } | Effect::Myriad
+            | Effect::Encore
+    )
+}
+
+/// CR 104.4b + CR 608.2h: an inferred own-source "copy of it" (`ParentTarget` /
+/// `None`, no source filter) may read the source's last-known copiable values
+/// through `copy_source(OwnSource)`, so loop normalisation must keep them. A
+/// shape-level superset: retaining an entry another referent never reads is
+/// harmless.
+fn may_infer_own_copy_source(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::CopyTokenOf {
+            target: TargetFilter::ParentTarget | TargetFilter::None,
+            source_filter: None,
+            ..
+        }
+    )
+}
+
+/// CR 400.7 + CR 608.2h: the `CopyTokenOf` ability a keyword handler builds to
+/// copy its own source (Myriad, CR 702.116a; Encore, CR 702.141a). It carries
+/// the outer ability's captured source identity, so `copy_source` binds the
+/// incarnation the outer ability captured.
+pub(crate) fn own_source_copy_ability(effect: Effect, outer: &ResolvedAbility) -> ResolvedAbility {
+    let mut ability = ResolvedAbility::new(effect, vec![], outer.source_id, outer.controller);
+    ability.trigger_source = outer.trigger_source.clone();
+    ability.source_incarnation = outer.source_incarnation;
+    ability
+}
+
+/// CR 400.7 + CR 400.7j: the source incarnation an ability captured: a
+/// trigger's source identity, or the incarnation an activated ability's
+/// source had as the ability was put on the stack (for Embalm, Eternalize and
+/// Encore, the exile incarnation its own cost created).
+fn captured_own_source(ability: &ResolvedAbility) -> Option<ObjectIncarnationRef> {
+    match &ability.trigger_source {
+        Some(source) => Some(source.identity.reference),
+        None => ability
+            .source_incarnation
+            .map(|incarnation| ObjectIncarnationRef::of(ability.source_id, incarnation)),
+    }
+}
+
+/// CR 104.4b + CR 608.2h: collect the source incarnations whose last-known
+/// copiable values `ability`, or a branch of it, can still read as its own
+/// copy source. `GameState::normalize_for_loop` reads them before it erases
+/// the abilities' identities.
+pub(crate) fn collect_own_copy_sources(
+    ability: &ResolvedAbility,
+    sources: &mut HashSet<ObjectIncarnationRef>,
+) {
+    if copies_own_source(&ability.effect) || may_infer_own_copy_source(&ability.effect) {
+        sources.extend(captured_own_source(ability));
+    }
+    for (_, branch) in ability.child_links() {
+        collect_own_copy_sources(branch, sources);
+    }
+}
+
+/// CR 707.2 + CR 614.1a: Route a queue of `PendingCopyTokenBatch`es through the
+/// `CreateToken` replacement pipeline and apply path. Single authority shared by
+/// `CopyTokenOf` (battlefield-sourced copies) and `CreateTokenCopyFromPool`
+/// (format-pool-sourced copies) so the replacement + apply path is never
+/// duplicated. The drain can pause and resume when a CR 616.1 replacement choice
+/// is required.
+pub(crate) fn drive_copy_token_batches(
+    state: &mut GameState,
+    remaining: VecDeque<PendingCopyTokenBatch>,
+    effect_kind: EffectKind,
+    source_id: ObjectId,
+    events: &mut Vec<GameEvent>,
+) {
+    drain_copy_token_resolution(
+        state,
+        PendingCopyTokenResolution {
+            created_ids: Vec::new(),
+            remaining,
+            effect_kind,
+            source_id,
+            referent_set: None,
+            offered_batch: OfferedBatchCustody::Settled,
+        },
+        events,
+    );
+}
+
+pub(crate) fn drain_pending_copy_token_resolution(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) {
+    // CR 614.12a + CR 608.2c: retiring a member's as-enters roll can
+    // expose its copy owner before the priority boundary commits that liminal
+    // member. The owner still owes that entry and its batch, so neither its
+    // next batch nor its completed "those tokens" result may run yet. The
+    // entry's recorded producer distinguishes it from a nested copy owner.
+    let pending_entry_producer = match state.pending_liminal_entry_resume.as_ref() {
+        Some(PendingLiminalEntryResume::Token { source_id, .. }) => state
+            .liminal_entries
+            .get(source_id)
+            .map(|entry| entry.source_id),
+        Some(PendingLiminalEntryResume::Meld { .. }) | None => None,
+    };
+    if state
+        .active_copy_token()
+        .is_some_and(|owner| Some(owner.source_id) == pending_entry_producer)
+    {
+        return;
+    }
+    // CR 603.6a + CR 603.3b: the inline liminal terminal also enters here.
+    // Claim its entries before taking the owner or resuming a later instruction.
+    let copy_owner = state.active_copy_token().cloned();
+    super::token::handoff_paused_liminal_copy_token_batch(state, copy_owner.as_ref(), events);
+    let Some(pending) = state
+        .take_active_copy_token()
+        .expect("copy-token drain may consume only the active CopyToken frame")
+    else {
+        return;
+    };
+    drain_copy_token_resolution(state, pending, events);
+    // CR 608.2c + CR 117.3b: a continuation left directly beneath the consumed
+    // owner resumes now, before any player receives priority.
+    if matches!(
+        state.waiting_for,
+        crate::types::game_state::WaitingFor::Priority { .. }
+    ) && state.active_ability_continuation().is_some()
+    {
+        super::drain_pending_continuation(state, events);
+    }
+}
+
+fn drain_copy_token_resolution(
+    state: &mut GameState,
+    pending: PendingCopyTokenResolution,
+    events: &mut Vec<GameEvent>,
+) {
+    crate::game::pre_entry_view::with_copy_owner_board(state, |state| {
+        drain_copy_token_resolution_on_board(state, pending, events);
+    });
+}
+
+fn drain_copy_token_resolution_on_board(
+    state: &mut GameState,
+    mut pending: PendingCopyTokenResolution,
+    events: &mut Vec<GameEvent>,
+) {
+    // CR 614.6 + CR 608.2c: the batch this owner offered was answered, and no delivery handed
+    // its tokens over. The answer replaced its creation with a different one, which has now run
+    // above this owner, so this owner's batch tokens are the tokens that creation published.
+    // Ledger contract: only the batch's own replacement work runs above a parked owner, and
+    // every CreateToken continuation is a substitute, so nothing else wrote the ledger since
+    // that creation completed. Settled first, so a later batch's prompt marks afresh.
+    if !pending.offered_batch.is_settled() {
+        pending.offered_batch = OfferedBatchCustody::Settled;
+        pending
+            .created_ids
+            .extend(state.last_created_token_ids.clone());
+    }
+    while let Some(mut batch) = pending.remaining.pop_front() {
+        if batch.count == 0 {
+            continue;
+        }
+        // CR 707.9b + CR 608.2h: settle donor-dependent exceptions up front for
+        // the liminal entry consult. Keep a copied roll with a dynamic exception
+        // on the placed-token route: that route records the unsupported roll
+        // and still applies the donor-dependent values.
+        if let Some(donor) = batch.copy.donor.filter(|_| {
+            !batch.copy.additional_modifications.is_empty()
+                && !crate::game::replacement::copy_entrant_has_own_entry_roll(&batch.copy.values)
+        }) {
+            for modification in &mut batch.copy.additional_modifications {
+                if matches!(
+                    modification,
+                    ContinuousModification::SetPowerDynamic { .. }
+                        | ContinuousModification::SetToughnessDynamic { .. }
+                ) {
+                    *modification = resolve_copy_token_modification(
+                        state,
+                        modification,
+                        batch.owner,
+                        donor.object_id,
+                    );
+                }
+            }
+        }
+        let stack_depth_before_batch = state.resolution_stack.capture_child_boundary();
+        let mut spec = copy_entry_probe_spec(&batch.copy, &state.all_creature_types);
+        spec.tapped = batch.copy.tapped;
+        spec.enters_attacking = batch.copy.enters_attacking;
+        let enter_tapped = EtbTapState::from_seeded_tapped(batch.copy.tapped);
+        let proposed = ProposedEvent::CreateToken {
+            redirected_to: None,
+            owner: batch.owner,
+            spec: Box::new(spec),
+            copy: Some(batch.copy),
+            enter_tapped,
+            count: batch.count,
+            // CR 614.6 + CR 616.1: a copy-token-substitution continuation
+            // (Moonlit Meditation) inherits the originating event's applied set
+            // so the substitution replacement cannot re-prompt on its own copy
+            // tokens. `None` for normal copy effects (Springheart, Twinflame,
+            // populate) → empty set → byte-identical to the prior
+            // `HashSet::new()`. A *different* source's replacement (Doubling
+            // Season's rid) is absent from the seed and still applies (#1511).
+            appended: Vec::new(),
+            applied: state
+                .post_replacement_token_choice_applied
+                .clone()
+                .unwrap_or_default(),
+        };
+
+        // CR 614.6 + CR 608.2c: this offered batch owns only its creation's
+        // ledger. Its earlier batches are already in `pending.created_ids`.
+        // Reset before replacements run so prevention publishes nothing, while
+        // a substitute creation may still publish the ids this owner adopts.
+        state.last_created_token_ids.clear();
+        // CR 111.1 + CR 614.12: this frame is off the resolution stack while the batch is
+        // scanned and delivered, so the tokens its earlier batches created (co-entrants of
+        // this one) are published for that window. Every park below runs after the window
+        // closes, so a parked frame is never shadowed by the publication.
+        let delivery = publish_committed_copy_tokens(state, pending.created_ids.clone(), |state| {
+            match crate::game::replacement::replace_event(state, proposed, events) {
+                crate::game::replacement::ReplacementResult::Execute(event) => {
+                    // CR 614.1a + CR 608.2c: the frame is taken, so the delivery
+                    // authority leaves the ledger as this batch's whole created
+                    // referent, appended batches included: own batch first on
+                    // completion, `[]` after a batch paused with more of the event
+                    // still to deliver (the event publishes to this frame when it
+                    // finishes), and the ids so far after its last batch, a copy
+                    // batch, paused. `Suppress`: this frame's drain emits the
+                    // effect's terminal `EffectResolved{CopyTokenOf}`, so no pause
+                    // of the event owes one.
+                    let completed =
+                        super::token::apply_create_token_after_replacement_with_created_ids(
+                            state,
+                            event,
+                            Vec::new(),
+                            crate::types::game_state::PendingEffectResolutionEvent::Suppress,
+                            events,
+                        );
+                    if completed {
+                        CopyBatchDelivery::Completed
+                    } else {
+                        CopyBatchDelivery::Paused
+                    }
+                }
+                crate::game::replacement::ReplacementResult::Prevented => {
+                    CopyBatchDelivery::Prevented
+                }
+                crate::game::replacement::ReplacementResult::NeedsChoice(player) => {
+                    CopyBatchDelivery::NeedsChoice(player)
+                }
+            }
+        });
+        match delivery {
+            CopyBatchDelivery::Completed => {
+                pending
+                    .created_ids
+                    .extend(state.last_created_token_ids.clone());
+            }
+            CopyBatchDelivery::Paused => {
+                pending
+                    .created_ids
+                    .extend(state.last_created_token_ids.clone());
+                let copy_owner = pending.clone();
+                park_copy_token_after_current_batch(state, pending, stack_depth_before_batch);
+                // CR 603.6a + CR 603.3b: earlier completed batches and this
+                // batch's committed prefix still owe their entry observers.
+                super::token::handoff_paused_liminal_copy_token_batch(
+                    state,
+                    Some(&copy_owner),
+                    events,
+                );
+                return;
+            }
+            CopyBatchDelivery::Prevented => {}
+            CopyBatchDelivery::NeedsChoice(player) => {
+                // CR 614.6 + CR 608.2c: this batch's creation event waits on a replacement
+                // answer. Its tokens are owed to this owner: handed over by the delivery that
+                // creates them, or, when the answer replaces the event with a different
+                // creation, adopted from that creation when this owner resumes.
+                pending.offered_batch = OfferedBatchCustody::AtReplacementPrompt;
+                park_copy_token_after_current_batch(state, pending, stack_depth_before_batch);
+                state.waiting_for =
+                    crate::game::replacement::replacement_choice_waiting_for(player, state);
+                // CR 603.6a + CR 603.3b: the new batch has no entries yet;
+                // collect the completed batches held by the re-parked owner.
+                let copy_owner = state.active_copy_token().cloned();
+                super::token::handoff_paused_liminal_copy_token_batch(
+                    state,
+                    copy_owner.as_ref(),
+                    events,
+                );
+                return;
+            }
+        }
+    }
+
+    // CR 608.2c + CR 603.7a: the producing instruction's "those tokens" is every token this
+    // resolution created, across every pause. Re-enter the producer's chain set and publish
+    // the whole referent through the one tracked-set authority, so the tail parked beneath
+    // this owner binds it.
+    if let Some(set) = pending.referent_set {
+        state.chain_tracked_set_id = Some(set);
+        let cause = super::this_way_cause_for_action(pending.effect_kind, None);
+        super::publish_tracked_set_with_causes(
+            state,
+            pending.created_ids.iter().map(|id| (*id, cause)).collect(),
+        );
+    }
+
+    // CR 603.7 + CR 701.36a: Record created token IDs so sub-abilities can
+    // reference them via `TargetFilter::LastCreated` ("the token created this
+    // way", "it") and so "those tokens" plural anaphor in delayed triggers
+    // captures the full list. Mirrors `token::apply_create_token`.
+    state.last_created_token_ids = pending.created_ids;
+
+    events.push(GameEvent::EffectResolved {
+        kind: pending.effect_kind,
+        source_id: pending.source_id,
+        subject: None,
+    });
+}
+
+/// What one copy batch's CreateToken event did inside its publication window; the owner is
+/// parked, if at all, after the window closes.
+enum CopyBatchDelivery {
+    Completed,
+    /// A batch member paused; the owner parks below the child stack it raised.
+    Paused,
+    Prevented,
+    /// CR 616.1: the event itself needs a replacement-order choice by this player.
+    NeedsChoice(crate::types::player::PlayerId),
+}
+
+/// CR 111.1 + CR 614.12: run `deliver` with `committed` published as the tokens a copy-token
+/// resolution whose owner frame is off the resolution stack has already created, then restore
+/// the previous publication (a nested resolution can't clobber an outer one). The single
+/// writer of `GameState::active_copy_token_resolution_tokens`; its windows are the inline
+/// drain (`drain_copy_token_resolution`) and a token event's delivery while it holds the
+/// owner (`token::deliver_with_held_copy_owner`: a compound event, or a single-batch copy
+/// event).
+pub(crate) fn publish_committed_copy_tokens<R>(
+    state: &mut GameState,
+    committed: Vec<ObjectId>,
+    deliver: impl FnOnce(&mut GameState) -> R,
+) -> R {
+    let outer = state.active_copy_token_resolution_tokens.replace(committed);
+    let delivered = deliver(state);
+    state.active_copy_token_resolution_tokens = outer;
+    delivered
+}
+
+/// CR 614.12 + CR 111.1 (Clone Legion ruling 2015-02-25): the tokens entering in the same
+/// event as `entrant`, which don't yet exist as it enters: the ones its copy-token
+/// resolution already created, plus `batch_prefix`, the ones its own batch (or its compound
+/// event's earlier positions) already created. The resolution's tokens are the published
+/// ones while its owner frame is off the resolution stack, otherwise the innermost parked
+/// `CopyToken` frame's (an outer resolution's frame is never read while one is published).
+/// Deduplicated, in order, without `entrant`. Linear in the resolution's tokens plus
+/// `batch_prefix`: membership is a hash-set probe, so a token-multiplied batch whose every
+/// entrant asks for its co-entrants costs quadratic, not cubic, time overall.
+pub(crate) fn copy_token_co_entrants(
+    state: &GameState,
+    entrant: ObjectId,
+    batch_prefix: &[ObjectId],
+) -> Vec<ObjectId> {
+    let resolution: &[ObjectId] = match &state.active_copy_token_resolution_tokens {
+        Some(published) => published,
+        None => state
+            .resolution_stack
+            .iter()
+            .filter_map(|frame| match frame {
+                crate::types::resolution::ResolutionFrame::CopyToken(owner) => {
+                    Some(owner.created_ids.as_slice())
+                }
+                crate::types::resolution::ResolutionFrame::AbilityContinuation(..)
+                | crate::types::resolution::ResolutionFrame::RepeatFor(..)
+                | crate::types::resolution::ResolutionFrame::RepeatUntil(..)
+                | crate::types::resolution::ResolutionFrame::RepeatedOptionalPayment(..)
+                | crate::types::resolution::ResolutionFrame::ChangeZone(..)
+                | crate::types::resolution::ResolutionFrame::BatchDelivery(..)
+                | crate::types::resolution::ResolutionFrame::CounterMoves(..)
+                | crate::types::resolution::ResolutionFrame::CounterRemovals(..)
+                | crate::types::resolution::ResolutionFrame::CounterAdditions(..)
+                | crate::types::resolution::ResolutionFrame::DebugCardEntries(..)
+                | crate::types::resolution::ResolutionFrame::EachPlayerCopyChosen(..)
+                | crate::types::resolution::ResolutionFrame::ChooseOneOf(..)
+                | crate::types::resolution::ResolutionFrame::VoteBallot(..)
+                | crate::types::resolution::ResolutionFrame::PerPlayerZoneChoice(..)
+                | crate::types::resolution::ResolutionFrame::PerCategoryZoneChoice(..)
+                | crate::types::resolution::ResolutionFrame::OptionalEffect(..)
+                | crate::types::resolution::ResolutionFrame::CoinFlip(..)
+                | crate::types::resolution::ResolutionFrame::DieRoll(..)
+                | crate::types::resolution::ResolutionFrame::Proliferate(..)
+                | crate::types::resolution::ResolutionFrame::MultiDraw(..)
+                | crate::types::resolution::ResolutionFrame::Discard(..)
+                | crate::types::resolution::ResolutionFrame::ConniveReentry(..)
+                | crate::types::resolution::ResolutionFrame::LifeTotalAssignment(..)
+                | crate::types::resolution::ResolutionFrame::SpellResolution(..)
+                | crate::types::resolution::ResolutionFrame::MutateMerge(..)
+                | crate::types::resolution::ResolutionFrame::CipherEncode(..)
+                | crate::types::resolution::ResolutionFrame::EntryAttackSeat(..)
+                | crate::types::resolution::ResolutionFrame::PostReplacement(..) => None,
+            })
+            .last()
+            .unwrap_or_default(),
+    };
+    let capacity = resolution.len() + batch_prefix.len();
+    let mut seen: HashSet<ObjectId> = HashSet::with_capacity(capacity);
+    let mut co_entrants: Vec<ObjectId> = Vec::with_capacity(capacity);
+    for id in resolution.iter().chain(batch_prefix) {
+        #[cfg(feature = "test-support")]
+        crate::game::perf_counters::record_copy_entrant_membership_probe();
+        if *id != entrant && seen.insert(*id) {
+            co_entrants.push(*id);
+        }
+    }
+    co_entrants
+}
+
+/// CR 614.12 + CR 111.1 (Clone Legion ruling 2015-02-25): the tokens entering in the same
+/// event as `entrant`, a token whose entry is still being decided (a liminal entry: its
+/// batch prefix is the entry's `created_ids`) or completed after its copy-target answer
+/// (committed: its batch is the ledger its finalize published, `last_created_token_ids`,
+/// which lists it, the same ledger the batch continuation resumes from). Unioned with the
+/// copy-token resolution's tokens by [`copy_token_co_entrants`]. Empty for any other
+/// object: a card entrant keeps the live read.
+pub(crate) fn entering_token_co_entrants(state: &GameState, entrant: ObjectId) -> Vec<ObjectId> {
+    if let Some(entry) = state
+        .liminal_entries
+        .get(&entrant)
+        .filter(|entry| entry.object.is_token_projection())
+    {
+        return copy_token_co_entrants(state, entrant, &entry.created_ids);
+    }
+    // The ledger is assigned by this entrant's own finalize, so listing it is what proves
+    // the ledger is its batch; a card, or a placed token at its payment prompt, is never in it.
+    if state.last_created_token_ids.contains(&entrant) {
+        return copy_token_co_entrants(state, entrant, &state.last_created_token_ids);
+    }
+    Vec::new()
+}
+
+/// Park a copy-token owner as the direct paused frame, or below the complete
+/// child stack its batch raised. The captured boundary preserves the actual
+/// parent/child relationship without searching for a buried CopyToken frame.
+///
+/// The single authority for re-parking a CopyToken owner around a child stack,
+/// shared with the token-event delivery authority
+/// (`token::drive_token_event_delivery`), which detaches the owner while it
+/// delivers a compound CreateToken event.
+pub(crate) fn park_copy_token_after_current_batch(
+    state: &mut GameState,
+    pending: PendingCopyTokenResolution,
+    stack_depth_before_batch: ChildStackDepth,
+) {
+    match state
+        .resolution_stack
+        .capture_child_boundary()
+        .cmp(&stack_depth_before_batch)
+    {
+        std::cmp::Ordering::Less => {
+            panic!("copy-token batch removed a parent frame before it could be re-parked")
+        }
+        std::cmp::Ordering::Equal => state.push_copy_token(pending),
+        std::cmp::Ordering::Greater => state
+            .insert_copy_token_parent_at_child_boundary(pending, stack_depth_before_batch)
+            .expect("copy-token parent must be inserted below its complete child stack"),
+    }
+}
+
+/// CR 601.2f + CR 603.4: Triggers gated on a cast-time additional-cost payment
+/// ("if its offspring cost was paid", "if it was kicked") are inert on a token
+/// copy — the token was created, not cast, so the payment condition can never
+/// hold. Only the payment-gated condition is stripped: persistent battlefield
+/// abilities that *observe* spell casts (Magecraft's `SpellCastOrCopy`,
+/// "whenever you cast a [type] spell" `SpellCast`) are copiable text per
+/// CR 707.2 and must survive on the copy.
+fn is_cast_payment_gated_trigger(trig: &TriggerDefinition) -> bool {
+    matches!(
+        trig.condition,
+        Some(TriggerCondition::AdditionalCostPaid { .. })
+    )
+}
+
+/// CR 601.2f + CR 707.2: Remove spell-casting-only copiable characteristics
+/// from a freshly created copy token (Offspring/Kicker keywords, "if it was
+/// kicked" / "if offspring was paid" ETB triggers, etc.).
+fn strip_spell_casting_copiable_characteristics(obj: &mut GameObject) {
+    obj.keywords.retain(|kw| !kw.is_spell_casting_only());
+    obj.base_keywords.retain(|kw| !kw.is_spell_casting_only());
+    obj.trigger_definitions
+        .retain(|entry| !is_cast_payment_gated_trigger(entry.definition()));
+    Arc::make_mut(&mut obj.base_trigger_definitions)
+        .retain(|trig| !is_cast_payment_gated_trigger(trig));
+}
+
+/// CR 111.10 + CR 702.175a: When a card-related token preset exists (Offspring,
+/// set-specific copy tokens), route the copy through the token art database
+/// instead of rendering as a card-copy with a "Copy" badge.
+fn resolve_predefined_token_display(
+    state: &mut GameState,
+    copy_source_id: ObjectId,
+    token_id: ObjectId,
+) {
+    let body = {
+        let token = match state.objects.get(&token_id) {
+            Some(token) if token.display_source == DisplaySource::Card => token,
+            _ => return,
+        };
+        TokenCharacteristics {
+            display_name: token.name.clone(),
+            power: token.power,
+            toughness: token.toughness,
+            loyalty: None,
+            core_types: token.card_types.core_types.clone(),
+            subtypes: token.card_types.subtypes.clone(),
+            supertypes: token.card_types.supertypes.clone(),
+            colors: token.color.clone(),
+            keywords: token.keywords.clone(),
+        }
+    };
+    let Some(image_ref) =
+        crate::game::token_presets::find_card_linked_copy_token_ref(state, copy_source_id, &body)
+    else {
+        return;
+    };
+    if let Some(token) = state.objects.get_mut(&token_id) {
+        token.display_source = DisplaySource::Token;
+        token.token_image_ref = Some(image_ref);
+    }
+}
+
+/// CR 707.2: Finalize a copy token after P/T exceptions and cast-only stripping.
+pub(crate) fn finalize_copied_token(
+    state: &mut GameState,
+    copy_source_id: ObjectId,
+    token_id: ObjectId,
+) {
+    if let Some(token) = state.objects.get_mut(&token_id) {
+        strip_spell_casting_copiable_characteristics(token);
+    }
+    resolve_predefined_token_display(state, copy_source_id, token_id);
+}
+
+/// CR 614.6 + CR 111.1 + CR 707.2: deliver a copy batch whose entry an applied
+/// replacement sent to `zone` instead of the battlefield (Hallowed Moonlight:
+/// "exile it instead"). Each token is created in `zone` from its copied values
+/// and its creation is published exactly as a battlefield creation is (the
+/// first-creation set, the created-token ledger, `TokenCreated`,
+/// `last_created_token_ids`), but nothing of the battlefield entry happens:
+/// no entry counters, abilities, attacking, attachment or delayed sacrifice. The
+/// token ceases to exist at the next state-based action check (CR 111.7,
+/// CR 704.5d).
+///
+/// Donor-dependent power/toughness exceptions are settled into fixed values for the birth
+/// (CR 707.9b); entry counters describe the permanent on the battlefield and are not part of it.
+#[allow(clippy::too_many_arguments)]
+fn apply_redirected_copy_batch(
+    state: &mut GameState,
+    token_owner: crate::types::player::PlayerId,
+    copy: CopyTokenSpec,
+    enter_tapped: EtbTapState,
+    zone: Zone,
+    final_count: u32,
+    initial_created_ids: Vec<ObjectId>,
+    events: &mut Vec<GameEvent>,
+) -> CopyTokenApplyStatus {
+    let mut created_ids = initial_created_ids;
+    created_ids.reserve(final_count as usize);
+    let mut copy = copy;
+    // CR 707.9b: a donor-dependent power/toughness exception (Saw in Half: "half that creature's
+    // power") is part of the copy's copiable values, so it is settled against the donor now (live,
+    // else last-known per CR 608.2h) into the fixed value the birth is journaled and replayed
+    // with. An entry counter describes the permanent on the battlefield, which this token never
+    // reaches (CR 614.6), so it is not part of the birth.
+    let donor_object = copy.donor.map_or(copy.source_id, |donor| donor.object_id);
+    copy.additional_modifications
+        .retain_mut(|modification| match modification {
+            ContinuousModification::SetPowerDynamic { .. }
+            | ContinuousModification::SetToughnessDynamic { .. } => {
+                *modification =
+                    resolve_copy_token_modification(state, modification, token_owner, donor_object);
+                true
+            }
+            ContinuousModification::AddCounterOnEnter { .. } => false,
+            _ => true,
+        });
+    let name = copy.values.name.clone();
+    let body_modifications = if copy.additional_modifications.is_empty() {
+        ResolvedCopyBodyModifications::NoExceptions
+    } else {
+        ResolvedCopyBodyModifications::Folded {
+            modifications: copy.additional_modifications.clone(),
+            all_creature_types: state.all_creature_types.clone(),
+        }
+    };
+    for _ in 0..final_count {
+        let token_id = zones::create_object(state, CardId(0), token_owner, name.clone(), zone);
+        let entry_timestamp = state.next_timestamp();
+        let resulting_tapped = enter_tapped.resolve(copy.tapped);
+        let turn_number = state.turn_number;
+        let created_reference = state.objects.get_mut(&token_id).map(|token| {
+            super::token::materialize_token_copy_body(
+                token,
+                &copy,
+                &body_modifications,
+                turn_number,
+                entry_timestamp,
+                resulting_tapped,
+            );
+            ObjectIncarnationRef::from_object(token)
+        });
+        if let Some(object) = created_reference {
+            let cause = state.current_or_begin_rules_execution_node();
+            let command = ResolvedTokenCreationCommand {
+                object,
+                owner: token_owner,
+                entry_timestamp,
+                entry_turn: turn_number,
+                body: ResolvedTokenBody::Copy {
+                    copy: Box::new(copy.clone()),
+                    modifications: body_modifications.clone(),
+                },
+                resulting_tapped,
+                entry_choices: Vec::new(),
+                resulting_next_object_id: state.next_object_id,
+                entry_zone: Some(zone),
+                cause,
+            };
+            state
+                .resolved_rules_journal
+                .record_token_creation(command)
+                .expect("resolved copy-token creation must have a live journal cause");
+        }
+        super::token::publish_redirected_token_creation(
+            state,
+            token_id,
+            zone,
+            name.clone(),
+            copy.source_id,
+            events,
+        );
+        created_ids.push(token_id);
+        state.last_created_token_ids = created_ids.clone();
+    }
+    state.last_created_token_ids = created_ids.clone();
+    CopyTokenApplyStatus {
+        created_ids,
+        completion: CopyTokenApplyCompletion::Completed,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_copy_token_after_replacement(
+    state: &mut GameState,
+    token_owner: crate::types::player::PlayerId,
+    copy: CopyTokenSpec,
+    enter_tapped: EtbTapState,
+    enter_with_counters: Vec<(crate::types::counter::CounterType, u32)>,
+    final_count: u32,
+    events: &mut Vec<GameEvent>,
+) -> CopyTokenApplyStatus {
+    apply_copy_token_after_replacement_with_created_ids(
+        state,
+        token_owner,
+        copy,
+        enter_tapped,
+        enter_with_counters,
+        final_count,
+        Vec::new(),
+        None,
+        events,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_copy_token_after_replacement_with_created_ids(
+    state: &mut GameState,
+    token_owner: crate::types::player::PlayerId,
+    copy: CopyTokenSpec,
+    enter_tapped: EtbTapState,
+    enter_with_counters: Vec<(crate::types::counter::CounterType, u32)>,
+    final_count: u32,
+    initial_created_ids: Vec<ObjectId>,
+    redirected_to: Option<Zone>,
+    events: &mut Vec<GameEvent>,
+) -> CopyTokenApplyStatus {
+    crate::game::pre_entry_view::with_copy_batch_board(state, |state| {
+        apply_copy_token_batch_on_board(
+            state,
+            token_owner,
+            copy,
+            enter_tapped,
+            enter_with_counters,
+            final_count,
+            initial_created_ids,
+            redirected_to,
+            events,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_copy_token_batch_on_board(
+    state: &mut GameState,
+    token_owner: crate::types::player::PlayerId,
+    copy: CopyTokenSpec,
+    enter_tapped: EtbTapState,
+    enter_with_counters: Vec<(crate::types::counter::CounterType, u32)>,
+    final_count: u32,
+    initial_created_ids: Vec<ObjectId>,
+    redirected_to: Option<Zone>,
+    events: &mut Vec<GameEvent>,
+) -> CopyTokenApplyStatus {
+    // CR 800.4b + CR 707.2: a token copy is a created token like any other; when
+    // its settled controller has left the game none of this batch is created.
+    // Returning before any per-token or liminal work keeps the created referent
+    // to what an earlier pass of this batch already created; every caller
+    // publishes `created_ids` into the ledger that owns the batch.
+    if super::token::token_creator_has_left_game(state, token_owner) {
+        return CopyTokenApplyStatus {
+            created_ids: initial_created_ids,
+            completion: CopyTokenApplyCompletion::Completed,
+        };
+    }
+    // CR 614.6 + CR 111.1: an applied replacement sent this batch's entry
+    // elsewhere (a non-liminal batch: a liminal one is asked at each entrant's
+    // `TokenEntry`). The tokens are created in that zone and never enter.
+    if let Some(zone) = redirected_to {
+        return apply_redirected_copy_batch(
+            state,
+            token_owner,
+            copy,
+            enter_tapped,
+            zone,
+            final_count,
+            initial_created_ids,
+            events,
+        );
+    }
+    let CopyTokenSpec {
+        mut values,
+        display,
+        extra_keywords,
+        additional_modifications,
+        tapped,
+        enters_attacking,
+        attack_request,
+        sacrifice_at,
+        source_id,
+        controller,
+        donor,
+        double_faced,
+    } = copy;
+    let name = values.name.clone();
+    // CR 508.4: a resume carries the earlier ids so they are republished, but a
+    // token's destination is selected by its ordinal among the tokens this call
+    // creates, so the carried ids do not shift it.
+    let prefix_len = initial_created_ids.len();
+    let mut created_ids = initial_created_ids;
+    created_ids.reserve(final_count as usize);
+    if let Some(loyalty) = copy_starting_loyalty_override(&additional_modifications) {
+        values.loyalty = Some(loyalty);
+        values.printed_loyalty = Some(PrintedLoyalty::Fixed(loyalty));
+    }
+    let copied_loyalty = values.loyalty;
+
+    // CR 306.5b + CR 707.2 + CR 707.9b: A token that's a copy of a planeswalker
+    // enters with loyalty counters equal to the copied loyalty, except a copy
+    // exception may set that starting loyalty to a different value. CR 306.5c
+    // makes the counter map the single source of truth for loyalty. The copy
+    // path builds the object directly (not through the ZoneChange ETB-counter
+    // seeding used by cast/play/effect entries), so seed the intrinsic loyalty
+    // counters here, ahead of any explicit `enter_with_counters`, routing them
+    // through `add_counter_with_replacement` below so Doubling Season etc. apply
+    // (CR 614.1a). Without this a copied planeswalker enters with 0 loyalty
+    // counters and dies immediately to CR 704.5i. Copies don't track battle
+    // defense (`CopiableValues` has no defense field), so only loyalty is seeded.
+    // CR 306.5b loyalty + CR 614.1c "~ enters with N counters" self-replacement
+    // (Atraxa's Skitterfang's three oil counters, Hangarback/Walking Ballista
+    // +1/+1, etc.) + any explicit counters the creating effect added. The copy
+    // path bypasses the ZoneChange replacement pass, so the copied card's
+    // intrinsic "enters with counters" replacement is seeded here from its
+    // copiable replacement set rather than firing during entry.
+    //
+    // The three parts are held apart because only the copied "enters with" abilities are
+    // gated per token (CR 614.12, below): `intrinsic` is the CR 306.5b loyalty ability. It
+    // is an ability and is removable, but it has no `ReplacementDefinition` for
+    // `retains_replacement` to compare, so this seam leaves it ungated. Residual (stated,
+    // red): a token copy that would exist as a creature planeswalker under a creature
+    // remover (Gideon Blackblade copied on its controller's turn; Applied Geometry of a
+    // planeswalker) should enter with no loyalty counters and then go to the graveyard
+    // (CR 704.5i). `enter_with_counters` are the creating effect's own, not an ability of
+    // the token, so they are never gated.
+    let intrinsic = crate::game::printed_cards::intrinsic_face_counters(copied_loyalty, None);
+    let own_entries: Vec<(
+        crate::types::ability::ReplacementDefinition,
+        crate::types::counter::CounterType,
+        u32,
+    )> = crate::game::printed_cards::self_etb_counter_replacement_entries(
+        &values.replacement_definitions,
+    )
+    .map(|(def, counter_type, count)| (def.clone(), counter_type, count))
+    .collect();
+
+    // Liminal choice is loop-invariant; compute once so the terminal drain below
+    // can mirror the former continue_liminal_copy_token_batch tail for this path.
+    let liminal_immediate = copy_batch_enters_through_liminal_entry(
+        &values,
+        &additional_modifications,
+        &enter_with_counters,
+    );
+    // CR 205.3m: the live creature-type list the CR 707.9 subtype exceptions
+    // resolve against. Loop-invariant, and cloned once so the per-token CR
+    // 303.4f/g projection below can be built while `state` is borrowed.
+    let all_creature_types = state.all_creature_types.clone();
+
+    // CR 614.12: one pre-event board per uninterrupted batch. Future tokens have no
+    // object on this board. Refresh extends the absent prefix and updates live history
+    // reads; only history-dependent residents can need another board layer pass.
+    // A pause drops it; non-entry side effects conservatively invalidate it below.
+    let mut entry_board: Option<crate::game::filter::TokenEntryBatchBoard> = None;
+    let mut entry_events_start = events.len();
+
+    for index in 0..final_count {
+        if events[entry_events_start..]
+            .iter()
+            .any(|event| match event {
+                GameEvent::TokenCreated { object_id, .. }
+                | GameEvent::CounterAdded { object_id, .. } => !created_ids.contains(object_id),
+                // CR 614.12: recording an entry replacement on an absent co-entrant
+                // does not change the board before the entry event. Its modified body
+                // is refreshed below; any other event still invalidates the cache.
+                GameEvent::ReplacementApplied { source_id, .. } => !created_ids.contains(source_id),
+                GameEvent::ZoneChanged {
+                    object_id,
+                    from,
+                    to,
+                    ..
+                } if from.is_none() && *to == Zone::Battlefield => !created_ids.contains(object_id),
+                _ => true,
+            })
+        {
+            entry_board = None;
+        }
+        entry_events_start = events.len();
+        // CR 508.4: this token's own destination, selected by its creation
+        // ordinal within the batch.
+        let attack_destination = attack_request.for_entrant(created_ids.len() - prefix_len);
+        if liminal_immediate {
+            let (token_id, mut token) =
+                super::token::reserve_liminal_token_object(state, token_owner, name.clone());
+            let entry_timestamp = state.next_timestamp();
+
+            let copy_spec = Box::new(CopyTokenSpec {
+                values: values.clone(),
+                display: display.clone(),
+                extra_keywords: extra_keywords.clone(),
+                additional_modifications: additional_modifications.clone(),
+                tapped,
+                enters_attacking,
+                attack_request: attack_request.clone(),
+                sacrifice_at: sacrifice_at.clone(),
+                source_id,
+                controller,
+                donor,
+                double_faced: double_faced.clone(),
+            });
+            // CR 707.9b/9c: this seam only runs when every exception is
+            // stampable onto copiable values before entry, so the body is
+            // complete here and the CR 733 record can replay it exactly.
+            let body_modifications = if additional_modifications.is_empty() {
+                ResolvedCopyBodyModifications::NoExceptions
+            } else {
+                ResolvedCopyBodyModifications::Folded {
+                    modifications: additional_modifications.clone(),
+                    all_creature_types: state.all_creature_types.clone(),
+                }
+            };
+            super::token::materialize_token_copy_body(
+                &mut token,
+                &copy_spec,
+                &body_modifications,
+                state.turn_number,
+                entry_timestamp,
+                enter_tapped.resolve(tapped),
+            );
+            state.liminal_entries.insert(
+                token_id,
+                LiminalEntry {
+                    copy_settlement: None,
+                    // CR 111.1: the projection this entry will create is a
+                    // token, carried as the witness the `TokenEntry` seam acts
+                    // on rather than as a flag it has to trust.
+                    object: crate::types::game_state::LiminalEntrant::Token(
+                        crate::types::game_state::TokenProjection::materialize(token),
+                    ),
+                    name: name.clone(),
+                    source_id,
+                    controller,
+                    enters_attacking,
+                    attack_destination: attack_destination.clone(),
+                    attach_to: None,
+                    sacrifice_at: sacrifice_at.clone(),
+                    remaining_count: final_count.saturating_sub(index + 1),
+                    created_ids: created_ids.clone(),
+                    copy_resume: Some(copy_spec),
+                    spec_resume: None,
+                    enter_tapped,
+                    // CR 614.1c + CR 122.6: the creating effect's and the batch replacements'
+                    // entry counters; the commit places them with the event's own.
+                    enter_with_counters: enter_with_counters.clone(),
+                    kind: crate::types::game_state::LiminalEntryKind::Token,
+                    replacement_applied: std::collections::HashSet::new(),
+                },
+            );
+
+            let proposed = ProposedEvent::TokenEntry {
+                redirected_to: None,
+                entry_ref: token_id,
+                enter_tapped,
+                enter_with_counters: Vec::new(),
+                enter_with_choices: None,
+                applied: std::collections::HashSet::new(),
+            };
+            let has_own_entry_replacements = state
+                .liminal_entries
+                .get(&token_id)
+                .is_some_and(|entry| !entry.object.projected().replacement_definitions.is_empty());
+            if has_own_entry_replacements && entry_board.is_none() {
+                let absent = copy_token_co_entrants(state, token_id, &created_ids);
+                entry_board = Some(crate::game::filter::TokenEntryBatchBoard::new(
+                    state, &absent,
+                ));
+            }
+            if let Some(board) = entry_board.as_mut() {
+                board.refresh(
+                    state,
+                    &copy_token_co_entrants(state, token_id, &created_ids),
+                );
+            }
+            match crate::game::replacement::replace_event_on_entry_board(
+                state,
+                proposed,
+                events,
+                entry_board.as_ref().map(|cached| cached.board()),
+            ) {
+                crate::game::replacement::ReplacementResult::Execute(event) => {
+                    if !super::token::commit_liminal_copy_token_entry(state, event, events) {
+                        created_ids = state.last_created_token_ids.clone();
+                        return CopyTokenApplyStatus {
+                            created_ids,
+                            completion: CopyTokenApplyCompletion::Paused,
+                        };
+                    }
+                    // CR 707.2: this copy committed; iterate to the next token in the
+                    // batch (O(1) stack). Terminal drain runs once after the loop.
+                    created_ids = state.last_created_token_ids.clone();
+                }
+                crate::game::replacement::ReplacementResult::Prevented => {
+                    state.liminal_entries.remove(&token_id);
+                }
+                crate::game::replacement::ReplacementResult::NeedsChoice(player) => {
+                    state.waiting_for =
+                        crate::game::replacement::replacement_choice_waiting_for(player, state);
+                    state.last_created_token_ids = created_ids.clone();
+                    return CopyTokenApplyStatus {
+                        created_ids,
+                        completion: CopyTokenApplyCompletion::Paused,
+                    };
+                }
+            }
+            continue;
+        }
+
+        let token_id = zones::create_object(
+            state,
+            CardId(0),
+            token_owner,
+            name.clone(),
+            Zone::Battlefield,
+        );
+
+        // CR 613.7d: a copy token enters the battlefield, so it receives a
+        // timestamp. Drawn before the `get_mut` (`next_timestamp` takes `&mut self`).
+        let entry_timestamp = state.next_timestamp();
+
+        let copy_spec = Box::new(CopyTokenSpec {
+            values: values.clone(),
+            display: display.clone(),
+            extra_keywords: extra_keywords.clone(),
+            additional_modifications: additional_modifications.clone(),
+            tapped,
+            enters_attacking,
+            attack_request: attack_request.clone(),
+            sacrifice_at: sacrifice_at.clone(),
+            source_id,
+            controller,
+            donor,
+            double_faced: double_faced.clone(),
+        });
+        // CR 707.9: unlike the liminal seam, this one applies its exceptions
+        // AFTER the birth through `apply_token_modifications`, which is pausable,
+        // state-level, and has no resolved family of its own yet. Mark them so
+        // replay refuses instead of installing a body that is missing them.
+        let body_modifications = if additional_modifications.is_empty() {
+            ResolvedCopyBodyModifications::NoExceptions
+        } else {
+            ResolvedCopyBodyModifications::DeferredToUnjournaledSeam {
+                modifications: additional_modifications.clone(),
+            }
+        };
+        let resulting_tapped = enter_tapped.resolve(tapped);
+        let turn_number = state.turn_number;
+        // `install_copiable_values_as_base` already seeds `loyalty`/`base_loyalty`
+        // from `values.loyalty` (CR 306.5b), which is what `copied_loyalty` is,
+        // so the shared body needs no separate loyalty seed.
+        let created_reference = state.objects.get_mut(&token_id).map(|token| {
+            super::token::materialize_token_copy_body(
+                token,
+                &copy_spec,
+                &body_modifications,
+                turn_number,
+                entry_timestamp,
+                resulting_tapped,
+            );
+            // CR 707.9b: this seam applies its exceptions to the displayed face
+            // later, through the pausable `apply_token_modifications`, so the
+            // stored face takes them here, at the birth, before any of that
+            // path's pause points.
+            if copy_spec.double_faced.is_some() && !copy_spec.additional_modifications.is_empty() {
+                if let Some(face) = token.back_face.take() {
+                    token.back_face = Some(fold_copy_exceptions_into_face(
+                        &face,
+                        &[],
+                        &[],
+                        &copy_spec.additional_modifications,
+                        &all_creature_types,
+                    ));
+                }
+            }
+            ObjectIncarnationRef::from_object(token)
+        });
+
+        // CR 614.12 + CR 613.1f: realize continuous effects for this entrant
+        // BEFORE discovering its copied payment or its copied counters — an
+        // ability-removing effect (Humility) must suppress a payment the entrant
+        // must not have. Mirrors `finish_copy_target_choice_entry`
+        // (`engine_replacement.rs:2927`).
+        crate::game::layers::mark_layers_full(state);
+        crate::game::layers::flush_layers(state);
+
+        // CR 707.9b/9c + CR 614.12: the entrant as it will exist AFTER the copy
+        // exceptions, not the bare copied body. Both CR 614.12 readings below —
+        // which copied "enters with" counters it keeps, and its CR 303.4f/g host —
+        // read this one body.
+        //
+        // `materialize_token_copy_body` is a documented no-op for
+        // `DeferredToUnjournaledSeam` — on this path the exceptions land later, at
+        // `apply_token_modifications` — so at this point the stored object still
+        // carries the UNMODIFIED copiable values. The liminal seam folds its
+        // exceptions before its own consult, so without this projection the two
+        // copy seams disagree about what the entrant is, and an exception that
+        // adds or removes `Creature` (CR 303.4d), adds or removes the `Aura`
+        // subtype, or changes color (CR 702.16c) flips the CR 303.4f/g verdict.
+        // The failure mode is silent: a token that is never created.
+        //
+        // A PROJECTION rather than an early mutation of the stored object: the
+        // exceptions must still be applied exactly once, by the seam that owns
+        // them and can pause (`AddCounterOnEnter` reaches
+        // `add_counter_with_replacement`), and several arms — `AddPower`,
+        // `GrantAbility`, `GrantTrigger` — are not idempotent under a second pass.
+        let entrant_body = state.objects.get(&token_id).map(|token| {
+            let mut body = token.clone();
+            apply_immediate_copy_token_modifications_to_object(
+                &mut body,
+                &additional_modifications,
+                &all_creature_types,
+            );
+            body
+        });
+
+        // CR 614.12 + CR 613.1f + CR 614.1c + CR 707.9b: a copied "enters with"
+        // ability applies only if the token, as it would exist on the battlefield
+        // (its exceptions folded in, the continuous effects that already exist
+        // applied, the tokens entering with it absent), still has it. An ability
+        // remover that would apply to it (Humility, Overwhelming Splendor on its
+        // controller) leaves the copied counters off; the loyalty and the creating
+        // effect's own counters are not gated (see their split above). Same order
+        // as the routing list, so counter replacements see the same sequence.
+        // CR 614.12 + CR 707.5: use the same resident-effect projection for a
+        // copied roll as for the copied counters on this placed-token route.
+        // The batch's shared pre-entry board serves this read, as it does the
+        // counters below; it is only projected when the body has a roll at all.
+        let rolls = entrant_body.as_ref().is_some_and(|body| {
+            let rollers: Vec<_> = body
+                .replacement_definitions
+                .iter_all()
+                .filter(|def| crate::game::replacement::replacement_rolls_as_it_enters(def))
+                .collect();
+            if rollers.is_empty() {
+                return false;
+            }
+            let mut absent = copy_token_co_entrants(state, token_id, &created_ids);
+            absent.push(token_id);
+            let board = entry_board.get_or_insert_with(|| {
+                crate::game::filter::TokenEntryBatchBoard::new(state, &absent)
+            });
+            board.refresh(state, &absent);
+            let projection =
+                crate::game::filter::BattlefieldEntrantProjection::token_on_pre_entry_board(
+                    std::borrow::Cow::Borrowed(board.board()),
+                    body,
+                );
+            rollers.into_iter().any(|def| {
+                projection
+                    .as_ref()
+                    .is_none_or(|projection| projection.retains_replacement(def))
+            })
+        });
+        if rolls {
+            super::record_runtime_unimplemented(state, token_id, "copied_as_enters_roll");
+        }
+        let token_etb_counters: Vec<(crate::types::counter::CounterType, u32)> = {
+            let projection = entrant_body
+                .as_ref()
+                .filter(|_| !own_entries.is_empty())
+                .and_then(|body| {
+                    let board = entry_board.get_or_insert_with(|| {
+                        let mut absent = copy_token_co_entrants(state, token_id, &created_ids);
+                        absent.push(token_id);
+                        crate::game::filter::TokenEntryBatchBoard::new(state, &absent)
+                    });
+                    let mut absent = copy_token_co_entrants(state, token_id, &created_ids);
+                    absent.push(token_id);
+                    board.refresh(state, &absent);
+                    crate::game::filter::BattlefieldEntrantProjection::token_on_pre_entry_board(
+                        std::borrow::Cow::Borrowed(board.board()),
+                        body,
+                    )
+                });
+            intrinsic
+                .iter()
+                .cloned()
+                .chain(
+                    own_entries
+                        .iter()
+                        .filter(|(def, _, _)| {
+                            projection
+                                .as_ref()
+                                .is_none_or(|projection| projection.retains_replacement(def))
+                        })
+                        .map(|(_, counter_type, count)| (counter_type.clone(), *count)),
+                )
+                .chain(enter_with_counters.iter().cloned())
+                .collect()
+        };
+
+        // CR 508.4: the tail resumes the rest of the batch counting its own
+        // tokens from zero, so its request starts past the tokens created so
+        // far, this one included.
+        let mut resume_copy = copy_spec.clone();
+        resume_copy.attack_request =
+            attack_request.after_entrants(created_ids.len() - prefix_len + 1);
+        let tail = CopyTokenEntryTail {
+            owner: token_owner,
+            copy: resume_copy,
+            enter_tapped,
+            enter_with_counters: enter_with_counters.clone(),
+            etb_counters: token_etb_counters,
+            remaining_count: final_count.saturating_sub(index + 1),
+            attack_destination: attack_destination.clone(),
+        };
+
+        // CR 614.12a + CR 707.2: a copied as-enters life payment (Saw in Half
+        // copying Minion of the Wastes / Nameless Race) is a choice that
+        // precedes the entry it modifies, so surface it BEFORE the CR 733
+        // birth is journaled — the birth record carries the answered amount
+        // (`entry_choices`). `None` (non-payer, or determined-0 already
+        // latched inline) continues untouched; `Some` means the funnel parked
+        // its prompt, so park the whole remaining entry tail — consult,
+        // birth, aura attach, copy exceptions, entry counters, entry events,
+        // and the rest of the batch — behind the player's answer. The prompt
+        // is the funnel's own (`PayAmountChoice` raised by the surface call);
+        // nothing here hand-raises a second one. The layers were flushed for this
+        // entrant above.
+        if crate::game::replacement::surface_copied_entry_payment(state, token_id, events).is_some()
+        {
+            state.last_created_token_ids = created_ids.clone();
+            super::counters::stash_pending_counter_post_actions(
+                state,
+                EffectKind::CopyTokenOf,
+                source_id,
+                vec![
+                    PendingCounterPostAction::ContinueNonLiminalCopyTokenAfterEntryPayment {
+                        object_id: token_id,
+                        tail: Box::new(tail),
+                    },
+                ],
+            );
+            return CopyTokenApplyStatus {
+                created_ids,
+                completion: CopyTokenApplyCompletion::Paused,
+            };
+        }
+
+        // CR 303.4f + CR 303.4g: decide the entering Aura's host BEFORE the CR 733
+        // birth is journaled (append-only, no retraction) and BEFORE the attach is
+        // applied, so the CR 303.4g "if the Aura is a token, it isn't created" arm
+        // can withhold the birth and the attach can never take a lower journal
+        // ordinal than the birth it depends on. Same decide/act split the liminal
+        // seam uses in `token::commit_liminal_token_entry_with_post_actions`.
+        // It reads `entrant_body`, built above, which predates an inline
+        // determined-0 payment latch; that latch writes only a
+        // `ChosenAttribute::Number`, which host legality doesn't read.
+        let hosts = match entrant_body.as_ref() {
+            Some(entrant) => {
+                crate::game::zone_pipeline::entering_aura_hosts_projected(state, token_id, entrant)
+            }
+            None => crate::game::zone_pipeline::EnteringAuraHosts::NotApplicable,
+        };
+        if matches!(
+            &hosts,
+            crate::game::zone_pipeline::EnteringAuraHosts::Hosts { legal_targets, .. }
+                if legal_targets.is_empty()
+        ) {
+            // CR 303.4g: this entrant is always a token on this path
+            // (`materialize_token_copy_body` set `is_token`), so "it isn't created":
+            // un-enter it with no birth record, no `TokenCreated`, no battlefield
+            // `ZoneChanged`, no `created_ids` row, and nothing in any graveyard.
+            super::token::uncreate_unentered_aura_token(state, token_id, token_owner);
+            continue;
+        }
+
+        // CR 733: journal the settled copy birth, after the body borrow ends and
+        // after CR 303.4g has settled that there IS a birth to journal.
+        if let Some(object) = created_reference {
+            let cause = state.current_or_begin_rules_execution_node();
+            // CR 614.12a + CR 707.2: the prompt path paused before this record,
+            // so any `Number` latched on the entrant now is a determined-0 the
+            // surface call committed inline (non-payers latch nothing). The
+            // record carries exactly what the entrant answered — the resume's
+            // own record point fills the same slot with the prompted answer.
+            let entry_choices: Vec<ChosenAttribute> = state
+                .objects
+                .get(&token_id)
+                .map(|token| {
+                    token
+                        .chosen_attributes
+                        .iter()
+                        .filter(|attr| matches!(attr, ChosenAttribute::Number(_)))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let command = ResolvedTokenCreationCommand {
+                object,
+                owner: token_owner,
+                entry_timestamp,
+                entry_turn: turn_number,
+                body: ResolvedTokenBody::Copy {
+                    copy: copy_spec.clone(),
+                    modifications: body_modifications,
+                },
+                resulting_tapped,
+                entry_choices,
+                resulting_next_object_id: state.next_object_id,
+                entry_zone: None,
+                cause,
+            };
+            state
+                .resolved_rules_journal
+                .record_token_creation(command)
+                .expect("resolved copy-token creation must have a live journal cause");
+        }
+
+        match crate::game::zone_pipeline::apply_entering_aura_hosts(state, token_id, hosts, events)
+        {
+            // `NoLegalHost` is unreachable here — the empty-host arm above `continue`d.
+            crate::game::zone_pipeline::EnteringAuraAttachment::NotApplicable
+            | crate::game::zone_pipeline::EnteringAuraAttachment::Attached
+            | crate::game::zone_pipeline::EnteringAuraAttachment::NoLegalHost => {}
+            crate::game::zone_pipeline::EnteringAuraAttachment::NeedsChoice {
+                controller: chooser,
+                legal_targets,
+            } => {
+                // CR 616.1 carrier: park the WHOLE remaining entry tail — copy
+                // exceptions, entry counters, entry events, and the rest of the
+                // batch — behind the host choice.
+                state.last_created_token_ids = created_ids.clone();
+                super::counters::stash_pending_counter_additions(
+                    state,
+                    Vec::new(),
+                    crate::types::game_state::PendingEffectResolved::with_post_actions_without_effect(
+                        EffectKind::CopyTokenOf,
+                        source_id,
+                        vec![PendingCounterPostAction::ContinueCopyTokenEntryAfterAuraHost {
+                            object_id: token_id,
+                            tail: Box::new(tail),
+                        }],
+                    ),
+                );
+                state.waiting_for = WaitingFor::ReturnAsAuraTarget {
+                    player: chooser,
+                    source_id,
+                    returned_id: token_id,
+                    legal_targets,
+                    pending_effect: Box::new(crate::types::ability::ResolvedAbility::new(
+                        crate::types::ability::Effect::Attach {
+                            attachment: crate::types::ability::TargetFilter::SelfRef,
+                            target: crate::types::ability::TargetFilter::Any,
+                            // Aura-attachment delivery: the attachment is the
+                            // entering Aura; only its host is chosen here.
+                            selection: crate::types::ability::AttachSelection::AtResolution {
+                                count: crate::types::ability::AttachCardinality::One,
+                            },
+                        },
+                        Vec::new(),
+                        source_id,
+                        chooser,
+                    )),
+                };
+                return CopyTokenApplyStatus {
+                    created_ids,
+                    completion: CopyTokenApplyCompletion::Paused,
+                };
+            }
+        }
+
+        if !finish_non_liminal_copy_token_entry(
+            state,
+            token_id,
+            &tail,
+            &mut CopyBatchIdSink::BatchLocal(&mut created_ids),
+            events,
+        ) {
+            let created_ids_snapshot = created_ids.clone();
+            state.last_created_token_ids = created_ids_snapshot;
+            return CopyTokenApplyStatus {
+                created_ids,
+                completion: CopyTokenApplyCompletion::Paused,
+            };
+        }
+    }
+
+    if liminal_immediate {
+        // CR 603.7 + CR 701.36a: terminal step of the iterative liminal batch —
+        // set the created-token id ledger and emit the batch's final
+        // EffectResolved through the pending drain, exactly as the former
+        // continue_liminal_copy_token_batch None / remaining==0 arm did.
+        state.waiting_for = crate::types::game_state::WaitingFor::Priority {
+            player: state.active_player,
+        };
+        super::token::record_copy_batch_ledger_on_active_copy_token(state);
+        if state.active_copy_token().is_some() {
+            drain_pending_copy_token_resolution(state, events);
+            // The drain assigned the owner's referent to the ledger (or
+            // re-parked it on a later batch).
+            created_ids = state.last_created_token_ids.clone();
+        }
+        // CR 614.6 + CR 609.3: otherwise `created_ids` is already this batch's
+        // list — the prefix plus each committed copy, re-read from the ledger
+        // after every commit. A batch that committed nothing (a replacement
+        // made it zero tokens, or every entry was prevented) created nothing,
+        // so it must not republish the ledger an earlier creation left.
+
+        // C1: do NOT hardcode Completed. Reproduce the replaced
+        // continue_liminal_copy_token_batch tail (old ~1196-1197): the whole
+        // (possibly multi-batch) resolution is done only if nothing remains
+        // pending or we've settled back to Priority; otherwise a later batch is
+        // waiting on a CR 616.1 replacement choice, so report Paused and let the
+        // caller resume rather than double-drain it (token_copy::resolve builds a
+        // multi-batch VecDeque when copy_source_ids.len() > 1).
+        let completion = if state.active_copy_token().is_none()
+            || matches!(
+                state.waiting_for,
+                crate::types::game_state::WaitingFor::Priority { .. }
+            ) {
+            CopyTokenApplyCompletion::Completed
+        } else {
+            CopyTokenApplyCompletion::Paused
+        };
+        return CopyTokenApplyStatus {
+            created_ids,
+            completion,
+        };
+    }
+
+    CopyTokenApplyStatus {
+        created_ids,
+        completion: CopyTokenApplyCompletion::Completed,
+    }
+}
+
+pub(crate) struct CopyTokenApplyStatus {
+    pub(crate) created_ids: Vec<ObjectId>,
+    pub(crate) completion: CopyTokenApplyCompletion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyTokenApplyCompletion {
+    Completed,
+    Paused,
+}
+
+struct CopyTokenFinalization {
+    name: String,
+    enters_attacking: bool,
+    attack_destination: EntryAttackDestination,
+    source_id: ObjectId,
+    controller: crate::types::player::PlayerId,
+    /// CR 608.2h + CR 707.9b: donor incarnation donor-referential exceptions
+    /// (`Source`-scoped dynamic P/T) read at the stamp; `None` reads the token.
+    donor: Option<ObjectIncarnationRef>,
+}
+
+/// CR 111.1 + CR 707.2: where a finished non-liminal copy-token entry publishes
+/// the id it just created.
+///
+/// The two live routes into [`finish_non_liminal_copy_token_entry`] differ in
+/// exactly this one respect, so the difference is a named parameter rather than
+/// two copies of the tail. Inline in the batch loop the running list is a local
+/// the loop owns and later returns; resumed from a parked post-action that local
+/// is gone, and the id must go through the guarded ledger-3 + in-flight-buffer
+/// authority instead (see `token::record_last_created_copy_batch_token` for why
+/// that has to be one call and not two statements).
+enum CopyBatchIdSink<'a> {
+    BatchLocal(&'a mut Vec<ObjectId>),
+    ResumedBatch,
+}
+
+impl CopyBatchIdSink<'_> {
+    fn publish(&mut self, state: &mut GameState, token_id: ObjectId) {
+        match self {
+            CopyBatchIdSink::BatchLocal(ids) => ids.push(token_id),
+            CopyBatchIdSink::ResumedBatch => {
+                super::token::record_last_created_copy_batch_token(state, token_id);
+            }
+        }
+    }
+
+    /// The batch's created-id list as it stands, for the `last_created_token_ids`
+    /// publication every pause inside the tail performs. On the resumed route the
+    /// ledger already IS that list, so this reads it back rather than inventing one.
+    fn snapshot(&self, state: &GameState) -> Vec<ObjectId> {
+        match self {
+            CopyBatchIdSink::BatchLocal(ids) => (**ids).clone(),
+            CopyBatchIdSink::ResumedBatch => state.last_created_token_ids.clone(),
+        }
+    }
+}
+
+/// CR 707.2 + CR 614.1c + CR 400.7: finish ONE non-liminal copy-token entry whose
+/// body is already materialized and whose CR 733 birth is already journaled.
+///
+/// Applies the copy exceptions (CR 707.9), the entry counters (CR 306.5b copied
+/// loyalty + CR 614.1c self-replacements + the creating effect's own), the
+/// attacking placement (CR 508.4), the predefined-token abilities (CR 111.10),
+/// and the CR 400.7 entry pair, then publishes the id through `sink`.
+///
+/// Returns `false` when a sub-step paused for a player choice, having parked its
+/// own remainder plus the rest of the batch; the caller must report `Paused`.
+fn finish_non_liminal_copy_token_entry(
+    state: &mut GameState,
+    token_id: ObjectId,
+    tail: &CopyTokenEntryTail,
+    sink: &mut CopyBatchIdSink<'_>,
+    events: &mut Vec<GameEvent>,
+) -> bool {
+    let token_owner = tail.owner;
+    let copy_spec = &tail.copy;
+    let enter_tapped = tail.enter_tapped;
+    let enter_with_counters = &tail.enter_with_counters;
+    let etb_counters = &tail.etb_counters;
+    let remaining_count = tail.remaining_count;
+    let enters_attacking = copy_spec.enters_attacking;
+    let attack_destination = tail.attack_destination.clone();
+    let source_id = copy_spec.source_id;
+    let controller = copy_spec.controller;
+    let additional_modifications = copy_spec.additional_modifications.clone();
+    let name = copy_spec.values.name.clone();
+
+    let finalization = CopyTokenFinalization {
+        name: name.clone(),
+        enters_attacking,
+        attack_destination: attack_destination.clone(),
+        source_id,
+        controller,
+        donor: copy_spec.donor,
+    };
+    if !apply_token_modifications(
+        state,
+        token_id,
+        &finalization,
+        &additional_modifications,
+        events,
+    ) {
+        if remaining_count > 0 {
+            super::counters::append_pending_counter_post_actions(
+                state,
+                vec![PendingCounterPostAction::ContinueCopyTokenCreation {
+                    owner: token_owner,
+                    copy: copy_spec.clone(),
+                    enter_tapped,
+                    enter_with_counters: enter_with_counters.clone(),
+                    remaining_count,
+                }],
+            );
+        }
+        state.last_created_token_ids = sink.snapshot(state);
+        return false;
+    }
+
+    finalize_copied_token(state, source_id, token_id);
+
+    // CR 614.1c + CR 122.6a: ETB-counter replacement mutations are carried
+    // on the accepted CreateToken spec, even for copy tokens whose full
+    // CR 707 payload lives in `CopyTokenSpec`.
+    for (counter_index, (counter_type, counter_count)) in etb_counters.iter().enumerate() {
+        if *counter_count > 0
+            && !super::counters::add_counter_with_replacement(
+                state,
+                token_owner,
+                token_id,
+                counter_type.clone(),
+                *counter_count,
+                // CR 614.16: entering-with-counters placements are
+                // replacement-driven entry modifications.
+                CounterCause::ReplacementOrPrevention,
+                events,
+            )
+        {
+            state.last_created_token_ids = sink.snapshot(state);
+            let remaining_counters = etb_counters[counter_index + 1..]
+                .iter()
+                .filter(|(_, count)| *count > 0)
+                .map(|(counter_type, count)| {
+                    crate::types::game_state::PendingCounterAddition::Object {
+                        actor: token_owner,
+                        object_id: token_id,
+                        counter_type: counter_type.clone(),
+                        count: *count,
+                        // CR 614.16: entering-with-counters placements are
+                        // replacement-driven entry modifications.
+                        cause: CounterCause::ReplacementOrPrevention,
+                    }
+                })
+                .collect();
+            super::counters::stash_pending_counter_additions(
+                state,
+                remaining_counters,
+                crate::types::game_state::PendingEffectResolved::with_post_actions_without_effect(
+                    EffectKind::CopyTokenOf,
+                    source_id,
+                    vec![
+                        PendingCounterPostAction::FinalizeCopyTokenEntry {
+                            object_id: token_id,
+                            name: name.clone(),
+                            enters_attacking,
+                            attack_destination: attack_destination.clone(),
+                            source_id,
+                            controller,
+                        },
+                        PendingCounterPostAction::ContinueCopyTokenCreation {
+                            owner: token_owner,
+                            copy: copy_spec.clone(),
+                            enter_tapped,
+                            enter_with_counters: enter_with_counters.clone(),
+                            remaining_count,
+                        },
+                    ],
+                ),
+            );
+            return false;
+        }
+    }
+
+    // CR 508.4: Uses shared helper for defending player resolution.
+    if enters_attacking {
+        crate::game::combat::enter_attacking_at_destination(
+            state,
+            token_id,
+            source_id,
+            controller,
+            &attack_destination,
+        );
+    }
+
+    // CR 111.10: Predefined token abilities for known subtypes (Treasure, Food, etc.).
+    //
+    // PAIRED WITH THE REPLAY ARM at `token::apply_resolved_token_creation`'s
+    // `ResolvedTokenBody::Copy` match arm, which must call the same
+    // predefined-only injector. Unlike the liminal path — where one
+    // `copy_resume.is_some()` predicate drives both the live and journaled
+    // matches, so a divergence fails to compile — this branch is coupled to
+    // replay by convention only. Switching it to the catalog-wide
+    // `inject_resolved_token_abilities` would silently desync replay from live.
+    super::token::inject_predefined_token_abilities(state, token_id);
+    // Battlefield entry of a copy token: request an incremental re-derive
+    // for just this token. `flush_layers` escalates to a full pass when
+    // the copied object sources a continuous effect, carries a CDA, etc.
+    crate::game::layers::mark_layers_entered(state, token_id);
+    crate::game::restrictions::record_token_created(state, token_id);
+
+    // CR 400.7 + CR 608.2i + CR 603.2c: route the record and the entry pair through the single
+    // `from: None → Battlefield` authority so the emitted `ZoneChanged` carries this turn's
+    // real zone-change index instead of the `0` placeholder. The authority performs the
+    // CR 608.2i battlefield-entry bookkeeping itself, so the co-located
+    // `record_battlefield_entry` call is deleted — keeping it would double-count
+    // `battlefield_entries_this_turn`.
+    super::token::push_committed_token_entry_events(state, token_id, name, source_id, events)
+        .expect("token just created");
+    sink.publish(state, token_id);
+    true
+}
+
+/// CR 303.4f: resume a non-liminal copy-token entry that paused on its Aura-host
+/// choice. The host is already attached by the `ReturnAsAuraTarget` answer
+/// handler; everything after the attach is the shared tail.
+pub(crate) fn continue_copy_token_entry_after_aura_host(
+    state: &mut GameState,
+    token_id: ObjectId,
+    tail: CopyTokenEntryTail,
+    events: &mut Vec<GameEvent>,
+) -> bool {
+    if !finish_non_liminal_copy_token_entry(
+        state,
+        token_id,
+        &tail,
+        &mut CopyBatchIdSink::ResumedBatch,
+        events,
+    ) {
+        return false;
+    }
+    // CR 707.2: the paused token is done; drive the rest of the batch. Publication
+    // goes through the shared resume authority, `resume_copy_token_batch_remainder`,
+    // whose doc says where the continuation's ids land and why THIS token, already
+    // published by `finish_non_liminal_copy_token_entry`'s `ResumedBatch` sink,
+    // stays in the referent.
+    resume_copy_token_batch_remainder(
+        state,
+        tail.owner,
+        *tail.copy,
+        tail.enter_tapped,
+        tail.enter_with_counters,
+        tail.remaining_count,
+        events,
+    )
+}
+
+/// CR 614.12a + CR 707.2: resume a non-liminal copy-token entry that paused on
+/// its copied as-enters life payment. The funnel's completion tail already
+/// latched the answered amount onto the live entrant; everything the loop
+/// would have run after the surface call — consult, birth record (carrying
+/// the answer), aura attach, copy exceptions, entry counters, entry events —
+/// plus the rest of the batch runs here. The consult/record/aura/finish
+/// sequence mirrors the loop body exactly (same helpers, same order); only
+/// the birth's `entry_choices` differs (the prompted answer instead of a
+/// determined-0/non-payer read).
+pub(crate) fn continue_copy_token_after_entry_payment(
+    state: &mut GameState,
+    token_id: ObjectId,
+    tail: CopyTokenEntryTail,
+    events: &mut Vec<GameEvent>,
+) -> bool {
+    // The funnel latched exactly one `Number` answer onto the entrant (its
+    // completion tail extends `chosen_attributes` with the parked amount). A
+    // missing entrant — or one with no latch — voids this entry (nothing
+    // moves the paused entrant during its own prompt, so this is defensive);
+    // the batch still continues below.
+    let answered = state.objects.get(&token_id).and_then(|token| {
+        token.chosen_attributes.iter().find_map(|attr| match attr {
+            ChosenAttribute::Number(amount) => Some(*amount),
+            _ => None,
+        })
+    });
+    if let Some(answer) = answered {
+        // Redo the loop's projection + consult against the realized
+        // post-payment entrant.
+        let all_creature_types = state.all_creature_types.clone();
+        let entrant_projection = state.objects.get(&token_id).map(|token| {
+            let mut projection = token.clone();
+            apply_immediate_copy_token_modifications_to_object(
+                &mut projection,
+                &tail.copy.additional_modifications,
+                &all_creature_types,
+            );
+            projection
+        });
+        let hosts = match entrant_projection.as_ref() {
+            Some(entrant) => {
+                crate::game::zone_pipeline::entering_aura_hosts_projected(state, token_id, entrant)
+            }
+            None => crate::game::zone_pipeline::EnteringAuraHosts::NotApplicable,
+        };
+        if matches!(
+            &hosts,
+            crate::game::zone_pipeline::EnteringAuraHosts::Hosts { legal_targets, .. }
+                if legal_targets.is_empty()
+        ) {
+            // CR 303.4g: same uncreate as the loop's gate — no birth was
+            // recorded (the pause precedes the record), so withholding it
+            // here is identical.
+            super::token::uncreate_unentered_aura_token(state, token_id, tail.owner);
+        } else {
+            // CR 733: journal the birth with the answered amount. Timestamp
+            // and turn are read off the entrant itself (written at
+            // materialize, so they match the token exactly); the high-water
+            // mark reads the live allocator (nothing allocates between the
+            // pause and this resume — the interleaving payment moves life
+            // only). `from_object` carries no attribute snapshot, so the
+            // latched answer cannot double-install at replay.
+            let turn_number = state.turn_number;
+            let live = state.objects.get(&token_id).map(|token| {
+                (
+                    ObjectIncarnationRef::from_object(token),
+                    token.timestamp,
+                    token.entered_battlefield_turn.unwrap_or(turn_number),
+                )
+            });
+            if let Some((object, entry_timestamp, entry_turn)) = live {
+                let cause = state.current_or_begin_rules_execution_node();
+                let body_modifications = if tail.copy.additional_modifications.is_empty() {
+                    ResolvedCopyBodyModifications::NoExceptions
+                } else {
+                    ResolvedCopyBodyModifications::DeferredToUnjournaledSeam {
+                        modifications: tail.copy.additional_modifications.clone(),
+                    }
+                };
+                let command = ResolvedTokenCreationCommand {
+                    object,
+                    owner: tail.owner,
+                    entry_timestamp,
+                    entry_turn,
+                    body: ResolvedTokenBody::Copy {
+                        copy: tail.copy.clone(),
+                        modifications: body_modifications,
+                    },
+                    resulting_tapped: tail.enter_tapped.resolve(tail.copy.tapped),
+                    entry_choices: vec![ChosenAttribute::Number(answer)],
+                    resulting_next_object_id: state.next_object_id,
+                    entry_zone: None,
+                    cause,
+                };
+                state
+                    .resolved_rules_journal
+                    .record_token_creation(command)
+                    .expect("resumed copy-token creation must have a live journal cause");
+            }
+            // Aura attach (mirror of the loop's apply block): a host choice
+            // pauses again behind the AURA variant — the birth above is
+            // already journaled, so that resume's straight-to-finish shape
+            // stays sound.
+            match crate::game::zone_pipeline::apply_entering_aura_hosts(
+                state, token_id, hosts, events,
+            ) {
+                crate::game::zone_pipeline::EnteringAuraAttachment::NotApplicable
+                | crate::game::zone_pipeline::EnteringAuraAttachment::Attached
+                | crate::game::zone_pipeline::EnteringAuraAttachment::NoLegalHost => {}
+                crate::game::zone_pipeline::EnteringAuraAttachment::NeedsChoice {
+                    controller: chooser,
+                    legal_targets,
+                } => {
+                    // No ledger snapshot (unlike the loop's arm): ledger 3
+                    // already holds exactly the pre-this-token ids — the
+                    // payment pause snapshotted them and nothing completed
+                    // since.
+                    let tail_source_id = tail.copy.source_id;
+                    super::counters::stash_pending_counter_additions(
+                        state,
+                        Vec::new(),
+                        crate::types::game_state::PendingEffectResolved::with_post_actions_without_effect(
+                            EffectKind::CopyTokenOf,
+                            tail_source_id,
+                            vec![PendingCounterPostAction::ContinueCopyTokenEntryAfterAuraHost {
+                                object_id: token_id,
+                                tail: Box::new(tail),
+                            }],
+                        ),
+                    );
+                    state.waiting_for = WaitingFor::ReturnAsAuraTarget {
+                        player: chooser,
+                        source_id: tail_source_id,
+                        returned_id: token_id,
+                        legal_targets,
+                        pending_effect: Box::new(crate::types::ability::ResolvedAbility::new(
+                            crate::types::ability::Effect::Attach {
+                                attachment: crate::types::ability::TargetFilter::SelfRef,
+                                target: crate::types::ability::TargetFilter::Any,
+                                selection: crate::types::ability::AttachSelection::AtResolution {
+                                    count: crate::types::ability::AttachCardinality::One,
+                                },
+                            },
+                            Vec::new(),
+                            tail_source_id,
+                            chooser,
+                        )),
+                    };
+                    return false;
+                }
+            }
+            if !finish_non_liminal_copy_token_entry(
+                state,
+                token_id,
+                &tail,
+                &mut CopyBatchIdSink::ResumedBatch,
+                events,
+            ) {
+                return false;
+            }
+        }
+    }
+    // CR 707.2: the paused token is done; drive the rest of the batch.
+    // Publication goes through the shared resume authority,
+    // `resume_copy_token_batch_remainder`.
+    resume_copy_token_batch_remainder(
+        state,
+        tail.owner,
+        *tail.copy,
+        tail.enter_tapped,
+        tail.enter_with_counters,
+        tail.remaining_count,
+        events,
+    )
+}
+
+/// CR 707.2 + CR 608.2c: drive the rest of a paused copy batch and publish its ids
+/// after the referent the creating event built so far. The single authority for
+/// every post-action that restarts a paused batch (counter pause, Aura host,
+/// copied entry payment).
+///
+/// While a CopyToken owner is active, its `created_ids` buffer is the referent
+/// (assigned wholesale onto `last_created_token_ids` at its drain), so the
+/// continuation's ids extend it. With none — the plain `Effect::Token` route, or a
+/// compound token event whose cursor re-parked the owner below this pause — the
+/// ledger is the destination, holding what the pause left there plus the token
+/// that just finished (on the plain route, the event's referent so far; under the
+/// compound cursor, possibly only the paused batch's ids, which the cursor
+/// reconciles against the ids it already holds when it resumes). It is handed to
+/// the continuation as its `initial_created_ids` prefix, so a pause inside the
+/// continuation republishes it rather than a continuation-local list, and the
+/// completed list replaces it.
+///
+/// The token whose own entry just finished is already in whichever destination
+/// owns the batch (`token::record_last_created_copy_batch_token` published it,
+/// from the counter pause's finalize post-action or through
+/// `finish_non_liminal_copy_token_entry`'s `ResumedBatch` sink): extending the
+/// owner's buffer keeps it, and with no owner it is part of the prefix the
+/// completed list starts with.
+pub(crate) fn resume_copy_token_batch_remainder(
+    state: &mut GameState,
+    owner: crate::types::player::PlayerId,
+    copy: CopyTokenSpec,
+    enter_tapped: EtbTapState,
+    enter_with_counters: Vec<(crate::types::counter::CounterType, u32)>,
+    remaining_count: u32,
+    events: &mut Vec<GameEvent>,
+) -> bool {
+    if remaining_count == 0 {
+        return true;
+    }
+    let initial_created_ids = if state.active_copy_token().is_some() {
+        Vec::new()
+    } else {
+        std::mem::take(&mut state.last_created_token_ids)
+    };
+    let status = apply_copy_token_after_replacement_with_created_ids(
+        state,
+        owner,
+        copy,
+        enter_tapped,
+        enter_with_counters,
+        remaining_count,
+        initial_created_ids,
+        None,
+        events,
+    );
+    // The owner neither appears nor drains inside this continuation (the
+    // non-liminal batch loop never drains it, and the remainder repeats the paused
+    // batch's non-liminal shape), so this read agrees with the one above.
+    match state.active_copy_token_mut() {
+        Some(pending) => pending.created_ids.extend(status.created_ids),
+        None => state.last_created_token_ids = status.created_ids,
+    }
+    matches!(status.completion, CopyTokenApplyCompletion::Completed)
+}
+
+/// CR 707.2 / CR 707.9: Complete copy-token entry and apply remaining copy
+/// modifications after resuming from a counter-placement replacement pause.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_remaining_token_modifications_after_counter_pause(
+    state: &mut GameState,
+    token_id: ObjectId,
+    name: String,
+    enters_attacking: bool,
+    attack_destination: EntryAttackDestination,
+    source_id: ObjectId,
+    controller: crate::types::player::PlayerId,
+    remaining_modifications: Vec<ContinuousModification>,
+    donor: Option<ObjectIncarnationRef>,
+    events: &mut Vec<GameEvent>,
+) -> bool {
+    let finalization = CopyTokenFinalization {
+        name: name.clone(),
+        enters_attacking,
+        attack_destination,
+        source_id,
+        controller,
+        donor,
+    };
+    if !apply_token_modifications(
+        state,
+        token_id,
+        &finalization,
+        &remaining_modifications,
+        events,
+    ) {
+        return false;
+    }
+    finalize_copied_token(state, source_id, token_id);
+    if enters_attacking {
+        crate::game::combat::enter_attacking_at_destination(
+            state,
+            token_id,
+            source_id,
+            controller,
+            &finalization.attack_destination,
+        );
+    }
+    super::token::inject_predefined_token_abilities(state, token_id);
+    crate::game::layers::mark_layers_entered(state, token_id);
+    crate::game::restrictions::record_token_created(state, token_id);
+    // CR 400.7 + CR 608.2i + CR 603.2c: route the record and the entry pair through the single
+    // `from: None → Battlefield` authority so the emitted `ZoneChanged` carries this turn's real
+    // zone-change index instead of the `0` placeholder. The authority performs the CR 608.2i
+    // battlefield-entry bookkeeping itself, so the co-located `record_battlefield_entry` call is
+    // deleted — keeping it would double-count `battlefield_entries_this_turn`.
+    //
+    // OBJECT-GONE: one of four counter-pause / deferred resume routes with this shape, all covered
+    // by the same predicate inside `push_committed_token_entry_events` — it gates `TokenCreated` on
+    // the authority's `None` verdict, so a vanished token cannot put a live creation event on the
+    // wire with no `created_tokens_this_turn` row behind it. MEASURED with the predicate deleted,
+    // token removed: `(TokenCreated=1, created_tokens_this_turn=0, last_created_token_ids=1)` —
+    // exactly the disagreement
+    // `a_vanished_counter_paused_token_reports_neither_creation_event_nor_ledger_row` forbids. The
+    // anaphora slot below carries the SAME predicate through
+    // `record_last_created_copy_batch_token`, which is the third ledger of the triple; without it
+    // the gone path reads `(0, 0, 1)`. That call owns BOTH of the slot's destinations — ledger 3
+    // and this batch's `created_ids`, which `drain_pending_copy_token_resolution` assigns wholesale
+    // back onto ledger 3 — because a separate buffer push republished the withheld id and clobbered
+    // the guarded list on top of it.
+    super::token::push_committed_token_entry_events(state, token_id, name, source_id, events);
+    super::token::record_last_created_copy_batch_token(state, token_id);
+    true
+}
+
+/// CR 707.9b + CR 608.2h: settle a characteristic exception through the quantity
+/// authority used by ordinary copy-token creation. In particular, donor P/T reads
+/// use the live battlefield object, otherwise its last-known P/T, rather than the
+/// donor's unmodified copiable values or the new graveyard card's base P/T.
+fn resolve_copy_token_modification(
+    state: &GameState,
+    modification: &ContinuousModification,
+    controller: PlayerId,
+    quantity_source: ObjectId,
+) -> ContinuousModification {
+    match modification {
+        ContinuousModification::SetPowerDynamic { value } => ContinuousModification::SetPower {
+            value: resolve_quantity(state, value, controller, quantity_source),
+        },
+        ContinuousModification::SetToughnessDynamic { value } => {
+            ContinuousModification::SetToughness {
+                value: resolve_quantity(state, value, controller, quantity_source),
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// CR 707.2 + CR 707.9: Apply non-keyword `, except <body>` modifications to
+/// a synthesized token. Tokens are created with copiable values baked in, so
+/// each modification mutates BOTH the layered view (`card_types`,
+/// `keywords`, etc.) AND the base view (`base_card_types`, `base_keywords`)
+/// directly — there is no "before exception" state to layer over the way a
+/// `BecomeCopy` modification layers over an existing object.
+///
+/// Variants consumed here:
+/// - `RemoveSupertype` / `AddSupertype` — Miirym, Sentinel Wyrm; Sarkhan-class.
+/// - `AddCounterOnEnter` — Spark Double-class. Counter placed via the shared
+///   `counters::add_counter_with_replacement` primitive (which handles
+///   replacements such as Doubling Season).
+/// - `SetName` — copy-name override (rare for token-copy, harmless if present).
+/// - `AddType` / `RemoveType` / `AddSubtype` / `RemoveSubtype` — type
+///   exception support for token-copy (compose with type-modifying except
+///   bodies that share grammar with `BecomeCopy`).
+/// - `SetCardTypes` — Myrkul, Lord of Bones: "it's an enchantment and loses
+///   all other card types" replaces the copied core card-type set (CR 613.1d).
+/// - `AddKeyword` — dual-path: keywords in the typed `extra_keywords` channel
+///   are applied earlier in the resolver, and an `AddKeyword` that instead lands
+///   in `additional_modifications` (e.g. an "except it has menace" body, or a
+///   keyword adjacent to a quoted-ability grant) is applied here too, on the
+///   `AddKeyword` arm below (CR 707.9a). Both routes add to the copiable keyword
+///   set idempotently.
+///
+/// `SetPowerDynamic` / `SetToughnessDynamic` (Saw in Half class) ARE stamped
+/// below: their `Source`-scoped quantities read the donor via
+/// `CopyTokenFinalization.donor` (live, else LKI per CR 608.2h) and land as
+/// token base P/T (CR 707.9b).
+///
+/// Modifications not relevant to token-copy semantics (e.g. `CopyValues`,
+/// `ChangeController`) are skipped silently — they have no meaningful "stamp
+/// at creation" interpretation. A future card with such an except body will
+/// surface as an unimplemented modification, which is strictly better than
+/// silently mutating the token incorrectly.
+fn apply_token_modifications(
+    state: &mut GameState,
+    token_id: ObjectId,
+    finalization: &CopyTokenFinalization,
+    modifications: &[ContinuousModification],
+    events: &mut Vec<GameEvent>,
+) -> bool {
+    for (index, modification) in modifications.iter().enumerate() {
+        match modification {
+            // CR 205.4 + CR 707.9b: "the token isn't legendary" (Miirym class).
+            ContinuousModification::RemoveSupertype { supertype } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    token.card_types.supertypes.retain(|s| s != supertype);
+                    token.base_card_types.supertypes.retain(|s| s != supertype);
+                }
+            }
+            // CR 205.4 + CR 707.9d: "it's <supertype> in addition to its other types".
+            ContinuousModification::AddSupertype { supertype } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    if !token.card_types.supertypes.contains(supertype) {
+                        token.card_types.supertypes.push(*supertype);
+                    }
+                    if !token.base_card_types.supertypes.contains(supertype) {
+                        token.base_card_types.supertypes.push(*supertype);
+                    }
+                }
+            }
+            // CR 122.1 + CR 614.1c: Counter at creation, optionally gated by
+            // the resolved core type. Read core types from the just-stamped
+            // `card_types` (already includes any AddType/RemoveType applied
+            // earlier in this loop) before placing the counter.
+            ContinuousModification::AddCounterOnEnter {
+                counter_type,
+                count,
+                if_type,
+            } => {
+                let counter_actor = state
+                    .objects
+                    .get(&token_id)
+                    .map(|o| o.controller)
+                    .unwrap_or(crate::types::player::PlayerId(0));
+                let n = resolve_quantity(state, count, counter_actor, token_id).max(0) as u32;
+                if n == 0 {
+                    continue;
+                }
+                let gate_passes = match if_type {
+                    None => true,
+                    Some(t) => state
+                        .objects
+                        .get(&token_id)
+                        .map(|obj| obj.card_types.core_types.contains(t))
+                        .unwrap_or(false),
+                };
+                if !gate_passes {
+                    continue;
+                }
+                if !super::counters::add_counter_with_replacement(
+                    state,
+                    counter_actor,
+                    token_id,
+                    counter_type.clone(),
+                    n,
+                    // CR 614.16: entering-with-counters placements are
+                    // replacement-driven entry modifications.
+                    CounterCause::ReplacementOrPrevention,
+                    events,
+                ) {
+                    super::counters::stash_pending_counter_post_actions(
+                        state,
+                        EffectKind::CopyTokenOf,
+                        finalization.source_id,
+                        vec![
+                            PendingCounterPostAction::ApplyCopyTokenModificationsAndFinalize {
+                                object_id: token_id,
+                                name: finalization.name.clone(),
+                                enters_attacking: finalization.enters_attacking,
+                                attack_destination: finalization.attack_destination.clone(),
+                                source_id: finalization.source_id,
+                                controller: finalization.controller,
+                                remaining_modifications: modifications[index + 1..].to_vec(),
+                                donor: finalization.donor,
+                            },
+                        ],
+                    );
+                    return false;
+                }
+            }
+            // CR 707.9b: Name override applied at copy time.
+            ContinuousModification::SetName { name } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    token.name = name.clone();
+                    token.base_name = name.clone();
+                }
+            }
+            // CR 205.1a: Type/subtype additions/removals as copy exceptions.
+            ContinuousModification::AddType { core_type } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    if !token.card_types.core_types.contains(core_type) {
+                        token.card_types.core_types.push(*core_type);
+                    }
+                    if !token.base_card_types.core_types.contains(core_type) {
+                        token.base_card_types.core_types.push(*core_type);
+                    }
+                }
+            }
+            // CR 205.1a: removing a card type removes its correlated subtypes too;
+            // applied to both live and base types so the loss is part of the
+            // token's copiable values (CR 707.9b).
+            ContinuousModification::RemoveType { core_type } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    remove_core_type(&mut token.card_types, *core_type);
+                    remove_core_type(&mut token.base_card_types, *core_type);
+                }
+            }
+            ContinuousModification::AddSubtype { subtype } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    if !token.card_types.subtypes.iter().any(|s| s == subtype) {
+                        token.card_types.subtypes.push(subtype.clone());
+                    }
+                    if !token.base_card_types.subtypes.iter().any(|s| s == subtype) {
+                        token.base_card_types.subtypes.push(subtype.clone());
+                    }
+                }
+            }
+            ContinuousModification::RemoveSubtype { subtype } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    token.card_types.subtypes.retain(|s| s != subtype);
+                    token.base_card_types.subtypes.retain(|s| s != subtype);
+                }
+            }
+            // CR 707.9b + CR 613.1d: a copy exception with no "in addition"
+            // carve-out replaces the copied creature subtypes (CR 707.9d). The
+            // wiped set becomes part of the token's copiable values, so apply it
+            // to both live and base subtype lists.
+            ContinuousModification::RemoveAllSubtypes { set } => {
+                let all_creature_types = &state.all_creature_types;
+                let objects = &mut state.objects;
+                if let Some(token) = objects.get_mut(&token_id) {
+                    remove_subtype_set(&mut token.card_types.subtypes, *set, all_creature_types);
+                    remove_subtype_set(
+                        &mut token.base_card_types.subtypes,
+                        *set,
+                        all_creature_types,
+                    );
+                }
+            }
+            // CR 205.1a + CR 613.1d + CR 707.9d: "it's an enchantment and loses
+            // all other card types" (Myrkul, Lord of Bones) REPLACES the copied
+            // card's core card-type set. Supertypes (Legendary) are retained;
+            // subtypes are filtered through the shared `subtype_matches_core_types`
+            // rule so this baked path keeps exactly the subtypes the layered
+            // `SetCardTypes` arm would (uncorrelated noncreature subtypes drop).
+            // Stamped into both live and base card types so the override is part
+            // of the token's copiable values (CR 707.9b).
+            ContinuousModification::SetCardTypes { core_types } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    token.card_types.core_types = core_types.clone();
+                    token.base_card_types.core_types = core_types.clone();
+                    let keep = |subtype: &String| {
+                        crate::game::layers::subtype_matches_core_types(subtype, core_types)
+                    };
+                    token.card_types.subtypes.retain(|s| keep(s));
+                    token.base_card_types.subtypes.retain(|s| keep(s));
+                }
+            }
+            // CR 707.9b + CR 613.1e: a copy exception that sets color (no
+            // "in addition to its other colors" carve-out, CR 707.9d) replaces
+            // the copied color. The result becomes part of the token's copiable
+            // values, so set both live and base color.
+            ContinuousModification::SetColor { colors } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    token.color = colors.clone();
+                    token.base_color = colors.clone();
+                }
+            }
+            // CR 707.9 + CR 202.1b: "except it has no mana cost" — strip the
+            // copied mana cost so the token's mana value is 0 (Embalm
+            // CR 702.128a, Eternalize CR 702.129a). Set both live and base so
+            // the override is part of the token's copiable values.
+            ContinuousModification::RemoveManaCost => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    token.mana_cost = crate::types::mana::ManaCost::NoCost;
+                    token.base_mana_cost = crate::types::mana::ManaCost::NoCost;
+                }
+            }
+            // CR 707.9b + CR 613.1e: a copy exception that adds color
+            // ("in addition to its other colors") becomes part of the token's
+            // copiable values without removing the copied color.
+            ContinuousModification::AddColor { color } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    if !token.color.contains(color) {
+                        token.color.push(*color);
+                    }
+                    if !token.base_color.contains(color) {
+                        token.base_color.push(*color);
+                    }
+                }
+            }
+            // CR 707.9b: "except it's 1/1" — set base and live P/T so the
+            // override persists through layer resets. Used by Offspring
+            // (CR 702.175a) and Saw in Half.
+            ContinuousModification::SetPower { value } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    token.base_power = Some(*value);
+                    token.power = Some(*value);
+                    token.layer_base_power = Some(*value);
+                }
+            }
+            ContinuousModification::SetToughness { value } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    token.base_toughness = Some(*value);
+                    token.toughness = Some(*value);
+                    token.layer_base_toughness = Some(*value);
+                }
+            }
+            // CR 707.9b: fixed additive P/T exceptions are baked into the
+            // token's copiable values by updating both base and live P/T.
+            ContinuousModification::AddPower { value } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    token.base_power = token.base_power.map(|p| p + *value);
+                    token.power = token.power.map(|p| p + *value);
+                    token.layer_base_power = token.layer_base_power.map(|p| p + *value);
+                }
+            }
+            ContinuousModification::AddToughness { value } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    token.base_toughness = token.base_toughness.map(|t| t + *value);
+                    token.toughness = token.toughness.map(|t| t + *value);
+                    token.layer_base_toughness = token.layer_base_toughness.map(|t| t + *value);
+                }
+            }
+            // CR 707.9b: "except its base power and toughness are each equal
+            // to half [X]" (Saw in Half). Dynamic quantity resolved at
+            // creation time and stamped as base P/T.
+            ContinuousModification::SetPowerDynamic { .. }
+            | ContinuousModification::SetToughnessDynamic { .. } => {
+                let controller = state
+                    .objects
+                    .get(&token_id)
+                    .map(|o| o.controller)
+                    .unwrap_or(crate::types::player::PlayerId(0));
+                // CR 608.2h + CR 707.9b: donor phrases read the donor; donor-less
+                // routes keep the token-id read. Redirected births settle through
+                // the same authority before their fixed exceptions are journaled.
+                let source_id = finalization.donor.map(|d| d.object_id).unwrap_or(token_id);
+                let resolved =
+                    resolve_copy_token_modification(state, modification, controller, source_id);
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    apply_immediate_copy_token_modifications_to_object(
+                        token,
+                        std::slice::from_ref(&resolved),
+                        &[],
+                    );
+                }
+            }
+            // CR 707.9b + CR 306.5b/c: Starting-loyalty exceptions are already
+            // consumed before loyalty counters are seeded, but apply the live
+            // fields idempotently so a paused/resumed modification sequence
+            // keeps the stamped token coherent.
+            ContinuousModification::SetStartingLoyalty { value } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    token.base_loyalty = Some(*value);
+                    token.loyalty = Some(*value);
+                    token.base_printed_loyalty = Some(PrintedLoyalty::Fixed(*value));
+                    token.printed_loyalty = Some(PrintedLoyalty::Fixed(*value));
+                }
+            }
+            // CR 707.9a + CR 603.1: "except it has \"<triggered ability>\""
+            // (Chandra, Flameshaper [+1]: "…and \"At the beginning of the end
+            // step, sacrifice this token.\""). The granted trigger becomes part
+            // of the copy's copiable values, so stamp it onto both the live and
+            // base trigger sets. `SelfRef`/`This`-anchored triggers in the
+            // grant resolve against the token because they fire with the token
+            // as their source.
+            ContinuousModification::GrantTrigger { trigger } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    token.push_printed_trigger((**trigger).clone());
+                }
+            }
+            // CR 707.9a: "except it has \"<activated/static ability>\"" — the
+            // granted ability is part of the copy's copiable values. Mirrors the
+            // GrantTrigger arm for the `obj.abilities` list.
+            ContinuousModification::GrantAbility { definition } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    Arc::make_mut(&mut token.abilities).push((**definition).clone());
+                    Arc::make_mut(&mut token.base_abilities).push((**definition).clone());
+                }
+            }
+            // CR 707.9a + CR 604.1: quoted static text in a copy exception is
+            // also part of the token's copiable values. Mirror predefined token
+            // rules text by carrying static-rule modifications on a self static.
+            ContinuousModification::GrantStaticAbility { .. }
+            | ContinuousModification::AddStaticMode { .. } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    let static_def = StaticDefinition::continuous()
+                        .affected(TargetFilter::SelfRef)
+                        .modifications(vec![modification.clone()]);
+                    Arc::make_mut(&mut token.base_static_definitions).push(static_def.clone());
+                    token.static_definitions.push(static_def);
+                }
+            }
+            // CR 707.9a + CR 702: a keyword granted via an except body that
+            // landed in `additional_modifications` (rather than `extra_keywords`)
+            // — e.g. a keyword adjacent to a quoted-ability grant. Apply it to
+            // the copiable keyword set, idempotently, mirroring `extra_keywords`.
+            ContinuousModification::AddKeyword { keyword } => {
+                if let Some(token) = state.objects.get_mut(&token_id) {
+                    if !token.keywords.contains(keyword) {
+                        token.keywords.push(keyword.clone());
+                    }
+                    if !token.base_keywords.contains(keyword) {
+                        token.base_keywords.push(keyword.clone());
+                    }
+                }
+            }
+            // Other layered-only modifications (CopyValues, ChangeController,
+            // ChangeControllerToDesignation, etc.) are intentionally skipped —
+            // their "stamp at copy time"
+            // interpretation is ambiguous, and a future except body needing
+            // them should route through the BecomeCopy layered path instead.
+            _ => {}
+        }
+    }
+    true
+}
+
+/// CR 614.12 + CR 614.1c: whether every token of a copy batch enters through its
+/// own liminal `TokenEntry` — the seam where the entrant's own as-enters
+/// replacements (Phyrexian Metamorph's "enter as a copy") are discovered.
+/// `apply_copy_token_after_replacement_with_created_ids` builds the liminal
+/// entrant exactly when this holds.
+///
+/// Every copy exception must be stampable before entry (CR 707.9b) and the copy must have no
+/// intrinsic loyalty and no "enters with" replacement of its own to seed; the creating
+/// effect's and the batch replacements' entry counters ride the entry (`enter_with_counters`).
+pub(crate) fn copy_batch_enters_through_liminal_entry(
+    values: &CopiableValues,
+    additional_modifications: &[ContinuousModification],
+    enter_with_counters: &[(crate::types::counter::CounterType, u32)],
+) -> bool {
+    let loyalty = copy_starting_loyalty_override(additional_modifications).or(values.loyalty);
+    copy_token_modifications_are_liminal_immediate(additional_modifications)
+        // CR 614.5: entry counters the batch already carries ride the liminal entry only when the
+        // entrant's own as-enters copy defers every non-copy entry replacement to it (so none is
+        // applied a second time there); any other counter-bearing batch keeps its direct path.
+        && (enter_with_counters.is_empty()
+            || crate::game::replacement::copy_entrant_has_own_entry_copy(values))
+        && crate::game::printed_cards::intrinsic_face_counters(loyalty, None).is_empty()
+        && crate::game::printed_cards::self_etb_counter_replacement_entries(
+            &values.replacement_definitions,
+        )
+        .next()
+        .is_none()
+}
+
+/// CR 707.2 + CR 707.9: classify copy exceptions that can be stamped into a
+/// liminal token's copiable values before replacement consultation.
+pub(crate) fn copy_token_modifications_are_liminal_immediate(
+    modifications: &[ContinuousModification],
+) -> bool {
+    // CR 707.2 + CR 707.9: only copy modifications that can be stamped onto
+    // copiable values before replacement consultation may use the liminal entry
+    // path. Dynamic P/T and ETB counters need the committed object/replacement
+    // pipeline instead.
+    modifications.iter().all(|modification| {
+        !matches!(
+            modification,
+            ContinuousModification::AddCounterOnEnter { .. }
+                | ContinuousModification::SetPowerDynamic { .. }
+                | ContinuousModification::SetToughnessDynamic { .. }
+        )
+    })
+}
+
+/// CR 707.9b + CR 707.9a + CR 614.12: the `TokenSpec` a copy batch's
+/// `CreateToken` replacement consult sees — the single authority for that
+/// probe.
+///
+/// A characteristic modified as part of the copying process ("except it's a
+/// 1/1 Soldier creature in addition to its other types") is part of the copy's
+/// copiable values (CR 707.9b), as is an ability gained that way (CR 707.9a,
+/// `extra_keywords`). A replacement deciding whether "a creature would enter"
+/// must therefore see the entrant as it will exist on the battlefield
+/// (CR 614.12) — the same view the liminal `TokenEntry` projection and the
+/// non-liminal `entrant_projection` already take through
+/// `apply_immediate_copy_token_modifications_to_object`. The body is built by
+/// the single copy-body authority `token::materialize_token_copy_body` on a
+/// scratch object and only projected into the spec's characteristics.
+///
+/// Probe-only: the copy apply path reads nothing from the spec except
+/// `enter_with_counters`, so token bodies are unchanged. Continuous effects
+/// that would modify the token are not applied here. Exception-free batches
+/// keep the raw-values probe from `copy_probe_spec_for` byte for byte.
+fn copy_entry_probe_spec(copy: &CopyTokenSpec, all_creature_types: &[String]) -> TokenSpec {
+    let mut spec = super::token::copy_probe_spec_for(
+        copy.source_id,
+        copy.controller,
+        copy.sacrifice_at.clone(),
+        &copy.values,
+    );
+    if copy.additional_modifications.is_empty() && copy.extra_keywords.is_empty() {
+        return spec;
+    }
+    // The sentinel id, turn number and timestamp are inert on a scratch probe
+    // that never enters any zone collection.
+    let mut probe = GameObject::new(
+        ObjectId(u64::MAX),
+        CardId(0),
+        copy.controller,
+        copy.values.name.clone(),
+        Zone::Battlefield,
+    );
+    super::token::materialize_token_copy_body(
+        &mut probe,
+        copy,
+        &ResolvedCopyBodyModifications::Folded {
+            modifications: copy.additional_modifications.clone(),
+            all_creature_types: all_creature_types.to_vec(),
+        },
+        0,
+        0,
+        copy.tapped,
+    );
+    let characteristics = &mut spec.characteristics;
+    characteristics.display_name = probe.name;
+    characteristics.power = probe.power;
+    characteristics.toughness = probe.toughness;
+    characteristics.core_types = probe.card_types.core_types;
+    characteristics.subtypes = probe.card_types.subtypes;
+    characteristics.supertypes = probe.card_types.supertypes;
+    characteristics.colors = probe.color;
+    characteristics.keywords = probe.keywords;
+    spec
+}
+
+/// CR 707.2 + CR 707.9: apply immediate copy exceptions to a liminal token's
+/// copiable values so self as-enters replacements consult the final shape.
+pub(crate) fn apply_immediate_copy_token_modifications_to_object(
+    token: &mut GameObject,
+    modifications: &[ContinuousModification],
+    all_creature_types: &[String],
+) {
+    // CR 707.2 + CR 707.9: apply immediate "except" copy modifications to the
+    // not-yet-committed token's copiable characteristics so self as-enters
+    // replacements consult the final copied shape.
+    for modification in modifications {
+        match modification {
+            ContinuousModification::RemoveSupertype { supertype } => {
+                token.card_types.supertypes.retain(|s| s != supertype);
+                token.base_card_types.supertypes.retain(|s| s != supertype);
+            }
+            ContinuousModification::AddSupertype { supertype } => {
+                if !token.card_types.supertypes.contains(supertype) {
+                    token.card_types.supertypes.push(*supertype);
+                }
+                if !token.base_card_types.supertypes.contains(supertype) {
+                    token.base_card_types.supertypes.push(*supertype);
+                }
+            }
+            ContinuousModification::SetName { name } => {
+                token.name = name.clone();
+                token.base_name = name.clone();
+            }
+            ContinuousModification::AddType { core_type } => {
+                if !token.card_types.core_types.contains(core_type) {
+                    token.card_types.core_types.push(*core_type);
+                }
+                if !token.base_card_types.core_types.contains(core_type) {
+                    token.base_card_types.core_types.push(*core_type);
+                }
+            }
+            // CR 205.1a + CR 707.9b: same as the layered `RemoveType` arm.
+            ContinuousModification::RemoveType { core_type } => {
+                remove_core_type(&mut token.card_types, *core_type);
+                remove_core_type(&mut token.base_card_types, *core_type);
+            }
+            ContinuousModification::AddSubtype { subtype } => {
+                if !token.card_types.subtypes.iter().any(|s| s == subtype) {
+                    token.card_types.subtypes.push(subtype.clone());
+                }
+                if !token.base_card_types.subtypes.iter().any(|s| s == subtype) {
+                    token.base_card_types.subtypes.push(subtype.clone());
+                }
+            }
+            ContinuousModification::RemoveSubtype { subtype } => {
+                token.card_types.subtypes.retain(|s| s != subtype);
+                token.base_card_types.subtypes.retain(|s| s != subtype);
+            }
+            ContinuousModification::RemoveAllSubtypes { set } => {
+                remove_subtype_set(&mut token.card_types.subtypes, *set, all_creature_types);
+                remove_subtype_set(
+                    &mut token.base_card_types.subtypes,
+                    *set,
+                    all_creature_types,
+                );
+            }
+            ContinuousModification::SetCardTypes { core_types } => {
+                token.card_types.core_types = core_types.clone();
+                token.base_card_types.core_types = core_types.clone();
+                let keep = |subtype: &String| {
+                    crate::game::layers::subtype_matches_core_types(subtype, core_types)
+                };
+                token.card_types.subtypes.retain(|s| keep(s));
+                token.base_card_types.subtypes.retain(|s| keep(s));
+            }
+            ContinuousModification::SetColor { colors } => {
+                token.color = colors.clone();
+                token.base_color = colors.clone();
+            }
+            ContinuousModification::RemoveManaCost => {
+                token.mana_cost = crate::types::mana::ManaCost::NoCost;
+                token.base_mana_cost = crate::types::mana::ManaCost::NoCost;
+            }
+            ContinuousModification::AddColor { color } => {
+                if !token.color.contains(color) {
+                    token.color.push(*color);
+                }
+                if !token.base_color.contains(color) {
+                    token.base_color.push(*color);
+                }
+            }
+            ContinuousModification::SetPower { value } => {
+                token.base_power = Some(*value);
+                token.power = Some(*value);
+                token.layer_base_power = Some(*value);
+            }
+            ContinuousModification::SetToughness { value } => {
+                token.base_toughness = Some(*value);
+                token.toughness = Some(*value);
+                token.layer_base_toughness = Some(*value);
+            }
+            ContinuousModification::AddPower { value } => {
+                token.base_power = token.base_power.map(|p| p + *value);
+                token.power = token.power.map(|p| p + *value);
+                token.layer_base_power = token.layer_base_power.map(|p| p + *value);
+            }
+            ContinuousModification::AddToughness { value } => {
+                token.base_toughness = token.base_toughness.map(|t| t + *value);
+                token.toughness = token.toughness.map(|t| t + *value);
+                token.layer_base_toughness = token.layer_base_toughness.map(|t| t + *value);
+            }
+            ContinuousModification::SetStartingLoyalty { value } => {
+                token.base_loyalty = Some(*value);
+                token.loyalty = Some(*value);
+                token.base_printed_loyalty = Some(PrintedLoyalty::Fixed(*value));
+                token.printed_loyalty = Some(PrintedLoyalty::Fixed(*value));
+            }
+            ContinuousModification::GrantTrigger { trigger } => {
+                token.push_printed_trigger((**trigger).clone());
+            }
+            ContinuousModification::GrantAbility { definition } => {
+                Arc::make_mut(&mut token.abilities).push((**definition).clone());
+                Arc::make_mut(&mut token.base_abilities).push((**definition).clone());
+            }
+            ContinuousModification::GrantStaticAbility { .. }
+            | ContinuousModification::AddStaticMode { .. } => {
+                let static_def = StaticDefinition::continuous()
+                    .affected(TargetFilter::SelfRef)
+                    .modifications(vec![modification.clone()]);
+                Arc::make_mut(&mut token.base_static_definitions).push(static_def.clone());
+                token.static_definitions.push(static_def);
+            }
+            ContinuousModification::AddKeyword { keyword } => {
+                if !token.keywords.contains(keyword) {
+                    token.keywords.push(keyword.clone());
+                }
+                if !token.base_keywords.contains(keyword) {
+                    token.base_keywords.push(keyword.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+pub(crate) fn copy_starting_loyalty_override(
+    modifications: &[ContinuousModification],
+) -> Option<u32> {
+    modifications.iter().rev().find_map(|modification| {
+        if let ContinuousModification::SetStartingLoyalty { value } = modification {
+            Some(*value)
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::engine::apply_as_current;
+    use crate::game::game_object::DisplaySource;
+    use crate::game::zones::create_object;
+    use crate::types::ability::{
+        AbilityDefinition, AbilityKind, AdditionalCostPaymentSource, ContinuousModification,
+        ControllerRef, CostPaidObjectSnapshot, Effect, FilterProp, ObjectScope, PtValue,
+        QuantityExpr, QuantityModification, QuantityRef, ReplacementDefinition, ReplacementMode,
+        RoundingMode, TargetFilter, TargetRef, TypeFilter, TypedFilter,
+    };
+    use crate::types::actions::GameAction;
+    use crate::types::card::PrintedCardRef;
+    use crate::types::card_type::{CardType, CoreType, SubtypeSet, Supertype};
+    use crate::types::game_state::WaitingFor;
+    use crate::types::identifiers::{ObjectId, TrackedSetId};
+    use crate::types::keywords::Keyword;
+    use crate::types::mana::ManaColor;
+    use crate::types::player::PlayerId;
+    use crate::types::proposed_event::CopiedFaceUp;
+    use crate::types::replacements::ReplacementEvent;
+    use crate::types::resolution::{FrameKind, ResolutionStateWire};
+    use crate::types::triggers::TriggerMode;
+
+    /// CR 508.4: a copy batch's tokens are seated at the destinations its
+    /// request lists, in creation order.
+    #[test]
+    fn copy_batch_is_seated_at_each_requested_destination_in_order() {
+        use crate::game::combat::{AttackTarget, CombatState};
+        use crate::types::proposed_event::TokenAttackRequest;
+
+        let mut state = GameState::new(crate::types::format::FormatConfig::commander(), 3, 42);
+        state.combat = Some(CombatState::default());
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_power = Some(2);
+            source.base_toughness = Some(2);
+            source.power = Some(2);
+            source.toughness = Some(2);
+            source.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Bear".to_string()],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+        let values =
+            crate::game::printed_cards::intrinsic_copiable_values(&state.objects[&source_id]);
+        let copy = CopyTokenSpec {
+            values: Box::new(values),
+            display: DisplayIdentity {
+                display_source: DisplaySource::Token,
+                ..Default::default()
+            },
+            extra_keywords: Vec::new(),
+            additional_modifications: Vec::new(),
+            tapped: true,
+            enters_attacking: true,
+            attack_request: TokenAttackRequest::Named {
+                first: PlayerId(1),
+                rest: vec![PlayerId(2)],
+            },
+            sacrifice_at: None,
+            source_id,
+            controller: PlayerId(0),
+            donor: None,
+            double_faced: None,
+        };
+        let mut events = Vec::new();
+        let status = apply_copy_token_after_replacement(
+            &mut state,
+            PlayerId(0),
+            copy,
+            EtbTapState::Tapped,
+            Vec::new(),
+            2,
+            &mut events,
+        );
+
+        assert_eq!(
+            status.created_ids.len(),
+            2,
+            "reach guard: both copies were created"
+        );
+        let seats: Vec<Option<AttackTarget>> = status
+            .created_ids
+            .iter()
+            .map(|id| {
+                state
+                    .combat
+                    .as_ref()
+                    .unwrap()
+                    .attackers
+                    .iter()
+                    .find(|a| a.object_id == *id)
+                    .map(|a| a.attack_target)
+            })
+            .collect();
+        assert_eq!(
+            seats,
+            vec![
+                Some(AttackTarget::Player(PlayerId(1))),
+                Some(AttackTarget::Player(PlayerId(2)))
+            ]
+        );
+    }
+
+    /// The attack target each created token holds in `state.combat`, in id order.
+    fn seats_of_battlefield_tokens(
+        state: &GameState,
+    ) -> Vec<Option<crate::game::combat::AttackTarget>> {
+        let mut token_ids: Vec<ObjectId> = state
+            .objects
+            .values()
+            .filter(|obj| obj.is_token && obj.zone == Zone::Battlefield)
+            .map(|obj| obj.id)
+            .collect();
+        token_ids.sort();
+        token_ids
+            .iter()
+            .map(|id| {
+                state
+                    .combat
+                    .as_ref()
+                    .unwrap()
+                    .attackers
+                    .iter()
+                    .find(|a| a.object_id == *id)
+                    .map(|a| a.attack_target)
+            })
+            .collect()
+    }
+
+    /// A creature copy source for the attack-destination batch tests.
+    fn add_copy_source(state: &mut GameState, name: &str) -> ObjectId {
+        let source_id = create_object(
+            state,
+            CardId(1),
+            PlayerId(0),
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let source = state.objects.get_mut(&source_id).unwrap();
+        source.base_power = Some(2);
+        source.base_toughness = Some(2);
+        source.power = Some(2);
+        source.toughness = Some(2);
+        source.base_card_types = CardType {
+            supertypes: vec![],
+            core_types: vec![CoreType::Creature],
+            subtypes: vec!["Bear".to_string()],
+        };
+        source.card_types = source.base_card_types.clone();
+        source_id
+    }
+
+    fn named_attack_copy_spec(
+        state: &GameState,
+        source_id: ObjectId,
+        additional_modifications: Vec<ContinuousModification>,
+    ) -> CopyTokenSpec {
+        use crate::types::proposed_event::TokenAttackRequest;
+
+        CopyTokenSpec {
+            values: Box::new(crate::game::printed_cards::intrinsic_copiable_values(
+                &state.objects[&source_id],
+            )),
+            display: DisplayIdentity {
+                display_source: DisplaySource::Token,
+                ..Default::default()
+            },
+            extra_keywords: Vec::new(),
+            additional_modifications,
+            tapped: true,
+            enters_attacking: true,
+            attack_request: TokenAttackRequest::Named {
+                first: PlayerId(1),
+                rest: vec![PlayerId(2)],
+            },
+            sacrifice_at: None,
+            source_id,
+            controller: PlayerId(0),
+            donor: None,
+            double_faced: None,
+        }
+    }
+
+    /// CR 508.4: a non-liminal copy batch keeps its creation ordinal across a
+    /// counter-replacement pause, so each token is still seated at the
+    /// destination its own position in the request names.
+    #[test]
+    fn copy_batch_ordinal_survives_a_counter_pause() {
+        use crate::game::combat::{AttackTarget, CombatState};
+
+        let mut state = GameState::new(crate::types::format::FormatConfig::commander(), 3, 42);
+        state.combat = Some(CombatState::default());
+        let replacement_source = create_object(
+            &mut state,
+            CardId(9),
+            PlayerId(0),
+            "Counter Choice".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let mut def = ReplacementDefinition::new(ReplacementEvent::AddCounter)
+                .valid_card(TargetFilter::Any)
+                .quantity_modification(QuantityModification::Prevent);
+            def.mode = crate::types::ability::ReplacementMode::Optional { decline: None };
+            let obj = state.objects.get_mut(&replacement_source).unwrap();
+            obj.base_replacement_definitions = Arc::new(vec![def.clone()]);
+            obj.replacement_definitions = vec![def].into();
+        }
+        let source_id = add_copy_source(&mut state, "Grizzly Bears");
+        let copy = named_attack_copy_spec(
+            &state,
+            source_id,
+            vec![ContinuousModification::AddCounterOnEnter {
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                if_type: None,
+            }],
+        );
+
+        let mut events = Vec::new();
+        let status = apply_copy_token_after_replacement(
+            &mut state,
+            PlayerId(0),
+            copy,
+            EtbTapState::Tapped,
+            Vec::new(),
+            3,
+            &mut events,
+        );
+        assert!(
+            matches!(status.completion, CopyTokenApplyCompletion::Paused),
+            "reach guard: the first token's counter placement paused the batch"
+        );
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        for _ in 0..3 {
+            if !matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }) {
+                break;
+            }
+            apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 }).unwrap();
+        }
+
+        assert_eq!(
+            seats_of_battlefield_tokens(&state),
+            vec![
+                Some(AttackTarget::Player(PlayerId(1))),
+                Some(AttackTarget::Player(PlayerId(2))),
+                Some(AttackTarget::Player(PlayerId(1))),
+            ]
+        );
+    }
+
+    /// CR 508.4 + CR 614.1c: the same, when the pause is on the copied
+    /// creature's own "enters with a counter" self-replacement.
+    #[test]
+    fn copy_batch_ordinal_survives_an_entry_counter_pause() {
+        use crate::game::combat::{AttackTarget, CombatState};
+
+        let mut state = GameState::new(crate::types::format::FormatConfig::commander(), 3, 42);
+        state.combat = Some(CombatState::default());
+        let counter_choice = create_object(
+            &mut state,
+            CardId(9),
+            PlayerId(0),
+            "Counter Choice".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let mut def = ReplacementDefinition::new(ReplacementEvent::AddCounter)
+                .valid_card(TargetFilter::Any)
+                .quantity_modification(QuantityModification::Prevent);
+            def.mode = crate::types::ability::ReplacementMode::Optional { decline: None };
+            let obj = state.objects.get_mut(&counter_choice).unwrap();
+            obj.base_replacement_definitions = Arc::new(vec![def.clone()]);
+            obj.replacement_definitions = vec![def].into();
+        }
+        let source_id = add_copy_source(&mut state, "Walking Ballista");
+        {
+            let enters_with_counter = ReplacementDefinition::new(ReplacementEvent::Moved)
+                .valid_card(TargetFilter::SelfRef)
+                .destination_zone(Zone::Battlefield)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::PutCounter {
+                        counter_type: CounterType::Plus1Plus1,
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::SelfRef,
+                    },
+                ));
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source
+                .replacement_definitions
+                .push(enters_with_counter.clone());
+            Arc::make_mut(&mut source.base_replacement_definitions).push(enters_with_counter);
+        }
+        let copy = named_attack_copy_spec(&state, source_id, Vec::new());
+        assert!(
+            !crate::game::printed_cards::self_etb_counter_replacements(
+                &copy.values.replacement_definitions
+            )
+            .is_empty(),
+            "reach guard: the copied values carry the entry counter"
+        );
+
+        let mut events = Vec::new();
+        let status = apply_copy_token_after_replacement(
+            &mut state,
+            PlayerId(0),
+            copy,
+            EtbTapState::Tapped,
+            Vec::new(),
+            3,
+            &mut events,
+        );
+        assert!(
+            matches!(status.completion, CopyTokenApplyCompletion::Paused),
+            "reach guard: the first token's entry counter paused the batch"
+        );
+        for _ in 0..3 {
+            if !matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }) {
+                break;
+            }
+            apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 }).unwrap();
+        }
+
+        let seats = seats_of_battlefield_tokens(&state);
+        assert_eq!(
+            seats,
+            vec![
+                Some(AttackTarget::Player(PlayerId(1))),
+                Some(AttackTarget::Player(PlayerId(2))),
+                Some(AttackTarget::Player(PlayerId(1))),
+            ]
+        );
+    }
+
+    /// CR 508.4 + CR 614.12: a liminal copy batch whose entry pauses on its
+    /// enter-as-a-copy target's own entry counters keeps its creation ordinal
+    /// for the tokens parked behind the pause.
+    #[test]
+    fn copy_batch_ordinal_survives_a_copy_target_entry_counter_pause() {
+        use crate::game::combat::{AttackTarget, CombatState};
+
+        let mut state = GameState::new(crate::types::format::FormatConfig::commander(), 3, 42);
+        state.combat = Some(CombatState::default());
+        let counter_choice = create_object(
+            &mut state,
+            CardId(9),
+            PlayerId(0),
+            "Counter Choice".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let mut def = ReplacementDefinition::new(ReplacementEvent::AddCounter)
+                .valid_card(TargetFilter::Any)
+                .quantity_modification(QuantityModification::Prevent);
+            def.mode = crate::types::ability::ReplacementMode::Optional { decline: None };
+            let obj = state.objects.get_mut(&counter_choice).unwrap();
+            obj.base_replacement_definitions = Arc::new(vec![def.clone()]);
+            obj.replacement_definitions = vec![def].into();
+        }
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Cursed Mirror".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let mirror = state.objects.get_mut(&source_id).unwrap();
+            mirror.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Artifact],
+                subtypes: vec![],
+            };
+            mirror.card_types = mirror.base_card_types.clone();
+            let replacement = ReplacementDefinition::new(ReplacementEvent::Moved)
+                .mode(ReplacementMode::Optional { decline: None })
+                .valid_card(TargetFilter::SelfRef)
+                .destination_zone(Zone::Battlefield)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::BecomeCopy {
+                        target: TargetFilter::Typed(TypedFilter::creature()),
+                        recipient: crate::types::ability::CopyRecipient::Source,
+                        duration: None,
+                        mana_value_limit: None,
+                        additional_modifications: Vec::new(),
+                    },
+                ));
+            mirror.replacement_definitions.push(replacement.clone());
+            Arc::make_mut(&mut mirror.base_replacement_definitions).push(replacement);
+        }
+        // CR 614.1c: the creature the token becomes enters with a counter.
+        let target_id = add_copy_source(&mut state, "Walking Ballista");
+        {
+            let enters_with_counter = ReplacementDefinition::new(ReplacementEvent::Moved)
+                .valid_card(TargetFilter::SelfRef)
+                .destination_zone(Zone::Battlefield)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::PutCounter {
+                        counter_type: CounterType::Plus1Plus1,
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::SelfRef,
+                    },
+                ));
+            let target = state.objects.get_mut(&target_id).unwrap();
+            target
+                .replacement_definitions
+                .push(enters_with_counter.clone());
+            Arc::make_mut(&mut target.base_replacement_definitions).push(enters_with_counter);
+        }
+        let copy = named_attack_copy_spec(&state, source_id, Vec::new());
+
+        let mut events = Vec::new();
+        let status = apply_copy_token_after_replacement(
+            &mut state,
+            PlayerId(0),
+            copy,
+            EtbTapState::Tapped,
+            Vec::new(),
+            2,
+            &mut events,
+        );
+        assert!(
+            matches!(status.completion, CopyTokenApplyCompletion::Paused),
+            "reach guard: the first token's entry paused the batch"
+        );
+        let mut counter_pauses = 0;
+        for _ in 0..12 {
+            match state.waiting_for.clone() {
+                WaitingFor::ReplacementChoice { .. } => {
+                    apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 })
+                        .unwrap();
+                }
+                WaitingFor::CopyTargetChoice { .. } => {
+                    apply_as_current(
+                        &mut state,
+                        GameAction::ChooseTarget {
+                            target: Some(TargetRef::Object(target_id)),
+                        },
+                    )
+                    .unwrap();
+                    if matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }) {
+                        counter_pauses += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            counter_pauses > 0,
+            "reach guard: a copy target's entry counters paused the batch"
+        );
+
+        assert_eq!(
+            seats_of_battlefield_tokens(&state),
+            vec![
+                Some(AttackTarget::Player(PlayerId(1))),
+                Some(AttackTarget::Player(PlayerId(2))),
+            ]
+        );
+    }
+
+    /// CR 707.9b + CR 707.9d: a copy token whose exception sets P/T, replaces
+    /// color, and replaces creature subtypes (The Scarab God shape) stamps each
+    /// characteristic onto both the live and base (copiable) values of the
+    /// synthesized token.
+    #[test]
+    fn copy_token_exceptions_stamp_pt_color_and_subtype() {
+        let mut state = GameState::new_two_player(42);
+        state.all_creature_types = vec![
+            "Human".to_string(),
+            "Soldier".to_string(),
+            "Zombie".to_string(),
+        ];
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Elite Vanguard".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_power = Some(2);
+            source.base_toughness = Some(1);
+            source.power = Some(2);
+            source.toughness = Some(1);
+            source.base_color = vec![ManaColor::White];
+            source.color = vec![ManaColor::White];
+            source.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Human".to_string(), "Soldier".to_string()],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![
+                    ContinuousModification::SetPower { value: 4 },
+                    ContinuousModification::SetToughness { value: 4 },
+                    ContinuousModification::SetColor {
+                        colors: vec![ManaColor::Black],
+                    },
+                    ContinuousModification::RemoveAllSubtypes {
+                        set: SubtypeSet::Creature,
+                    },
+                    ContinuousModification::AddType {
+                        core_type: CoreType::Creature,
+                    },
+                    ContinuousModification::AddSubtype {
+                        subtype: "Zombie".to_string(),
+                    },
+                ],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        assert_eq!(token.power, Some(4));
+        assert_eq!(token.toughness, Some(4));
+        assert_eq!(token.color, vec![ManaColor::Black]);
+        assert!(token.card_types.subtypes.contains(&"Zombie".to_string()));
+        assert!(!token.card_types.subtypes.contains(&"Human".to_string()));
+        assert!(!token.card_types.subtypes.contains(&"Soldier".to_string()));
+        assert_eq!(token.base_power, Some(4));
+        assert_eq!(token.base_toughness, Some(4));
+        assert_eq!(token.base_color, vec![ManaColor::Black]);
+        assert!(token
+            .base_card_types
+            .subtypes
+            .contains(&"Zombie".to_string()));
+        assert!(!token
+            .base_card_types
+            .subtypes
+            .contains(&"Human".to_string()));
+        assert!(!token
+            .base_card_types
+            .subtypes
+            .contains(&"Soldier".to_string()));
+    }
+
+    /// CR 205.1a + CR 613.1d + CR 707.9d: Myrkul, Lord of Bones — "create a
+    /// token that's a copy of that card, except it's an enchantment and loses
+    /// all other card types." `SetCardTypes` replaces the copied creature's
+    /// core types with `[Enchantment]` (no longer a creature), while supertypes
+    /// (Legendary) survive. Subtype retention follows the shared
+    /// `subtype_matches_core_types` rule used by the layered path: a noncreature
+    /// subtype not correlated to the new core types (here the artifact subtype
+    /// "Equipment") drops, keeping both applications consistent. Applied to both
+    /// live and base (copiable) card types.
+    #[test]
+    fn copy_token_set_card_types_replaces_core_types_and_drops_uncorrelated_subtype() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Dying God".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_power = Some(7);
+            source.base_toughness = Some(5);
+            source.power = Some(7);
+            source.toughness = Some(5);
+            source.base_card_types = CardType {
+                supertypes: vec![Supertype::Legendary],
+                core_types: vec![CoreType::Artifact, CoreType::Creature],
+                subtypes: vec!["Equipment".to_string()],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![ContinuousModification::SetCardTypes {
+                    core_types: vec![CoreType::Enchantment],
+                }],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        // Core types replaced: enchantment only, no longer a creature or artifact.
+        assert_eq!(token.card_types.core_types, vec![CoreType::Enchantment]);
+        assert_eq!(
+            token.base_card_types.core_types,
+            vec![CoreType::Enchantment]
+        );
+        // CR 205.1a: the "Equipment" artifact subtype is no longer correlated, so it drops.
+        assert!(!token.card_types.subtypes.contains(&"Equipment".to_string()));
+        assert!(!token
+            .base_card_types
+            .subtypes
+            .contains(&"Equipment".to_string()));
+        // Supertypes are unaffected by a card-type replacement.
+        assert!(token.card_types.supertypes.contains(&Supertype::Legendary));
+        assert!(token
+            .base_card_types
+            .supertypes
+            .contains(&Supertype::Legendary));
+    }
+
+    /// CR 205.1a + CR 707.9b: a baked `RemoveType { Creature }` copy exception
+    /// removes the creature types with the Creature type, in both the live and
+    /// the base (copiable) card types. Kindred keeps the creature set
+    /// (CR 308.2).
+    #[test]
+    fn copy_token_remove_type_creature_drops_creature_types_in_card_and_base_types() {
+        for (core_types, subtypes, expected_core, expected_subtypes) in [
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Heartwood", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Heartwood"],
+            ),
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Vibranium", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Vibranium"],
+            ),
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Equipment", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Equipment"],
+            ),
+            (
+                vec![CoreType::Kindred, CoreType::Creature],
+                vec!["Eldrazi"],
+                vec![CoreType::Kindred],
+                vec!["Eldrazi"],
+            ),
+        ] {
+            let mut state = GameState::new_two_player(42);
+            state.all_creature_types = vec!["Bear".to_string(), "Eldrazi".to_string()];
+            let source_id = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Source".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let source = state.objects.get_mut(&source_id).unwrap();
+                source.base_card_types = CardType {
+                    supertypes: vec![],
+                    core_types: core_types.clone(),
+                    subtypes: subtypes.iter().map(|s| s.to_string()).collect(),
+                };
+                source.card_types = source.base_card_types.clone();
+            }
+
+            let mut events = Vec::new();
+            let ability = ResolvedAbility::new(
+                Effect::CopyTokenOf {
+                    attack_destination:
+                        crate::types::ability::TokenAttackDestination::ControllerChooses,
+                    target: TargetFilter::SelfRef,
+                    owner: TargetFilter::Controller,
+                    source_filter: None,
+                    enters_attacking: false,
+                    tapped: false,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    extra_keywords: vec![],
+                    additional_modifications: vec![ContinuousModification::RemoveType {
+                        core_type: CoreType::Creature,
+                    }],
+                },
+                vec![],
+                source_id,
+                PlayerId(0),
+            );
+            resolve(&mut state, &ability, &mut events).unwrap();
+
+            let token = state
+                .objects
+                .get(&ObjectId(state.next_object_id - 1))
+                .unwrap();
+            let expected_subtypes: Vec<String> =
+                expected_subtypes.iter().map(|s| s.to_string()).collect();
+            // Reach guard: the token exists, lost Creature and kept the expected type.
+            assert_eq!(token.card_types.core_types, expected_core);
+            assert_eq!(token.base_card_types.core_types, expected_core);
+            assert_eq!(token.card_types.subtypes, expected_subtypes);
+            assert_eq!(token.base_card_types.subtypes, expected_subtypes);
+        }
+    }
+
+    /// CR 205.1a + CR 707.2 + CR 707.9b: the immediate (liminal token) copy
+    /// exception path removes creature types with the Creature type too.
+    #[test]
+    fn immediate_copy_token_remove_type_creature_drops_creature_types() {
+        for (core_types, subtypes, expected_core, expected_subtypes) in [
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Heartwood", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Heartwood"],
+            ),
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Vibranium", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Vibranium"],
+            ),
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Equipment", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Equipment"],
+            ),
+            (
+                vec![CoreType::Kindred, CoreType::Creature],
+                vec!["Eldrazi"],
+                vec![CoreType::Kindred],
+                vec!["Eldrazi"],
+            ),
+        ] {
+            let mut token = GameObject::new(
+                ObjectId(900),
+                CardId(900),
+                PlayerId(0),
+                "Liminal Token".to_string(),
+                Zone::Battlefield,
+            );
+            token.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: core_types.clone(),
+                subtypes: subtypes.iter().map(|s| s.to_string()).collect(),
+            };
+            token.card_types = token.base_card_types.clone();
+
+            apply_immediate_copy_token_modifications_to_object(
+                &mut token,
+                &[ContinuousModification::RemoveType {
+                    core_type: CoreType::Creature,
+                }],
+                &["Bear".to_string(), "Eldrazi".to_string()],
+            );
+
+            let expected_subtypes: Vec<String> =
+                expected_subtypes.iter().map(|s| s.to_string()).collect();
+            assert_eq!(token.card_types.core_types, expected_core);
+            assert_eq!(token.base_card_types.core_types, expected_core);
+            assert_eq!(token.card_types.subtypes, expected_subtypes);
+            assert_eq!(token.base_card_types.subtypes, expected_subtypes);
+        }
+    }
+
+    #[test]
+    fn copy_token_artifact_subtypes_follow_owner_in_both_baked_paths() {
+        // CR 205.1a/205.3g + CR 707.9b: synthetic copy exceptions test the
+        // shared primitive, without claiming a printed token-animation pair.
+        for subtype in ["Heartwood", "Vibranium"] {
+            for (modification, core, expected_subtype) in [
+                (
+                    ContinuousModification::RemoveType {
+                        core_type: CoreType::Creature,
+                    },
+                    CoreType::Artifact,
+                    subtype,
+                ),
+                (
+                    ContinuousModification::RemoveType {
+                        core_type: CoreType::Artifact,
+                    },
+                    CoreType::Creature,
+                    "Bear",
+                ),
+                (
+                    ContinuousModification::SetCardTypes {
+                        core_types: vec![CoreType::Artifact],
+                    },
+                    CoreType::Artifact,
+                    subtype,
+                ),
+                (
+                    ContinuousModification::SetCardTypes {
+                        core_types: vec![CoreType::Creature],
+                    },
+                    CoreType::Creature,
+                    "Bear",
+                ),
+            ] {
+                let mut state = GameState::new_two_player(42);
+                state.all_creature_types = vec!["Bear".into(), "Elf".into()];
+                let source_id = create_object(
+                    &mut state,
+                    CardId(1),
+                    PlayerId(0),
+                    "Artifact copy source".into(),
+                    Zone::Battlefield,
+                );
+                let source = state.objects.get_mut(&source_id).unwrap();
+                source.base_card_types = CardType {
+                    supertypes: vec![Supertype::Legendary],
+                    core_types: vec![CoreType::Artifact, CoreType::Creature],
+                    subtypes: vec![subtype.into(), "Bear".into()],
+                };
+                source.card_types = source.base_card_types.clone();
+                let mut liminal = source.clone();
+                let ability = ResolvedAbility::new(
+                    Effect::CopyTokenOf {
+                        attack_destination:
+                            crate::types::ability::TokenAttackDestination::ControllerChooses,
+                        target: TargetFilter::SelfRef,
+                        owner: TargetFilter::Controller,
+                        source_filter: None,
+                        enters_attacking: false,
+                        tapped: false,
+                        count: QuantityExpr::Fixed { value: 1 },
+                        extra_keywords: vec![],
+                        additional_modifications: vec![modification.clone()],
+                    },
+                    vec![],
+                    source_id,
+                    PlayerId(0),
+                );
+                let mut events = Vec::new();
+                resolve(&mut state, &ability, &mut events).unwrap();
+                let token_id = ObjectId(state.next_object_id - 1);
+                assert_ne!(token_id, source_id);
+                let token = &state.objects[&token_id];
+                assert!(token.is_token, "reach: CopyTokenOf created a token");
+                assert_eq!(token.name, "Artifact copy source");
+                assert_eq!(
+                    state.objects[&source_id].card_types.subtypes,
+                    vec![subtype.to_string(), "Bear".to_string()]
+                );
+                apply_immediate_copy_token_modifications_to_object(
+                    &mut liminal,
+                    &[modification],
+                    &state.all_creature_types,
+                );
+                for object in [token, &liminal] {
+                    assert_eq!(object.card_types.core_types, vec![core]);
+                    assert_eq!(object.base_card_types.core_types, vec![core]);
+                    assert_eq!(
+                        object.card_types.subtypes,
+                        vec![expected_subtype.to_string()]
+                    );
+                    assert_eq!(
+                        object.base_card_types.subtypes,
+                        vec![expected_subtype.to_string()]
+                    );
+                    assert_eq!(object.card_types.supertypes, vec![Supertype::Legendary]);
+                    assert_eq!(
+                        object.base_card_types.supertypes,
+                        vec![Supertype::Legendary]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn copy_token_of_self_creates_copy() {
+        let mut state = GameState::new_two_player(42);
+
+        // Create a creature to copy
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mist-Syndicate Naga".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_power = Some(3);
+            source.base_toughness = Some(1);
+            source.power = Some(3);
+            source.toughness = Some(1);
+            source.base_color = vec![ManaColor::Blue];
+            source.color = vec![ManaColor::Blue];
+            source.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Snake".to_string(), "Ninja".to_string()],
+            };
+            source.card_types = source.base_card_types.clone();
+            source.base_keywords = vec![Keyword::Ninjutsu(Default::default())];
+            source.keywords = source.base_keywords.clone();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // Find the token (it's the newest object)
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+
+        assert_eq!(token.name, "Mist-Syndicate Naga");
+        assert_eq!(token.power, Some(3));
+        assert_eq!(token.toughness, Some(1));
+        assert_eq!(token.color, vec![ManaColor::Blue]);
+        assert!(token.card_types.core_types.contains(&CoreType::Creature));
+        assert!(token.card_types.subtypes.contains(&"Snake".to_string()));
+        assert!(token.is_token);
+        assert!(token.zone == Zone::Battlefield);
+        assert!(state.layers_dirty.is_dirty());
+        assert!(events.iter().any(
+            |e| matches!(e, GameEvent::TokenCreated { name, .. } if name == "Mist-Syndicate Naga")
+        ));
+        // Verify record_token_created was called
+        assert!(
+            state
+                .players_who_created_token_this_turn
+                .contains(&PlayerId(0)),
+            "should record token creation"
+        );
+    }
+
+    /// CR 707.2 + CR 111.10: a copy token sourced from a card with only a
+    /// runtime name, no printed ref, and no source-related token ids remains a
+    /// card-display copy even if the copied body matches a catalog token preset.
+    #[test]
+    fn copy_token_of_name_only_card_does_not_bind_catalog_preset() {
+        let mut state = GameState::new_two_player(42);
+
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Fanatic of Rhonas".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.display_source = DisplaySource::Card;
+            source.base_power = Some(4);
+            source.base_toughness = Some(4);
+            source.power = Some(4);
+            source.toughness = Some(4);
+            source.base_color = vec![ManaColor::Black];
+            source.color = vec![ManaColor::Black];
+            source.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec![
+                    "Zombie".to_string(),
+                    "Snake".to_string(),
+                    "Druid".to_string(),
+                ],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        assert!(token.is_token);
+        assert_eq!(token.name, "Fanatic of Rhonas");
+        assert_eq!(token.power, Some(4));
+        assert_eq!(token.toughness, Some(4));
+        assert_eq!(token.color, vec![ManaColor::Black]);
+        assert_eq!(token.card_types.core_types, vec![CoreType::Creature]);
+        assert_eq!(
+            token.card_types.subtypes,
+            vec![
+                "Zombie".to_string(),
+                "Snake".to_string(),
+                "Druid".to_string()
+            ]
+        );
+        assert_eq!(token.display_source, DisplaySource::Card);
+        assert_eq!(token.token_image_ref, None);
+    }
+
+    /// CR 614.1a + CR 707.2: A token-count-doubling replacement (Doubling
+    /// Season / Adrix and Nev / Parallel Lives / Anointed Procession / Mondrak)
+    /// applies to a token that's a *copy* of a permanent, exactly as it applies
+    /// to a predefined `Effect::Token`. Such doublers are CR 614.1a replacement
+    /// effects that modify the number of tokens created; copy-token creation
+    /// (CR 707.5 / CR 707.2) is a token-creation event, so the same replacement
+    /// applies: the doubling is applied first, then each copy enters with its
+    /// own ETB. Issue #1511 regression: `CopyTokenOf` previously created exactly
+    /// `count` copies, bypassing the `ProposedEvent::CreateToken` replacement
+    /// pipeline, so the doubler never saw the copy.
+    #[test]
+    fn copy_token_count_doubling_replacement_applies() {
+        let mut state = GameState::new_two_player(42);
+
+        // Doubling-Season-style mandatory token-count doubler, controller-scoped.
+        let doubler_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Doubling Season".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let doubler = state.objects.get_mut(&doubler_id).unwrap();
+            let def = ReplacementDefinition::new(ReplacementEvent::CreateToken)
+                .token_owner_scope(ControllerRef::You)
+                .quantity_modification(QuantityModification::DOUBLE);
+            doubler.base_replacement_definitions = Arc::new(vec![def.clone()]);
+            doubler.replacement_definitions = vec![def].into();
+        }
+
+        // The copy source — a 3/1 Snake.
+        let source_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Mist-Syndicate Naga".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_power = Some(3);
+            source.base_toughness = Some(1);
+            source.power = Some(3);
+            source.toughness = Some(1);
+            source.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Snake".to_string()],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // CR 614.1a: count 1 doubled to 2 — two independent copy tokens.
+        let copies: Vec<_> = state
+            .objects
+            .values()
+            .filter(|o| o.is_token && o.name == "Mist-Syndicate Naga")
+            .collect();
+        assert_eq!(
+            copies.len(),
+            2,
+            "token-count doubler must double a copy-token's count (issue #1511)"
+        );
+        // Each doubled copy enters with its own faithful characteristics + ETB.
+        assert!(copies
+            .iter()
+            .all(|t| t.power == Some(3) && t.toughness == Some(1)));
+        assert!(copies.iter().all(|t| t.zone == Zone::Battlefield));
+        assert_eq!(
+            state.last_created_token_ids.len(),
+            2,
+            "both doubled copy-token ids are recorded for downstream anaphora"
+        );
+        // CR 603.6a: each copy emits its own TokenCreated/ETB event.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    GameEvent::TokenCreated { name, .. } if name == "Mist-Syndicate Naga"
+                ))
+                .count(),
+            2,
+            "each doubled copy emits its own ETB/TokenCreated event"
+        );
+    }
+
+    /// CR 616.1 + CR 707.2: If copy-token creation is modified by
+    /// order-material token-count replacements, the resolver must pause for the
+    /// affected player's choice and then resume by creating real copy tokens,
+    /// not generic probe tokens.
+    #[test]
+    fn copy_token_replacement_choice_resumes_with_copy_payload() {
+        let mut state = GameState::new_two_player(42);
+
+        let doubler_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Doubling Season".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let doubler = state.objects.get_mut(&doubler_id).unwrap();
+            let def = ReplacementDefinition::new(ReplacementEvent::CreateToken)
+                .token_owner_scope(ControllerRef::You)
+                .quantity_modification(QuantityModification::DOUBLE);
+            doubler.base_replacement_definitions = Arc::new(vec![def.clone()]);
+            doubler.replacement_definitions = vec![def].into();
+        }
+
+        let plus_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Token Augmenter".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let plus = state.objects.get_mut(&plus_id).unwrap();
+            let def = ReplacementDefinition::new(ReplacementEvent::CreateToken)
+                .token_owner_scope(ControllerRef::You)
+                .quantity_modification(QuantityModification::Plus { value: 1 });
+            plus.base_replacement_definitions = Arc::new(vec![def.clone()]);
+            plus.replacement_definitions = vec![def].into();
+        }
+
+        let source_id = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Glasspool Mimic".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.printed_ref = Some(PrintedCardRef {
+                oracle_id: "glasspool-oracle".to_string(),
+                face_name: "Glasspool Mimic".to_string(),
+            });
+            source.base_printed_ref = source.printed_ref.clone();
+            source.display_source = DisplaySource::Card;
+            source.base_power = Some(3);
+            source.base_toughness = Some(3);
+            source.power = Some(3);
+            source.toughness = Some(3);
+            source.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Shapeshifter".to_string()],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            matches!(
+                state.waiting_for,
+                WaitingFor::ReplacementChoice {
+                    candidate_count: 2,
+                    ..
+                }
+            ),
+            "non-commuting copy-token count replacements must prompt for CR 616 order"
+        );
+        assert!(
+            state.last_created_token_ids.is_empty(),
+            "no copy token should be created before the replacement choice resolves"
+        );
+        assert!(
+            state.active_copy_token().is_some(),
+            "the replacement prompt must be owned by the active CopyToken frame"
+        );
+
+        let wire = ResolutionStateWire::from_game_state(state);
+        let serialized = serde_json::to_value(&wire).expect("CopyToken prompt serializes as v2");
+        assert!(
+            serialized.get("pending_copy_token_resolution").is_none(),
+            "v2 CopyToken prompts must not emit the removed v1 field"
+        );
+        let mut state = serde_json::from_value::<ResolutionStateWire>(serialized)
+            .expect("v2 CopyToken prompt roundtrips")
+            .into_game_state();
+        assert!(
+            state.active_copy_token().is_some(),
+            "roundtripped prompt keeps CopyToken as the active typed owner"
+        );
+
+        apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 }).unwrap();
+
+        assert!(
+            matches!(state.waiting_for, WaitingFor::Priority { .. }),
+            "copy-token resolution should finish after the replacement choice"
+        );
+        assert!(
+            (3..=4).contains(&state.last_created_token_ids.len()),
+            "chosen Double/Plus ordering should create three or four copies, not the unmodified one"
+        );
+        for token_id in &state.last_created_token_ids {
+            let token = state.objects.get(token_id).unwrap();
+            assert!(token.is_token);
+            assert_eq!(token.name, "Glasspool Mimic");
+            assert_eq!(token.power, Some(3));
+            assert_eq!(token.toughness, Some(3));
+            assert_eq!(token.display_source, DisplaySource::Card);
+            assert_eq!(
+                token
+                    .printed_ref
+                    .as_ref()
+                    .map(|printed| printed.face_name.as_str()),
+                Some("Glasspool Mimic"),
+                "replacement-choice resume must use the copy payload, not generic TokenSpec apply"
+            );
+        }
+    }
+
+    /// CR 614.1c + CR 707.2: ETB-counter replacement mutations live on the
+    /// accepted `CreateToken` event's `TokenSpec`; copy-token apply must consume
+    /// them in addition to the CR 707 copy payload.
+    #[test]
+    fn copy_token_creation_applies_etb_counter_replacement_payload() {
+        let mut state = GameState::new_two_player(42);
+
+        let counter_replacement_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Counter Mentor".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&counter_replacement_id).unwrap();
+            let def = ReplacementDefinition::new(ReplacementEvent::ChangeZone)
+                .valid_card(TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::You),
+                ))
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::PutCounter {
+                        target: TargetFilter::SelfRef,
+                        counter_type: CounterType::Plus1Plus1,
+                        count: QuantityExpr::Fixed { value: 1 },
+                    },
+                ));
+            source.base_replacement_definitions = Arc::new(vec![def.clone()]);
+            source.replacement_definitions = vec![def].into();
+        }
+
+        let source_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Runeclaw Bear".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_power = Some(2);
+            source.base_toughness = Some(2);
+            source.power = Some(2);
+            source.toughness = Some(2);
+            source.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Bear".to_string()],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = state.last_created_token_ids[0];
+        let token = state.objects.get(&token_id).unwrap();
+        assert_eq!(token.name, "Runeclaw Bear");
+        assert_eq!(
+            token.counters.get(&CounterType::Plus1Plus1).copied(),
+            Some(1),
+            "copy-token apply must consume accepted TokenSpec enter_with_counters"
+        );
+    }
+
+    /// Non-regression: without any token-count replacement active,
+    /// `CopyTokenOf { count: N }` creates exactly N copies.
+    #[test]
+    fn copy_token_count_without_doubler_is_exact() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_power = Some(2);
+            source.base_toughness = Some(2);
+            source.power = Some(2);
+            source.toughness = Some(2);
+            source.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Bear".to_string()],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 3 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let copies = state
+            .objects
+            .values()
+            .filter(|o| o.is_token && o.name == "Bear")
+            .count();
+        assert_eq!(copies, 3, "no doubler: exactly the requested count");
+    }
+
+    #[test]
+    fn copy_token_propagates_printed_ref_for_image_lookup() {
+        // A copy of a real-card permanent must carry the source's Scryfall
+        // image hint (oracle_id + displayed face_name) so the frontend resolves
+        // the same art. Regression: copying an MDFC face (The Prismatic Bridge)
+        // produced a token with `printed_ref: None`, which rendered blank in the
+        // legend-rule chooser because the back-face name is absent from the
+        // front-face-only image index.
+        let mut state = GameState::new_two_player(42);
+
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "The Prismatic Bridge".to_string(),
+            Zone::Battlefield,
+        );
+        let source_ref = crate::types::card::PrintedCardRef {
+            oracle_id: "92023a5d-a143-4950-a71b-d736e6b8e959".to_string(),
+            face_name: "The Prismatic Bridge".to_string(),
+        };
+        state.objects.get_mut(&source_id).unwrap().printed_ref = Some(source_ref.clone());
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        assert!(state.objects[&token_id].is_token);
+        assert_eq!(
+            state.objects[&token_id].printed_ref,
+            Some(source_ref.clone()),
+            "token copy must carry the source's printed_ref for image lookup"
+        );
+
+        // The fix is only durable if the token also carries `base_printed_ref`:
+        // the layer reset restores `printed_ref` from the baseline each pass, so
+        // without it the next `evaluate_layers` would wipe the art back to None.
+        crate::game::layers::evaluate_layers(&mut state);
+        assert_eq!(
+            state.objects[&token_id].printed_ref,
+            Some(source_ref),
+            "token copy's printed_ref must survive a layer evaluation pass"
+        );
+    }
+
+    #[test]
+    fn copy_token_of_target_creates_copy() {
+        let mut state = GameState::new_two_player(42);
+
+        let target_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let target = state.objects.get_mut(&target_id).unwrap();
+            target.base_power = Some(2);
+            target.base_toughness = Some(2);
+            target.power = Some(2);
+            target.toughness = Some(2);
+        }
+
+        let source_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Copier".to_string(),
+            Zone::Battlefield,
+        );
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![TargetRef::Object(target_id)],
+            source_id,
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        assert_eq!(token.name, "Grizzly Bears");
+        assert_eq!(token.power, Some(2));
+        assert_eq!(token.toughness, Some(2));
+        assert!(token.is_token);
+    }
+
+    /// Issue #2402: Hazel of the Rootbloom — copy a non-Squirrel token target
+    /// whose live characteristics must be mirrored into `base_*` fields by the
+    /// real token creation path before copy-token resolution reads copiable values.
+    #[test]
+    fn issue_2402_copy_token_of_token_target_creates_copy() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Hazel".to_string(),
+            Zone::Battlefield,
+        );
+        let create_food = ResolvedAbility::new(
+            Effect::Token {
+                name: "Food".to_string(),
+                power: PtValue::Fixed(0),
+                toughness: PtValue::Fixed(0),
+                types: vec!["Artifact".to_string(), "Food".to_string()],
+                colors: vec![],
+                keywords: vec![],
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                owner: TargetFilter::Controller,
+                attach_to: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                supertypes: vec![],
+                static_abilities: vec![],
+                enter_with_counters: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        crate::game::effects::token::resolve(&mut state, &create_food, &mut events).unwrap();
+        crate::game::layers::evaluate_layers(&mut state);
+        let food = state.last_created_token_ids[0];
+        let food_token = state.objects.get(&food).unwrap();
+        assert!(food_token.base_characteristics_initialized);
+        assert_eq!(food_token.base_name, "Food");
+        assert_eq!(
+            food_token.base_card_types.core_types,
+            vec![CoreType::Artifact]
+        );
+        assert_eq!(food_token.base_card_types.subtypes, vec!["Food"]);
+
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![TargetRef::Object(food)],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let copy_id = ObjectId(state.next_object_id - 1);
+        let copy = state.objects.get(&copy_id).unwrap();
+        assert!(copy.is_token);
+        assert_eq!(copy.name, "Food");
+        assert_eq!(copy.card_types.core_types, vec![CoreType::Artifact]);
+        assert_eq!(copy.card_types.subtypes, vec!["Food"]);
+    }
+
+    /// CR 109.4 + CR 111.2: "target opponent creates a token that's a copy of
+    /// it" — the copy token must enter under the chosen opponent's control,
+    /// not the trigger controller's. Pins the new `owner` channel at the
+    /// building-block level (issue #403 defect 1).
+    #[test]
+    fn copy_token_of_owner_creates_under_chosen_player() {
+        let mut state = GameState::new_two_player(42);
+
+        // The copy source — a permanent controlled by PlayerId(0).
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Wedding Ring".to_string(),
+            Zone::Battlefield,
+        );
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                // Copy source stays Wedding Ring itself.
+                target: TargetFilter::SelfRef,
+                // Non-context-ref owner filter — resolved from `ability.targets`.
+                owner: TargetFilter::Typed(
+                    crate::types::ability::TypedFilter::default()
+                        .controller(crate::types::ability::ControllerRef::Opponent),
+                ),
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            // The chosen opponent target.
+            vec![TargetRef::Player(PlayerId(1))],
+            source_id,
+            // Wedding Ring's trigger controller is PlayerId(0).
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        // The token is a copy of Wedding Ring (the source), not a player.
+        assert_eq!(token.name, "Wedding Ring");
+        assert!(token.is_token);
+        // CR 109.4: the token is controlled (and owned) by the chosen opponent.
+        assert_eq!(
+            token.controller,
+            PlayerId(1),
+            "copy token must be controlled by the chosen opponent, not the trigger controller"
+        );
+        assert_eq!(token.owner, PlayerId(1));
+    }
+
+    /// CR 109.4: the default `owner` of `TargetFilter::Controller` keeps the
+    /// copy under the resolving ability's controller (the common case —
+    /// populate, "you create a token that's a copy of …").
+    #[test]
+    fn copy_token_of_default_owner_is_controller() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Llanowar Elves".to_string(),
+            Zone::Battlefield,
+        );
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        assert_eq!(token.controller, PlayerId(0));
+    }
+
+    /// CR 609.3 + CR 101.3: An unattached Springheart Nantuko resolves
+    /// `CopyTokenOf { target: AttachedTo }` with no host — `AttachedTo`
+    /// resolves empty. The effect must be a clean zero-token no-op (no token
+    /// created, `Ok` not `Err`) so the chained Insect-token fallback can fire.
+    #[test]
+    fn copy_token_of_empty_host_is_clean_no_op() {
+        let mut state = GameState::new_two_player(42);
+        // Source object with no `attached_to` — `AttachedTo` resolves empty.
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Springheart Nantuko".to_string(),
+            Zone::Battlefield,
+        );
+        let objects_before = state.objects.len();
+
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::AttachedTo,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).expect("empty host must be a clean no-op");
+
+        assert_eq!(
+            state.objects.len(),
+            objects_before,
+            "no token may be created when the AttachedTo host is empty"
+        );
+        assert!(
+            state.last_created_token_ids.is_empty(),
+            "no token ids recorded for an empty-host no-op"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GameEvent::EffectResolved { .. })),
+            "EffectResolved must still be emitted so the chain proceeds"
+        );
+    }
+
+    #[test]
+    fn copy_token_of_cost_paid_object_creates_requested_copies() {
+        let mut state = GameState::new_two_player(42);
+
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Osgir, the Reconstructor".to_string(),
+            Zone::Battlefield,
+        );
+        let artifact_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Ichor Wellspring".to_string(),
+            Zone::Exile,
+        );
+        {
+            let artifact = state.objects.get_mut(&artifact_id).unwrap();
+            artifact.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Artifact],
+                subtypes: vec![],
+            };
+            artifact.card_types = artifact.base_card_types.clone();
+        }
+
+        let snapshot = {
+            let artifact = state.objects.get(&artifact_id).unwrap();
+            CostPaidObjectSnapshot {
+                object_id: artifact_id,
+                lki: artifact.snapshot_for_mana_spent(),
+                incarnation: 0,
+            }
+        };
+        let mut ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::CostPaidObject,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 2 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        ability.set_cost_paid_object_recursive(snapshot);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let copies: Vec<_> = state
+            .objects
+            .values()
+            .filter(|object| object.is_token && object.name == "Ichor Wellspring")
+            .collect();
+        assert_eq!(copies.len(), 2);
+        assert!(copies.iter().all(|token| token.zone == Zone::Battlefield));
+        assert!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::TokenCreated { name, .. } if name == "Ichor Wellspring"
+                ))
+                .count()
+                >= 2
+        );
+    }
+
+    /// CR 603.10a / Vaultborn Tyrant + Ochre Jelly class: LTB self-copy triggers
+    /// fire after the source has moved to the graveyard. The parsed effect is
+    /// `CopyTokenOf { target: ParentTarget }` with empty `ability.targets`; the
+    /// resolver must copy the source object from the graveyard.
+    #[test]
+    fn copy_token_of_parent_target_from_graveyard() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Vaultborn Tyrant".to_string(),
+            Zone::Graveyard,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_power = Some(6);
+            source.base_toughness = Some(6);
+            source.power = Some(6);
+            source.toughness = Some(6);
+            source.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Dinosaur".to_string()],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::ParentTarget,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        assert!(token.is_token);
+        assert_eq!(token.name, "Vaultborn Tyrant");
+        assert_eq!(token.power, Some(6));
+        assert_eq!(token.toughness, Some(6));
+        // Source remains in graveyard (we only copy it, we don't move it).
+        assert_eq!(state.objects[&source_id].zone, Zone::Graveyard);
+    }
+
+    /// CR 603.7 + CR 707.2: "copy of that card" after an exile instruction
+    /// must read the tracked set published by the prior zone change. Copy
+    /// sources are zone-agnostic, so an exiled card is a valid source.
+    #[test]
+    fn copy_token_of_tracked_set_source_from_exile() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Kheru Goldkeeper".to_string(),
+            Zone::Exile,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_power = Some(3);
+            source.base_toughness = Some(3);
+            source.power = Some(3);
+            source.toughness = Some(3);
+            source.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Zombie".to_string()],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+        state
+            .tracked_object_sets
+            .insert(TrackedSetId(1), vec![source_id]);
+
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(1),
+                },
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: true,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        assert!(token.is_token);
+        assert!(token.tapped);
+        assert_eq!(token.name, "Kheru Goldkeeper");
+        assert_eq!(token.power, Some(3));
+        assert_eq!(token.toughness, Some(3));
+    }
+
+    #[test]
+    fn copy_token_enters_tapped_and_attacking() {
+        let mut state = GameState::new_two_player(42);
+
+        // Set up combat
+        state.combat = Some(crate::game::combat::CombatState::default());
+
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_power = Some(2);
+            source.base_toughness = Some(2);
+            source.power = Some(2);
+            source.toughness = Some(2);
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: true,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: true,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![TargetRef::Object(source_id)],
+            source_id,
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+
+        // CR 508.4: Token enters tapped and attacking
+        assert!(token.tapped);
+        let combat = state.combat.as_ref().unwrap();
+        assert!(combat.attackers.iter().any(|a| a.object_id == token_id));
+    }
+
+    /// CR 707.2 + CR 702.10 (Haste): Twinflame's "except it has haste" — copy
+    /// tokens carry the source's keywords plus the granted extra keyword.
+    #[test]
+    fn copy_token_extra_keywords_grant_haste() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let s = state.objects.get_mut(&source_id).unwrap();
+            s.base_power = Some(2);
+            s.base_toughness = Some(2);
+            s.power = Some(2);
+            s.toughness = Some(2);
+            s.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Bear".to_string()],
+            };
+            s.card_types = s.base_card_types.clone();
+        }
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![Keyword::Haste],
+                additional_modifications: vec![],
+            },
+            vec![TargetRef::Object(source_id)],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        assert!(token.is_token);
+        assert!(token.keywords.contains(&Keyword::Haste));
+        assert!(token.base_keywords.contains(&Keyword::Haste));
+    }
+
+    /// CR 115.1d + CR 601.2c: Twinflame's "for each of them" — multi-target
+    /// CopyTokenOf creates one copy per object in `ability.targets`, and all
+    /// created token IDs are recorded in `state.last_created_token_ids` so the
+    /// "those tokens" anaphor in the delayed exile trigger captures the full
+    /// set.
+    #[test]
+    fn copy_token_multi_target_creates_one_per_target() {
+        let mut state = GameState::new_two_player(42);
+        let bear_a = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Bear A".to_string(),
+            Zone::Battlefield,
+        );
+        let bear_b = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Bear B".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [bear_a, bear_b] {
+            let s = state.objects.get_mut(&id).unwrap();
+            s.base_power = Some(2);
+            s.base_toughness = Some(2);
+            s.power = Some(2);
+            s.toughness = Some(2);
+            s.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Bear".to_string()],
+            };
+            s.card_types = s.base_card_types.clone();
+        }
+        let twinflame_src = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Twinflame".to_string(),
+            Zone::Stack,
+        );
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::ParentTarget,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![Keyword::Haste],
+                additional_modifications: vec![],
+            },
+            vec![TargetRef::Object(bear_a), TargetRef::Object(bear_b)],
+            twinflame_src,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+        // Two new tokens, both with haste.
+        assert_eq!(state.last_created_token_ids.len(), 2);
+        for token_id in &state.last_created_token_ids {
+            let t = state.objects.get(token_id).unwrap();
+            assert!(t.is_token);
+            assert!(t.keywords.contains(&Keyword::Haste));
+        }
+        // Names follow each respective source.
+        let names: Vec<&str> = state
+            .last_created_token_ids
+            .iter()
+            .map(|id| state.objects[id].name.as_str())
+            .collect();
+        assert!(names.contains(&"Bear A"));
+        assert!(names.contains(&"Bear B"));
+    }
+
+    #[test]
+    fn copy_token_source_filter_copies_matching_tokens_not_source() {
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 5;
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Ocelot Pride".to_string(),
+            Zone::Battlefield,
+        );
+        let cat_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Cat".to_string(),
+            Zone::Battlefield,
+        );
+        let old_cat_id = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Old Cat".to_string(),
+            Zone::Battlefield,
+        );
+        let opponent_cat_id = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(1),
+            "Opponent Cat".to_string(),
+            Zone::Battlefield,
+        );
+        for (id, turn) in [
+            (cat_id, Some(5)),
+            (old_cat_id, Some(4)),
+            (opponent_cat_id, Some(5)),
+        ] {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.is_token = true;
+            obj.entered_battlefield_turn = turn;
+            obj.base_power = Some(1);
+            obj.base_toughness = Some(1);
+            obj.power = Some(1);
+            obj.toughness = Some(1);
+            obj.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Cat".to_string()],
+            };
+            obj.card_types = obj.base_card_types.clone();
+        }
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::ParentTarget,
+                owner: TargetFilter::Controller,
+                source_filter: Some(TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![],
+                    controller: Some(ControllerRef::You),
+                    properties: vec![FilterProp::Token, FilterProp::EnteredThisTurn],
+                })),
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+        assert_eq!(state.last_created_token_ids.len(), 1);
+        let copied = state.objects.get(&state.last_created_token_ids[0]).unwrap();
+        assert_eq!(copied.name, "Cat");
+        assert!(copied.is_token);
+    }
+
+    #[test]
+    fn copy_token_source_filter_copies_graveyard_quest_counter_creature_card() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Altaïr Ibn-La'Ahad".to_string(),
+            Zone::Battlefield,
+        );
+        let quest_creature = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Quest Creature".to_string(),
+            Zone::Graveyard,
+        );
+        {
+            let obj = state.objects.get_mut(&quest_creature).unwrap();
+            obj.base_power = Some(2);
+            obj.base_toughness = Some(2);
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Assassin".to_string()],
+            };
+            obj.card_types = obj.base_card_types.clone();
+            obj.counters
+                .insert(CounterType::Generic("quest".to_string()), 1);
+        }
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::None,
+                owner: TargetFilter::Controller,
+                source_filter: Some(TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature, TypeFilter::Card],
+                    controller: None,
+                    properties: vec![
+                        FilterProp::InZone {
+                            zone: Zone::Graveyard,
+                        },
+                        FilterProp::Counters {
+                            counters: CounterMatch::OfType(CounterType::Generic(
+                                "quest".to_string(),
+                            )),
+                            comparator: crate::types::ability::Comparator::GE,
+                            count: QuantityExpr::Fixed { value: 1 },
+                        },
+                    ],
+                })),
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.last_created_token_ids.len(), 1);
+        let copied = state.objects.get(&state.last_created_token_ids[0]).unwrap();
+        assert_eq!(copied.name, "Quest Creature");
+        assert!(copied.is_token);
+    }
+
+    #[test]
+    fn copy_token_source_filter_copies_each_matching_graveyard_source() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Copy Source".to_string(),
+            Zone::Battlefield,
+        );
+        let stale_token = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Stale Token".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&stale_token).unwrap().is_token = true;
+        state.last_created_token_ids = vec![stale_token];
+
+        let first_match = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "First Match".to_string(),
+            Zone::Graveyard,
+        );
+        let second_match = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(0),
+            "Second Match".to_string(),
+            Zone::Graveyard,
+        );
+        let wrong_counter = create_object(
+            &mut state,
+            CardId(5),
+            PlayerId(0),
+            "Wrong Counter".to_string(),
+            Zone::Graveyard,
+        );
+        for (id, counter) in [
+            (first_match, "quest"),
+            (second_match, "quest"),
+            (wrong_counter, "lore"),
+        ] {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.base_power = Some(2);
+            obj.base_toughness = Some(2);
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec![],
+            };
+            obj.card_types = obj.base_card_types.clone();
+            obj.counters
+                .insert(CounterType::Generic(counter.to_string()), 1);
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::None,
+                owner: TargetFilter::Controller,
+                source_filter: Some(TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature, TypeFilter::Card],
+                    controller: None,
+                    properties: vec![
+                        FilterProp::InZone {
+                            zone: Zone::Graveyard,
+                        },
+                        FilterProp::Counters {
+                            counters: CounterMatch::OfType(CounterType::Generic(
+                                "quest".to_string(),
+                            )),
+                            comparator: crate::types::ability::Comparator::GE,
+                            count: QuantityExpr::Fixed { value: 1 },
+                        },
+                    ],
+                })),
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.last_created_token_ids.len(), 2);
+        assert!(!state.last_created_token_ids.contains(&stale_token));
+        let names: Vec<&str> = state
+            .last_created_token_ids
+            .iter()
+            .map(|id| state.objects[id].name.as_str())
+            .collect();
+        assert!(names.contains(&"First Match"));
+        assert!(names.contains(&"Second Match"));
+        assert!(!names.contains(&"Wrong Counter"));
+    }
+
+    #[test]
+    fn copy_token_source_filter_ignores_wrong_zone_and_wrong_counter() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Copy Source".to_string(),
+            Zone::Battlefield,
+        );
+        let battlefield_quest = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Battlefield Quest".to_string(),
+            Zone::Battlefield,
+        );
+        let graveyard_lore = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Graveyard Lore".to_string(),
+            Zone::Graveyard,
+        );
+        for (id, counter) in [(battlefield_quest, "quest"), (graveyard_lore, "lore")] {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.base_power = Some(2);
+            obj.base_toughness = Some(2);
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec![],
+            };
+            obj.card_types = obj.base_card_types.clone();
+            obj.counters
+                .insert(CounterType::Generic(counter.to_string()), 1);
+        }
+        let next_before = state.next_object_id;
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::None,
+                owner: TargetFilter::Controller,
+                source_filter: Some(TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature, TypeFilter::Card],
+                    controller: None,
+                    properties: vec![
+                        FilterProp::InZone {
+                            zone: Zone::Graveyard,
+                        },
+                        FilterProp::Counters {
+                            counters: CounterMatch::OfType(CounterType::Generic(
+                                "quest".to_string(),
+                            )),
+                            comparator: crate::types::ability::Comparator::GE,
+                            count: QuantityExpr::Fixed { value: 1 },
+                        },
+                    ],
+                })),
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.next_object_id, next_before);
+        assert!(state.last_created_token_ids.is_empty());
+    }
+
+    #[test]
+    fn copy_token_zero_match_clears_stale_last_created_before_cleanup() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Copy Source".to_string(),
+            Zone::Battlefield,
+        );
+        let stale_token = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Stale Token".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&stale_token).unwrap().is_token = true;
+        state.last_created_token_ids = vec![stale_token];
+
+        let mut events = Vec::new();
+        let copy_ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::None,
+                owner: TargetFilter::Controller,
+                source_filter: Some(TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature, TypeFilter::Card],
+                    controller: None,
+                    properties: vec![
+                        FilterProp::InZone {
+                            zone: Zone::Graveyard,
+                        },
+                        FilterProp::Counters {
+                            counters: CounterMatch::OfType(CounterType::Generic(
+                                "quest".to_string(),
+                            )),
+                            comparator: crate::types::ability::Comparator::GE,
+                            count: QuantityExpr::Fixed { value: 1 },
+                        },
+                    ],
+                })),
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &copy_ability, &mut events).unwrap();
+        assert!(state.last_created_token_ids.is_empty());
+
+        let cleanup = ResolvedAbility::new(
+            Effect::ChangeZone {
+                actor: crate::types::ability::LibraryInstructionActor::Controller,
+                library_shuffle: Default::default(),
+                origin: Some(Zone::Battlefield),
+                destination: Zone::Exile,
+                target: TargetFilter::LastCreated,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        crate::game::effects::change_zone::resolve(&mut state, &cleanup, &mut events).unwrap();
+        assert_eq!(state.objects[&stale_token].zone, Zone::Battlefield);
+    }
+
+    /// CR 205.4 + CR 707.9b + CR 704.5j: Miirym, Sentinel Wyrm class —
+    /// `additional_modifications: [RemoveSupertype(Legendary)]` strips the
+    /// Legendary supertype from the synthesized token. The legend rule
+    /// (CR 704.5j) only collapses legendary permanents, so two such tokens
+    /// must coexist on the battlefield without state-based action collapse.
+    #[test]
+    fn copy_token_remove_supertype_strips_legendary_from_token() {
+        let mut state = GameState::new_two_player(42);
+        // Source is a legendary creature (e.g., a Dragon).
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Bahamut".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let s = state.objects.get_mut(&source_id).unwrap();
+            s.base_power = Some(7);
+            s.base_toughness = Some(7);
+            s.power = Some(7);
+            s.toughness = Some(7);
+            s.base_card_types = CardType {
+                supertypes: vec![Supertype::Legendary],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Dragon".to_string()],
+            };
+            s.card_types = s.base_card_types.clone();
+        }
+
+        // Synthesize Miirym's CopyTokenOf with the RemoveSupertype modification.
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![ContinuousModification::RemoveSupertype {
+                    supertype: Supertype::Legendary,
+                }],
+            },
+            vec![TargetRef::Object(source_id)],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        assert!(token.is_token);
+        // Layered view: Legendary stripped.
+        assert!(
+            !token.card_types.supertypes.contains(&Supertype::Legendary),
+            "token must not be Legendary; got {:?}",
+            token.card_types.supertypes
+        );
+        // Base view: Legendary stripped from the copiable values too — the
+        // exception is part of the copy effect's bake-in (CR 707.2), so future
+        // copies-of-this-token also start without Legendary.
+        assert!(
+            !token
+                .base_card_types
+                .supertypes
+                .contains(&Supertype::Legendary),
+            "token's base_card_types must not contain Legendary; got {:?}",
+            token.base_card_types.supertypes
+        );
+    }
+
+    /// CR 205.4 + CR 707.9d: Adagia, Windswept Bastion class —
+    /// `additional_modifications: [AddSupertype(Legendary)]` grants Legendary
+    /// to a token copy of a non-legendary permanent.
+    #[test]
+    fn copy_token_add_supertype_grants_legendary_to_nonlegendary_source() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Sol Ring".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let s = state.objects.get_mut(&source_id).unwrap();
+            s.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Artifact],
+                subtypes: vec![],
+            };
+            s.card_types = s.base_card_types.clone();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![ContinuousModification::AddSupertype {
+                    supertype: Supertype::Legendary,
+                }],
+            },
+            vec![TargetRef::Object(source_id)],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        assert!(token.is_token);
+        assert!(
+            token.card_types.supertypes.contains(&Supertype::Legendary),
+            "token must be Legendary; got {:?}",
+            token.card_types.supertypes
+        );
+    }
+
+    /// CR 704.5j + CR 707.9b: Issue #685 regression. When token-copy strips
+    /// the Legendary supertype via `additional_modifications`, the legend
+    /// rule SBA must NOT prompt the controller to choose which copy to
+    /// sacrifice — the token is no longer Legendary, so there is exactly one
+    /// Legendary permanent with the shared name (the original). Both
+    /// permanents must remain on the battlefield. This is the SBA-side
+    /// counterpart to the parser-side fix for the contracted "it's not
+    /// legendary" form (Delina, Wild Mage; Ratadrabik of Urborg; etc.).
+    #[test]
+    fn legend_rule_does_not_fire_when_copy_token_drops_legendary() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Bahamut".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let s = state.objects.get_mut(&source_id).unwrap();
+            s.base_power = Some(7);
+            s.base_toughness = Some(7);
+            s.power = Some(7);
+            s.toughness = Some(7);
+            s.base_card_types = CardType {
+                supertypes: vec![Supertype::Legendary],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Dragon".to_string()],
+            };
+            s.card_types = s.base_card_types.clone();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![ContinuousModification::RemoveSupertype {
+                    supertype: Supertype::Legendary,
+                }],
+            },
+            vec![TargetRef::Object(source_id)],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = state.last_created_token_ids[0];
+
+        // Run state-based actions; the legend rule SBA must NOT fire because
+        // the token is not Legendary.
+        let mut sba_events = Vec::new();
+        crate::game::sba::check_state_based_actions(&mut state, &mut sba_events);
+
+        assert!(
+            !matches!(
+                state.waiting_for,
+                crate::types::game_state::WaitingFor::ChooseLegend { .. }
+            ),
+            "legend rule must not present a choice when token is not legendary; \
+             got waiting_for={:?}",
+            state.waiting_for
+        );
+        assert_eq!(
+            state.objects[&source_id].zone,
+            Zone::Battlefield,
+            "original legendary creature must remain on battlefield"
+        );
+        assert_eq!(
+            state.objects[&token_id].zone,
+            Zone::Battlefield,
+            "non-legendary token-copy must remain on battlefield"
+        );
+    }
+
+    /// CR 704.5j + CR 707.9b: A token-copy exception that renames the copy
+    /// avoids the legend rule through the generic `SetName` modification path,
+    /// without any SBA special-case for Mishra, Eminent One.
+    #[test]
+    fn legend_rule_does_not_fire_when_copy_token_is_renamed() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mishra, Eminent One".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_card_types = CardType {
+                supertypes: vec![Supertype::Legendary],
+                core_types: vec![CoreType::Artifact],
+                subtypes: vec![],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+
+        let oracle = "create a token that's a copy of target noncreature artifact you control, except its name is ~'s Warform and it's a 4/4 Construct artifact creature in addition to its other types";
+        let mut ctx = crate::parser::oracle_ir::context::ParseContext {
+            card_name: Some("Mishra, Eminent One".to_string()),
+            ..Default::default()
+        };
+        let effect =
+            crate::parser::oracle_effect::try_parse_token(&oracle.to_lowercase(), oracle, &mut ctx)
+                .expect("Mishra token-copy text should parse");
+        let Effect::CopyTokenOf {
+            additional_modifications,
+            ..
+        } = &effect
+        else {
+            panic!("expected parser-produced CopyTokenOf, got {effect:?}");
+        };
+        assert!(
+            additional_modifications.iter().any(|m| matches!(
+                m,
+                ContinuousModification::SetName { name } if name == "Mishra's Warform"
+            )),
+            "runtime regression must be driven by the parser-produced Mishra's Warform rename; got {additional_modifications:?}"
+        );
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            effect,
+            vec![TargetRef::Object(source_id)],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = state.last_created_token_ids[0];
+        let mut sba_events = Vec::new();
+        crate::game::sba::check_state_based_actions(&mut state, &mut sba_events);
+
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::ChooseLegend { .. }),
+            "legend rule must not present a choice when the copy token has a distinct name; \
+             got waiting_for={:?}",
+            state.waiting_for
+        );
+        assert_eq!(state.objects[&source_id].zone, Zone::Battlefield);
+        let token = &state.objects[&token_id];
+        assert_eq!(token.zone, Zone::Battlefield);
+        assert_eq!(token.name, "Mishra's Warform");
+        assert_eq!(token.base_name, "Mishra's Warform");
+        assert_eq!(token.power, Some(4));
+        assert_eq!(token.toughness, Some(4));
+        assert!(
+            token.card_types.core_types.contains(&CoreType::Artifact),
+            "renamed copy token must be an artifact; got {:?}",
+            token.card_types.core_types
+        );
+        assert!(
+            token.card_types.core_types.contains(&CoreType::Creature),
+            "renamed copy token must be a creature; got {:?}",
+            token.card_types.core_types
+        );
+        assert!(
+            token.card_types.subtypes.contains(&"Construct".to_string()),
+            "renamed copy token must be a Construct; got {:?}",
+            token.card_types.subtypes
+        );
+    }
+
+    #[test]
+    fn mishra_shaped_copy_token_surfaces_liminal_enter_as_copy_choice() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mishra, Eminent One".to_string(),
+            Zone::Battlefield,
+        );
+        let mirror_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Cursed Mirror".to_string(),
+            Zone::Battlefield,
+        );
+        let target_id = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Silver Myr".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let mirror = state.objects.get_mut(&mirror_id).unwrap();
+            mirror.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Artifact],
+                subtypes: vec![],
+            };
+            mirror.card_types = mirror.base_card_types.clone();
+            let replacement = ReplacementDefinition::new(ReplacementEvent::Moved)
+                .mode(ReplacementMode::Optional { decline: None })
+                .valid_card(TargetFilter::SelfRef)
+                .destination_zone(Zone::Battlefield)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::BecomeCopy {
+                        target: TargetFilter::Typed(TypedFilter::creature()),
+                        recipient: crate::types::ability::CopyRecipient::Source,
+                        duration: None,
+                        mana_value_limit: None,
+                        additional_modifications: Vec::new(),
+                    },
+                ));
+            mirror.replacement_definitions.push(replacement.clone());
+            Arc::make_mut(&mut mirror.base_replacement_definitions).push(replacement);
+        }
+        {
+            let target = state.objects.get_mut(&target_id).unwrap();
+            target.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Artifact, CoreType::Creature],
+                subtypes: vec!["Myr".to_string()],
+            };
+            target.card_types = target.base_card_types.clone();
+            target.base_power = Some(1);
+            target.power = Some(1);
+            target.base_toughness = Some(1);
+            target.toughness = Some(1);
+        }
+
+        let oracle = "create a token that's a copy of target noncreature artifact you control, except its name is ~'s Warform and it's a 4/4 Construct artifact creature in addition to its other types";
+        let mut ctx = crate::parser::oracle_ir::context::ParseContext {
+            card_name: Some("Mishra, Eminent One".to_string()),
+            ..Default::default()
+        };
+        let effect =
+            crate::parser::oracle_effect::try_parse_token(&oracle.to_lowercase(), oracle, &mut ctx)
+                .expect("Mishra token-copy text should parse");
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            effect,
+            vec![TargetRef::Object(mirror_id)],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let WaitingFor::ReplacementChoice { .. } = state.waiting_for.clone() else {
+            panic!(
+                "expected optional liminal enter-as-copy ReplacementChoice, got {:?}",
+                state.waiting_for
+            );
+        };
+        apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 })
+            .expect("accepting optional enter-as-copy replacement should resolve");
+
+        let WaitingFor::CopyTargetChoice {
+            source_id: liminal_id,
+            valid_targets,
+            ..
+        } = state.waiting_for.clone()
+        else {
+            panic!(
+                "expected liminal CopyTargetChoice, got {:?}",
+                state.waiting_for
+            );
+        };
+        assert!(
+            state.liminal_entries.contains_key(&liminal_id),
+            "copy choice source must be the uncommitted liminal token"
+        );
+        assert!(
+            !state.objects.contains_key(&liminal_id),
+            "liminal token must not be committed before the copy target choice"
+        );
+        assert!(valid_targets.contains(&target_id));
+
+        apply_as_current(
+            &mut state,
+            GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(target_id)),
+            },
+        )
+        .expect("copy target choice should resolve");
+
+        let token = state
+            .objects
+            .get(&liminal_id)
+            .expect("liminal token should commit after choice");
+        assert_eq!(token.name, "Mishra's Warform");
+        assert_eq!(token.base_name, "Mishra's Warform");
+        assert_eq!(token.power, Some(4));
+        assert_eq!(token.toughness, Some(4));
+        assert!(token.card_types.core_types.contains(&CoreType::Artifact));
+        assert!(token.card_types.core_types.contains(&CoreType::Creature));
+        assert!(token.card_types.subtypes.contains(&"Construct".to_string()));
+    }
+
+    /// CR 122.1 + CR 614.1c: AddCounterOnEnter with matching `if_type` places
+    /// the counter on the synthesized token. Spark Double's planeswalker copy
+    /// branch is exercised at the BecomeCopy resolver site; this test pins
+    /// the same primitive on the token-copy path.
+    #[test]
+    fn copy_token_add_counter_on_enter_unconditional() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Soldier".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let s = state.objects.get_mut(&source_id).unwrap();
+            s.base_power = Some(2);
+            s.base_toughness = Some(2);
+            s.power = Some(2);
+            s.toughness = Some(2);
+            s.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec![],
+            };
+            s.card_types = s.base_card_types.clone();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![ContinuousModification::AddCounterOnEnter {
+                    counter_type: CounterType::Plus1Plus1,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    if_type: None,
+                }],
+            },
+            vec![TargetRef::Object(source_id)],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        let p1p1 = token
+            .counters
+            .get(&crate::types::counter::CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            p1p1, 1,
+            "token should have one +1/+1 counter; counters={:?}",
+            token.counters
+        );
+    }
+
+    #[test]
+    fn paused_copy_token_add_counter_on_enter_preserves_remaining_batch() {
+        let mut state = GameState::new_two_player(42);
+        let replacement_source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Counter Choice".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let mut def = ReplacementDefinition::new(ReplacementEvent::AddCounter)
+                .valid_card(TargetFilter::Any)
+                .quantity_modification(QuantityModification::Prevent);
+            def.mode = crate::types::ability::ReplacementMode::Optional { decline: None };
+            let obj = state.objects.get_mut(&replacement_source).unwrap();
+            obj.base_replacement_definitions = Arc::new(vec![def.clone()]);
+            obj.replacement_definitions = vec![def].into();
+        }
+
+        let source_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Soldier".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_power = Some(2);
+            source.base_toughness = Some(2);
+            source.power = Some(2);
+            source.toughness = Some(2);
+            source.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Soldier".to_string()],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 2 },
+                extra_keywords: vec![],
+                additional_modifications: vec![ContinuousModification::AddCounterOnEnter {
+                    counter_type: CounterType::Plus1Plus1,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    if_type: None,
+                }],
+            },
+            vec![TargetRef::Object(source_id)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        assert_eq!(
+            state
+                .resolution_stack
+                .iter()
+                .map(crate::types::resolution::ResolutionFrame::kind)
+                .collect::<Vec<_>>(),
+            vec![FrameKind::CopyToken, FrameKind::CounterAdditions],
+            "a counter-replacement pause must keep CopyToken below its active counter child"
+        );
+        assert!(
+            state.active_copy_token().is_none(),
+            "top-only access must not search through the active counter child"
+        );
+        let serialized = serde_json::to_value(ResolutionStateWire::from_game_state(state))
+            .expect("nested CopyToken counter prompt serializes as v2");
+        let mut state = serde_json::from_value::<ResolutionStateWire>(serialized)
+            .expect("nested CopyToken counter prompt roundtrips")
+            .into_game_state();
+        assert_eq!(
+            state
+                .resolution_stack
+                .iter()
+                .map(crate::types::resolution::ResolutionFrame::kind)
+                .collect::<Vec<_>>(),
+            vec![FrameKind::CopyToken, FrameKind::CounterAdditions],
+            "v2 must preserve the CopyToken parent beneath its counter child"
+        );
+
+        let mut choice_events = Vec::new();
+        for _ in 0..2 {
+            let result =
+                apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 }).unwrap();
+            choice_events.extend(result.events);
+        }
+
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+        assert_eq!(
+            state.last_created_token_ids.len(),
+            2,
+            "copy-token counter pauses must preserve the current token and remaining copies"
+        );
+        for token_id in &state.last_created_token_ids {
+            let token = state.objects.get(token_id).unwrap();
+            assert!(token.is_token);
+            assert_eq!(token.name, "Soldier");
+        }
+        assert_eq!(
+            choice_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::EffectResolved {
+                        kind: EffectKind::CopyTokenOf,
+                        source_id: ObjectId(100),
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the copy-token effect should resolve once after the paused batch finishes"
+        );
+    }
+
+    /// CR 707.9f: Conditional `if_type` declines when the resolved object's
+    /// core type doesn't match. Token-copy of a non-creature with
+    /// `AddCounterOnEnter { if_type: Some(Creature) }` must NOT place the
+    /// counter (mirrors Spark Double's "if it's a creature" branch on a
+    /// planeswalker copy).
+    #[test]
+    fn copy_token_add_counter_on_enter_if_type_mismatch_skips() {
+        let mut state = GameState::new_two_player(42);
+        // Copy source: a planeswalker (no Creature core type).
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Jace".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let s = state.objects.get_mut(&source_id).unwrap();
+            s.base_loyalty = Some(3);
+            s.loyalty = Some(3);
+            s.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Planeswalker],
+                subtypes: vec!["Jace".to_string()],
+            };
+            s.card_types = s.base_card_types.clone();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![ContinuousModification::AddCounterOnEnter {
+                    counter_type: CounterType::Plus1Plus1,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    if_type: Some(CoreType::Creature),
+                }],
+            },
+            vec![TargetRef::Object(source_id)],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        let p1p1 = token
+            .counters
+            .get(&crate::types::counter::CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            p1p1, 0,
+            "if_type=Creature must skip on a Planeswalker copy; counters={:?}",
+            token.counters
+        );
+    }
+
+    /// CR 306.5b + CR 306.5c + CR 707.2: A token that's a copy of a planeswalker
+    /// must enter with loyalty counters equal to the copied loyalty — the copy
+    /// path builds the object directly, bypassing the ZoneChange ETB-counter
+    /// seeding, so it must seed loyalty counters itself. Pre-fix the copy carried
+    /// only the `loyalty` field with no counter, so once the layer system treats
+    /// the counter map as the source of truth (CR 306.5c) the copy would read 0
+    /// loyalty and die immediately to CR 704.5i.
+    #[test]
+    fn copy_token_of_planeswalker_seeds_loyalty_counters() {
+        use crate::game::layers::evaluate_layers;
+
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Jace".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let s = state.objects.get_mut(&source_id).unwrap();
+            s.base_loyalty = Some(5);
+            s.loyalty = Some(5);
+            s.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Planeswalker],
+                subtypes: vec!["Jace".to_string()],
+            };
+            s.card_types = s.base_card_types.clone();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![TargetRef::Object(source_id)],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        assert_eq!(
+            state.objects[&token_id]
+                .counters
+                .get(&CounterType::Loyalty)
+                .copied(),
+            Some(5),
+            "planeswalker copy must seed loyalty counters equal to copied loyalty",
+        );
+
+        // The copy must survive a layer re-evaluation at its real loyalty, not
+        // snap to 0 (it's still on the battlefield, not in the graveyard).
+        evaluate_layers(&mut state);
+        let token = &state.objects[&token_id];
+        assert_eq!(token.zone, Zone::Battlefield);
+        assert_eq!(
+            token.loyalty,
+            Some(5),
+            "copied planeswalker loyalty must derive from its seeded counters",
+        );
+    }
+
+    /// CR 707.9b + CR 306.5b/c: Jace, Mirror Mage's token-copy exception sets
+    /// the copy's starting loyalty to 1. This is not an extra loyalty counter;
+    /// it replaces the loyalty value used for intrinsic planeswalker counter
+    /// seeding, so the token must enter with one loyalty counter even if the
+    /// copied source has a different loyalty value.
+    #[test]
+    fn copy_token_starting_loyalty_exception_overrides_seeded_loyalty() {
+        use crate::game::layers::evaluate_layers;
+
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Jace, Mirror Mage".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_loyalty = Some(5);
+            source.loyalty = Some(5);
+            source.base_card_types = CardType {
+                supertypes: vec![crate::types::card_type::Supertype::Legendary],
+                core_types: vec![CoreType::Planeswalker],
+                subtypes: vec!["Jace".to_string()],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![
+                    ContinuousModification::RemoveSupertype {
+                        supertype: crate::types::card_type::Supertype::Legendary,
+                    },
+                    ContinuousModification::SetStartingLoyalty { value: 1 },
+                ],
+            },
+            vec![TargetRef::Object(source_id)],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = &state.objects[&token_id];
+        assert_eq!(token.base_loyalty, Some(1));
+        assert_eq!(token.printed_loyalty, Some(PrintedLoyalty::Fixed(1)));
+        assert_eq!(token.base_printed_loyalty, Some(PrintedLoyalty::Fixed(1)));
+        assert_eq!(
+            token.counters.get(&CounterType::Loyalty).copied(),
+            Some(1),
+            "starting-loyalty exception must seed one loyalty counter"
+        );
+        assert!(!token
+            .card_types
+            .supertypes
+            .contains(&crate::types::card_type::Supertype::Legendary));
+
+        evaluate_layers(&mut state);
+        let token = &state.objects[&token_id];
+        assert_eq!(token.zone, Zone::Battlefield);
+        assert_eq!(token.loyalty, Some(1));
+    }
+
+    /// Regression: Helm of the Host (DOM, MH3, BLC) — pin the already-shipped
+    /// non-legendary token-copy behavior so a future refactor cannot silently
+    /// drop the `RemoveSupertype { Legendary }` stamp.
+    ///
+    /// Helm of the Host's begin-combat trigger creates a token that's a copy
+    /// of equipped creature, "except the token isn't legendary." When the
+    /// equipped creature IS legendary, the synthesized token must not be
+    /// legendary — both the layered view (`card_types.supertypes`) and the
+    /// copiable-values view (`base_card_types.supertypes`) must be free of
+    /// `Supertype::Legendary`. Otherwise the legend rule (CR 704.5j) would
+    /// collapse the token alongside its source.
+    ///
+    /// This test exercises the resolver with Helm's full ability shape:
+    /// `Effect::CopyTokenOf { target: Typed[Creature]+EquippedBy,
+    /// additional_modifications: [RemoveSupertype(Legendary)] }`. The general
+    /// resolver behavior is also pinned by
+    /// `copy_token_remove_supertype_strips_legendary_from_token` (Miirym
+    /// class); this test anchors the named card so the behavior cannot
+    /// regress without an explicit failure pointing at Helm of the Host.
+    ///
+    /// CR 707.9b + CR 205.4 + CR 301.5a: copy modifications, supertype
+    /// semantics, and the equipped-creature relationship.
+    #[test]
+    fn helm_of_the_host_token_copy_strips_legendary_from_equipped_creature() {
+        let mut state = GameState::new_two_player(42);
+
+        // Equipped creature: a legendary 7/7 Dragon (e.g., Bahamut).
+        let equipped_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Bahamut".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let s = state.objects.get_mut(&equipped_id).unwrap();
+            s.base_power = Some(7);
+            s.base_toughness = Some(7);
+            s.power = Some(7);
+            s.toughness = Some(7);
+            s.base_card_types = CardType {
+                supertypes: vec![Supertype::Legendary],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Dragon".to_string()],
+            };
+            s.card_types = s.base_card_types.clone();
+        }
+
+        // Helm of the Host: non-legendary Equipment artifact attached to the
+        // equipped creature. The trigger source for the begin-combat trigger.
+        let helm_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Helm of the Host".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let s = state.objects.get_mut(&helm_id).unwrap();
+            s.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Artifact],
+                subtypes: vec!["Equipment".to_string()],
+            };
+            s.card_types = s.base_card_types.clone();
+            s.attached_to = Some(equipped_id.into());
+        }
+
+        // Resolve Helm's begin-combat trigger: CopyTokenOf with the exact
+        // Helm AST shape (`target: Typed[Creature]+EquippedBy`,
+        // `additional_modifications: [RemoveSupertype(Legendary)]`). After
+        // trigger resolution the engine has bound `EquippedBy` to the
+        // equipped creature, so the resolved ability carries
+        // `targets: [Object(equipped_id)]`.
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    controller: None,
+                    properties: vec![FilterProp::EquippedBy],
+                }),
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![ContinuousModification::RemoveSupertype {
+                    supertype: Supertype::Legendary,
+                }],
+            },
+            vec![TargetRef::Object(equipped_id)],
+            helm_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+
+        // CR 707.2: token copies the equipped creature's name, P/T, and types.
+        assert!(token.is_token);
+        assert_eq!(token.name, "Bahamut");
+        assert_eq!(token.power, Some(7));
+        assert_eq!(token.toughness, Some(7));
+
+        // CR 707.9b + CR 205.4: layered view has Legendary stripped.
+        assert!(
+            !token.card_types.supertypes.contains(&Supertype::Legendary),
+            "token must not be Legendary; got supertypes={:?}",
+            token.card_types.supertypes
+        );
+
+        // CR 707.9b: copiable-values view also has Legendary stripped — the
+        // exception is part of the copy effect's bake-in, so future copies
+        // of this token also start without Legendary.
+        assert!(
+            !token
+                .base_card_types
+                .supertypes
+                .contains(&Supertype::Legendary),
+            "token's base_card_types must not contain Legendary; got {:?}",
+            token.base_card_types.supertypes
+        );
+
+        // CR 704.5j: with the original legendary creature and the
+        // non-legendary token-copy both on the battlefield, the legend rule
+        // SBA must NOT fire — there is exactly one Legendary permanent named
+        // "Bahamut" (the source); the token shares the name but is not
+        // legendary, so it is not a candidate for collapse.
+        let mut sba_events = Vec::new();
+        crate::game::sba::check_state_based_actions(&mut state, &mut sba_events);
+
+        assert!(
+            !matches!(
+                state.waiting_for,
+                crate::types::game_state::WaitingFor::ChooseLegend { .. }
+            ),
+            "legend rule must not present a choice when the token is not legendary; \
+             got waiting_for={:?}",
+            state.waiting_for
+        );
+        // Both permanents survive on the battlefield.
+        assert_eq!(
+            state.objects[&equipped_id].zone,
+            Zone::Battlefield,
+            "original legendary creature must remain on battlefield"
+        );
+        assert_eq!(
+            state.objects[&token_id].zone,
+            Zone::Battlefield,
+            "non-legendary token-copy must remain on battlefield"
+        );
+    }
+
+    /// CR 702.175a: Offspring creates a token that's a copy of the creature,
+    /// except it's 1/1. `SetPower`/`SetToughness` in `additional_modifications`
+    /// must override the copied base P/T at creation time.
+    #[test]
+    fn offspring_token_is_1_1_not_copy_pt() {
+        let mut state = GameState::new_two_player(42);
+
+        // Create a 3/2 creature (the "parent" with offspring).
+        let parent_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Coruscation Mage".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let parent = state.objects.get_mut(&parent_id).unwrap();
+            parent.base_power = Some(3);
+            parent.base_toughness = Some(2);
+            parent.power = Some(3);
+            parent.toughness = Some(2);
+            parent.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Human".to_string(), "Wizard".to_string()],
+            };
+            parent.card_types = parent.base_card_types.clone();
+        }
+
+        let mut events = Vec::new();
+
+        // Simulate the offspring ETB trigger: CopyTokenOf with SetPower(1), SetToughness(1).
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![
+                    ContinuousModification::SetPower { value: 1 },
+                    ContinuousModification::SetToughness { value: 1 },
+                ],
+            },
+            vec![],
+            parent_id,
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // Find the token (newest object).
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+
+        // Token must be 1/1, not 3/2.
+        assert_eq!(
+            token.base_power,
+            Some(1),
+            "offspring token base_power must be 1"
+        );
+        assert_eq!(
+            token.base_toughness,
+            Some(1),
+            "offspring token base_toughness must be 1"
+        );
+        assert_eq!(token.power, Some(1), "offspring token power must be 1");
+        assert_eq!(
+            token.toughness,
+            Some(1),
+            "offspring token toughness must be 1"
+        );
+        // Name and types are still copied.
+        assert_eq!(token.name, "Coruscation Mage");
+        assert!(token.card_types.subtypes.contains(&"Wizard".to_string()));
+        assert!(token.is_token);
+        assert!(
+            !token
+                .keywords
+                .iter()
+                .any(|kw| matches!(kw, crate::types::keywords::Keyword::Offspring(_))),
+            "offspring token must not retain the cast-only Offspring keyword"
+        );
+        assert!(
+            !token.trigger_definitions.iter_all().any(|trig| matches!(
+                trig.definition.condition,
+                Some(TriggerCondition::AdditionalCostPaid { .. })
+            )),
+            "offspring token must not retain AdditionalCostPaid ETB triggers"
+        );
+    }
+
+    /// CR 707.2 vs CR 601.2f + CR 603.4: copy-token finalization strips only
+    /// cast-payment-gated triggers ("if its offspring cost was paid" / "if it
+    /// was kicked"). Persistent spell-cast observers — Magecraft's
+    /// `SpellCastOrCopy`, generic "whenever you cast a [type] spell"
+    /// `SpellCast` — are copiable battlefield text and must survive on the
+    /// token copy.
+    #[test]
+    fn copy_token_keeps_spell_cast_triggers_strips_payment_gated_triggers() {
+        let mut state = GameState::new_two_player(42);
+
+        let parent_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Archmage Emeritus".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let parent = state.objects.get_mut(&parent_id).unwrap();
+            parent.base_power = Some(2);
+            parent.base_toughness = Some(2);
+            parent.power = Some(2);
+            parent.toughness = Some(2);
+            parent.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Human".to_string(), "Wizard".to_string()],
+            };
+            parent.card_types = parent.base_card_types.clone();
+
+            // Magecraft-style persistent battlefield trigger (CR 707.10 note:
+            // observes casts/copies; it is not itself cast-time bookkeeping).
+            let magecraft = TriggerDefinition::new(TriggerMode::SpellCastOrCopy).description(
+                "Magecraft — Whenever you cast or copy an instant or sorcery spell, draw a card."
+                    .to_string(),
+            );
+            // Offspring-style ETB trigger gated on a cast-time payment.
+            let offspring_etb = TriggerDefinition::new(TriggerMode::ChangesZone)
+                .destination(Zone::Battlefield)
+                .valid_card(TargetFilter::SelfRef)
+                .condition(TriggerCondition::AdditionalCostPaid {
+                    source: AdditionalCostPaymentSource::Any,
+                    origin: None,
+                    origin_ordinal: None,
+                    variant: None,
+                    kicker_cost: None,
+                    min_count: 1,
+                })
+                .description("offspring etb".to_string());
+            parent.base_trigger_definitions = Arc::new(vec![magecraft, offspring_etb]);
+            parent.trigger_definitions = Arc::clone(&parent.base_trigger_definitions).into();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            parent_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        assert!(token.is_token);
+        assert!(
+            token
+                .trigger_definitions
+                .iter_all()
+                .any(|trig| matches!(trig.definition.mode, TriggerMode::SpellCastOrCopy)),
+            "token copy must keep the persistent Magecraft SpellCastOrCopy trigger (CR 707.2)"
+        );
+        assert!(
+            token
+                .base_trigger_definitions
+                .iter()
+                .any(|trig| matches!(trig.mode, TriggerMode::SpellCastOrCopy)),
+            "copiable base triggers must also keep the SpellCastOrCopy trigger (CR 707.2)"
+        );
+        assert!(
+            !token.trigger_definitions.iter_all().any(|trig| matches!(
+                trig.definition.condition,
+                Some(TriggerCondition::AdditionalCostPaid { .. })
+            )),
+            "token copy must strip cast-payment-gated triggers (CR 601.2f + CR 603.4)"
+        );
+    }
+
+    /// CR 707.9b: dynamic copy exceptions are resolved after the copied values
+    /// are stamped onto the token, then baked into the token's base P/T.
+    #[test]
+    fn copy_token_dynamic_pt_exception_uses_copied_values() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Sawed Beast".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_power = Some(5);
+            source.base_toughness = Some(4);
+            source.power = Some(5);
+            source.toughness = Some(4);
+            source.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Beast".to_string()],
+            };
+            source.card_types = source.base_card_types.clone();
+        }
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![
+                    ContinuousModification::SetPowerDynamic {
+                        value: QuantityExpr::DivideRounded {
+                            inner: Box::new(QuantityExpr::Ref {
+                                qty: QuantityRef::Power {
+                                    scope: ObjectScope::Source,
+                                },
+                            }),
+                            divisor: 2,
+                            rounding: RoundingMode::Up,
+                        },
+                    },
+                    ContinuousModification::SetToughnessDynamic {
+                        value: QuantityExpr::DivideRounded {
+                            inner: Box::new(QuantityExpr::Ref {
+                                qty: QuantityRef::Toughness {
+                                    scope: ObjectScope::Source,
+                                },
+                            }),
+                            divisor: 2,
+                            rounding: RoundingMode::Up,
+                        },
+                    },
+                ],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        assert_eq!(token.base_power, Some(3));
+        assert_eq!(token.power, Some(3));
+        assert_eq!(token.base_toughness, Some(2));
+        assert_eq!(token.toughness, Some(2));
+        assert_eq!(token.name, "Sawed Beast");
+        assert!(token.is_token);
+    }
+
+    /// Count copy-tokens of `copied_name` controlled by `player` on the
+    /// battlefield (CR 111.2 — the player who creates a token is its owner and
+    /// the token enters under that player's control).
+    fn copy_tokens_for(state: &GameState, player: PlayerId, copied_name: &str) -> usize {
+        state
+            .battlefield
+            .iter()
+            .filter_map(|id| state.objects.get(id))
+            .filter(|obj| obj.is_token && obj.name == copied_name && obj.controller == player)
+            .count()
+    }
+
+    /// CR 707.2 + CR 608.2c + CR 109.4 + CR 608.2h: Fractured Identity end-to-end
+    /// in a 3-player game. Exile a permanent P1 controls, then EACH PLAYER OTHER
+    /// THAN ITS CONTROLLER (P1) creates a token copy. P0 and P2 each get exactly
+    /// one copy; P1 (the exiled permanent's controller) gets none. The exclusion
+    /// anchor resolves through the ability-aware `players_for_filter` using the
+    /// exiled object's preserved last-known controller.
+    #[test]
+    fn fractured_identity_three_player_excludes_exiled_controller() {
+        use crate::game::scenario::GameScenario;
+        use crate::types::phase::Phase;
+
+        let p0 = PlayerId(0);
+        let p1 = PlayerId(1);
+        let p2 = PlayerId(2);
+
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        // The exile target: a creature P1 owns and controls.
+        let creature = scenario.add_creature(p1, "Grizzly Bears", 2, 2).id();
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(
+                p0,
+                "Fractured Identity",
+                false,
+                "Exile target nonland permanent. Each player other than its controller \
+                 creates a token that's a copy of it.",
+            )
+            .id();
+        let mut runner = scenario.build();
+
+        let outcome = runner.cast(spell).target_object(creature).resolve();
+        let state = outcome.state();
+
+        assert_eq!(
+            state.objects[&creature].zone,
+            Zone::Exile,
+            "the targeted permanent must be exiled"
+        );
+        assert_eq!(
+            copy_tokens_for(state, p0, "Grizzly Bears"),
+            1,
+            "P0 (not the controller) must create one copy"
+        );
+        assert_eq!(
+            copy_tokens_for(state, p2, "Grizzly Bears"),
+            1,
+            "P2 (not the controller) must create one copy"
+        );
+        assert_eq!(
+            copy_tokens_for(state, p1, "Grizzly Bears"),
+            0,
+            "P1 (the exiled permanent's controller) must NOT create a copy"
+        );
+    }
+
+    /// CR 109.4 + CR 608.2h: "its controller" should anchor on the exiled
+    /// permanent's last-known battlefield CONTROLLER, not its owner. A creature
+    /// P1 owns but P0 controls (Mind Control style) is exiled; "each player other
+    /// than its controller" should exclude P0, so only P1 creates a copy.
+    ///
+    /// `parent_target_controller` now prefers the LKI snapshot (captured before
+    /// `reset_for_battlefield_exit` reverts the controller to the owner) for any
+    /// object that is no longer on the battlefield (CR 608.2h).
+    #[test]
+    fn fractured_identity_its_controller_excludes_controller_not_owner() {
+        use crate::game::scenario::GameScenario;
+        use crate::types::phase::Phase;
+
+        let p0 = PlayerId(0);
+        let p1 = PlayerId(1);
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        // A creature P1 OWNS but P0 CONTROLS.
+        let creature = scenario.add_creature(p1, "Grizzly Bears", 2, 2).id();
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(
+                p0,
+                "Fractured Identity",
+                false,
+                "Exile target nonland permanent. Each player other than its controller \
+                 creates a token that's a copy of it.",
+            )
+            .id();
+        let mut runner = scenario.build();
+        // Simulate a stolen-control effect: P0 controls the P1-owned creature.
+        // `base_controller` is the layer-stable control anchor (layers reset
+        // `controller` to `base_controller.unwrap_or(owner)`), so both must be set
+        // for the control change to survive recomputation.
+        {
+            let obj = runner.state_mut().objects.get_mut(&creature).unwrap();
+            obj.base_controller = Some(p0);
+            obj.controller = p0;
+        }
+
+        let outcome = runner.cast(spell).target_object(creature).resolve();
+        let state = outcome.state();
+
+        assert_eq!(state.objects[&creature].zone, Zone::Exile);
+        assert_eq!(
+            copy_tokens_for(state, p1, "Grizzly Bears"),
+            1,
+            "P1 (not the controller) must create one copy"
+        );
+        assert_eq!(
+            copy_tokens_for(state, p0, "Grizzly Bears"),
+            0,
+            "P0 (the controller of the exiled permanent) must NOT create a copy"
+        );
+    }
+
+    // ── Chatterfang's appended Squirrels share the created referent ──────────
+    //
+    // Chatterfang ruling: the additional Squirrels "won't have any abilities the
+    // other tokens were created with", but anything else the creating effect
+    // specifies ("That token gains haste", "Exile that token …") applies to both
+    // the original tokens and the Squirrels.
+
+    const CHATTERFANG: &str = "Forestwalk (This creature can't be blocked as long as defending player controls a Forest.)\nIf one or more tokens would be created under your control, those tokens plus that many 1/1 green Squirrel creature tokens are created instead.\n{B}, Sacrifice X Squirrels: Target creature gets +X/-X until end of turn.";
+    const COGWORK_ASSEMBLER: &str = "{7}: Create a token that's a copy of target artifact. That token gains haste. Exile it at the beginning of the next end step.";
+    const HEAT_SHIMMER: &str = "Create a token that's a copy of target creature, except it has haste and \"At the beginning of the end step, exile this token.\"";
+
+    /// Every battlefield token named `name`.
+    fn battlefield_tokens(state: &GameState, name: &str) -> Vec<ObjectId> {
+        state
+            .battlefield
+            .iter()
+            .copied()
+            .filter(|id| state.objects[id].is_token && state.objects[id].name == name)
+            .collect()
+    }
+
+    /// The one battlefield token named `name`.
+    fn the_battlefield_token(state: &GameState, name: &str) -> ObjectId {
+        let found = battlefield_tokens(state, name);
+        assert_eq!(found.len(), 1, "exactly one {name} token: {found:?}");
+        found[0]
+    }
+
+    /// Advance to the end step with no attackers and let its triggers resolve.
+    fn finish_at_end_step(runner: &mut crate::game::scenario::GameRunner) {
+        use crate::types::phase::Phase;
+
+        runner.advance_to_end_step();
+        if matches!(
+            runner.state().waiting_for,
+            WaitingFor::DeclareAttackers { .. }
+        ) {
+            runner
+                .declare_attackers(&[])
+                .expect("declaring no attackers is legal");
+            runner.advance_to_end_step();
+        }
+        assert_eq!(runner.state().phase, Phase::End);
+        runner.advance_until_stack_empty();
+    }
+
+    /// CR 707.2 + CR 614.1a + CR 608.2c: Cogwork Assembler with Chatterfang out,
+    /// on the copy route: one copy and one Squirrel, both hasty and both in the
+    /// created referent (the copy first); at the next end step "Exile it" exiles
+    /// both.
+    #[test]
+    fn chatterfang_squirrel_shares_copy_token_exile_rider() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::mana::{ManaType, ManaUnit};
+        use crate::types::phase::Phase;
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let assembler = scenario
+            .add_artifact_from_oracle(P0, "Cogwork Assembler", COGWORK_ASSEMBLER)
+            .id();
+        scenario.add_creature_from_oracle(P0, "Chatterfang, Squirrel General", 3, 3, CHATTERFANG);
+        scenario.with_mana_pool(
+            P0,
+            (0..7)
+                .map(|_| ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]))
+                .collect(),
+        );
+        let mut runner = scenario.build();
+        let index = runner.state().objects[&assembler]
+            .abilities
+            .iter()
+            .position(|ability| matches!(ability.kind, AbilityKind::Activated))
+            .expect("Cogwork Assembler's activated ability");
+        runner
+            .activate(assembler, index)
+            .target_object(assembler)
+            .resolve();
+        assert!(runner.state().stack.is_empty(), "the activation resolved");
+
+        let state = runner.state();
+        // Reach-guards: the copy exists and Chatterfang's replacement applied.
+        let copy = the_battlefield_token(state, "Cogwork Assembler");
+        let squirrel = the_battlefield_token(state, "Squirrel");
+        assert!(state.objects[&copy].has_keyword(&Keyword::Haste));
+        // CR 702.10a: "That token gains haste" reaches the Squirrel too.
+        assert!(
+            state.objects[&squirrel].has_keyword(&Keyword::Haste),
+            "the Squirrel gains haste"
+        );
+        assert_eq!(state.last_created_token_ids, vec![copy, squirrel]);
+
+        // CR 603.7c: the delayed "Exile it" affects both tokens.
+        finish_at_end_step(&mut runner);
+        let state = runner.state();
+        assert!(!state.battlefield.contains(&copy), "the copy is exiled");
+        assert!(
+            !state.battlefield.contains(&squirrel),
+            "the Squirrel is exiled"
+        );
+    }
+
+    /// Negative sibling (Chatterfang ruling: the Squirrels "won't have any
+    /// abilities the other tokens were created with"): Heat Shimmer's haste and
+    /// end-step exile are copy exceptions (CR 707.9a), so they belong to the copy
+    /// only. The Squirrel is not hasty and survives the end step.
+    #[test]
+    fn heat_shimmer_copy_exceptions_do_not_reach_chatterfang_squirrel() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::phase::Phase;
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_creature_from_oracle(P0, "Chatterfang, Squirrel General", 3, 3, CHATTERFANG);
+        let bears = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+        let shimmer = scenario
+            .add_spell_to_hand_from_oracle(P0, "Heat Shimmer", false, HEAT_SHIMMER)
+            .id();
+        let mut runner = scenario.build();
+        runner.cast(shimmer).target_object(bears).resolve();
+
+        let state = runner.state();
+        let copy = the_battlefield_token(state, "Grizzly Bears");
+        let squirrel = the_battlefield_token(state, "Squirrel");
+        assert!(state.objects[&copy].has_keyword(&Keyword::Haste));
+        assert!(
+            !state.objects[&squirrel].has_keyword(&Keyword::Haste),
+            "the Squirrel does not get the copy's haste"
+        );
+
+        finish_at_end_step(&mut runner);
+        let state = runner.state();
+        // Reach-guard: the copy's own end-step trigger exiled it.
+        assert!(!state.battlefield.contains(&copy), "the copy is exiled");
+        assert!(
+            state.battlefield.contains(&squirrel),
+            "the Squirrel survives the end step"
+        );
+    }
+
+    /// CR 104.4b + CR 608.2h: an inferred own-source "copy of it"
+    /// (`ParentTarget` / `None`, no source filter) may read its departed
+    /// source's last-known copiable values, so loop normalisation keeps them;
+    /// a filtered copy source never reads them and they are still pruned.
+    #[test]
+    fn normalize_for_loop_keeps_the_values_an_inferred_own_source_copy_reads() {
+        use crate::types::game_state::{loop_states_equal, StackEntry, StackEntryKind};
+        use crate::types::identifiers::CardId;
+
+        let source = ObjectId(5);
+        let captured = 7;
+        let state_with = |target: TargetFilter, source_filter: Option<TargetFilter>, name: &str| {
+            let mut state = GameState::new_two_player(7);
+            let values_object = create_object(
+                &mut state,
+                CardId(90),
+                PlayerId(0),
+                "Copy Source".to_string(),
+                Zone::Exile,
+            );
+            let mut values = crate::game::printed_cards::intrinsic_copiable_values(
+                &state.objects[&values_object],
+            );
+            values.name = name.to_string();
+            let mut ability = ResolvedAbility::new(
+                Effect::CopyTokenOf {
+                    target,
+                    owner: TargetFilter::Controller,
+                    source_filter,
+                    enters_attacking: false,
+                    attack_destination:
+                        crate::types::ability::TokenAttackDestination::ControllerChooses,
+                    tapped: false,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    extra_keywords: vec![],
+                    additional_modifications: vec![],
+                },
+                vec![],
+                source,
+                PlayerId(0),
+            );
+            ability.source_incarnation = Some(captured);
+            state.stack.push_back(StackEntry {
+                id: ObjectId(20),
+                source_id: source,
+                controller: PlayerId(0),
+                kind: StackEntryKind::TriggeredAbility {
+                    source_id: source,
+                    ability: Box::new(ability),
+                    condition: None,
+                    trigger_event: None,
+                    description: None,
+                    source_name: String::new(),
+                    subject_match_count: None,
+                    die_result: None,
+                    provenance: None,
+                },
+            });
+            state
+                .lki_copiable_values_by_incarnation
+                .entry(source)
+                .or_default()
+                .insert(captured, values);
+            state
+        };
+        // Normalisation renames the retained incarnation keys, so read the values.
+        let retained = |state: &GameState| {
+            state
+                .normalize_for_loop()
+                .lki_copiable_values_by_incarnation
+                .get(&source)
+                .and_then(|history| history.values().next().map(|values| values.name.clone()))
+        };
+
+        for target in [TargetFilter::ParentTarget, TargetFilter::None] {
+            let departed = state_with(target.clone(), None, "Departed");
+            assert_eq!(
+                retained(&departed),
+                Some("Departed".to_string()),
+                "{target:?}: the captured incarnation's values survive"
+            );
+            let other = state_with(target.clone(), None, "Other");
+            assert!(
+                !loop_states_equal(&departed.normalize_for_loop(), &other.normalize_for_loop()),
+                "{target:?}: values the copy can read distinguish two loop states"
+            );
+        }
+
+        let filtered = state_with(
+            TargetFilter::ParentTarget,
+            Some(TargetFilter::Any),
+            "Departed",
+        );
+        assert_eq!(
+            retained(&filtered),
+            None,
+            "a filtered copy source never reads the own source's values"
+        );
+    }
+
+    /// A front-face-up transform card on the battlefield whose stored face is
+    /// `layout`, as Kessig Prowler // Sinuous Predator stores it.
+    fn double_faced_donor(state: &mut GameState, layout: Option<LayoutKind>) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(1),
+            PlayerId(0),
+            "Kessig Prowler".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&id).unwrap().back_face = Some(BackFaceData {
+            name: "Sinuous Predator".to_string(),
+            power: Some(4),
+            toughness: Some(4),
+            card_types: CardType {
+                core_types: vec![CoreType::Creature],
+                ..CardType::default()
+            },
+            layout_kind: layout,
+            ..BackFaceData::default()
+        });
+        id
+    }
+
+    /// The copy source as `CopySource::live` reads it.
+    fn live_source(state: &GameState, id: ObjectId) -> CopySource {
+        let obj = &state.objects[&id];
+        CopySource {
+            incarnation: ObjectIncarnationRef::from_object(obj),
+            values: crate::game::printed_cards::intrinsic_copiable_values(obj),
+            display: obj.display_identity(),
+        }
+    }
+
+    fn capture_after(
+        layout: Option<LayoutKind>,
+        tweak: impl FnOnce(&mut GameObject, &mut CopySource),
+    ) -> Option<CopiedDoubleFaces> {
+        let mut state = GameState::new_two_player(42);
+        let id = double_faced_donor(&mut state, layout);
+        let mut source = live_source(&state, id);
+        tweak(state.objects.get_mut(&id).unwrap(), &mut source);
+        copied_double_faces(&state, &source)
+    }
+
+    /// CR 707.8a + CR 712.8d/e/f: the capture's up face follows the donor's
+    /// flags, and its hidden face is the donor's stored face, whether that face
+    /// has a printed layout (Kessig Prowler) or none (an Incubator token's Phyrexian face, CR 111.10i).
+    #[test]
+    fn copied_double_faces_follows_the_up_face() {
+        for layout in [Some(LayoutKind::Transform), None] {
+            let faces = capture_after(layout, |_, _| {}).expect("a front-up donor has faces");
+            assert_eq!(faces.up, CopiedFaceUp::Front);
+            assert_eq!(faces.hidden.name, "Sinuous Predator");
+            assert_eq!(faces.hidden.layout_kind, layout);
+        }
+        let faces = capture_after(Some(LayoutKind::Transform), |obj, _| obj.transformed = true)
+            .expect("a transformed donor has faces");
+        assert_eq!(faces.up, CopiedFaceUp::TransformedBack);
+        let faces = capture_after(Some(LayoutKind::Modal), |obj, _| obj.modal_back_face = true)
+            .expect("a modal donor cast back face up has faces");
+        assert_eq!(faces.up, CopiedFaceUp::ModalBack);
+    }
+
+    /// CR 707.8a + CR 613.2: under a Layer-1 copy effect the hidden face is the
+    /// copied values (Mirrorweave making Kessig Prowler a Grizzly Bears), and it
+    /// keeps the stored face's layout.
+    #[test]
+    fn copied_double_faces_under_a_layer1_copy_takes_the_copied_values() {
+        let faces = capture_after(Some(LayoutKind::Transform), |obj, source| {
+            obj.layer1_copy_effect = Some(crate::types::ability::CopyEffectInstanceRef {
+                continuous_effect_id: 1,
+                modification_index: 0,
+            });
+            source.values.name = "Grizzly Bears".to_string();
+            source.values.power = Some(2);
+            source.values.toughness = Some(2);
+        })
+        .expect("a copied double-faced donor has faces");
+        assert_eq!(faces.hidden.name, "Grizzly Bears");
+        assert_eq!(
+            (faces.hidden.power, faces.hidden.toughness),
+            (Some(2), Some(2))
+        );
+        assert_eq!(faces.hidden.layout_kind, Some(LayoutKind::Transform));
+    }
+
+    // The copy-only refusals. Each changes one thing on the donor of the positive
+    // captures above, so each refusal is that one check's.
+
+    /// CR 400.7: the faces are read only from the object the copy read its values
+    /// from. The live object under the donor's id is a later object (its
+    /// incarnation moved on) with a different stored face, and the capture never
+    /// reads that face. This asserts the guard only: whether a departed donor's
+    /// token is single-faced is a known gap, not the CR 707.8a answer, and is not
+    /// asserted here. Nearest printed board: Saw in Half ("Destroy target
+    /// creature. If that creature dies this way, its controller creates two tokens
+    /// that are copies of that creature, …") destroying Kessig Prowler.
+    #[test]
+    fn copied_double_faces_never_reads_a_later_object() {
+        let faces = capture_after(Some(LayoutKind::Transform), |obj, _| {
+            obj.incarnation += 1;
+            obj.back_face.as_mut().unwrap().name = "Later Face".to_string();
+        });
+        assert_ne!(
+            faces.map(|faces| faces.hidden.name),
+            Some("Later Face".to_string()),
+            "CR 400.7: a later object under the same id never supplies the faces"
+        );
+    }
+
+    /// CR 712.4b: a melded permanent. Nearest printed board: Cackling Counterpart copying Brisela, Voice of Nightmares (Bruna, the Fading Light melded with Gisela, the Broken Blade).
+    #[test]
+    fn copied_double_faces_refuses_a_melded_permanent() {
+        let faces = capture_after(Some(LayoutKind::Transform), |obj, _| {
+            obj.merge_kind = Some(MergeKind::Meld);
+        });
+        assert!(faces.is_none());
+    }
+
+    /// CR 712.4b: a meld card's stored back face. Nearest printed board: Cackling Counterpart copying Bruna, the Fading Light ("(Melds with Gisela, the Broken Blade.)").
+    #[test]
+    fn copied_double_faces_refuses_a_meld_back_face() {
+        assert!(capture_after(Some(LayoutKind::Meld), |_, _| {}).is_none());
+    }
+
+    /// CR 709.5b: values copied from a Room. Nearest printed board, by a read: Opalescence ("Each other non-Aura enchantment is a creature in addition to its other types …") animates Unholy Annex // Ritual Chamber, Mirrorweave targeting it makes Kessig Prowler a copy of the Room, and Cackling Counterpart copies the Prowler.
+    /// The token keeps both faces, and stores the Room half beside them
+    /// (`GameObject::double_faced_token_alternative`, CR 707.8a + CR 709.5b).
+    #[test]
+    fn copied_double_faces_keeps_both_faces_beside_room_values() {
+        let faces = capture_after(Some(LayoutKind::Transform), |_, source| {
+            source.values.room_halves = Some(crate::types::ability::RoomCopiableHalves {
+                left: crate::types::ability::RoomHalfIdentity {
+                    name: "Left".to_string(),
+                    mana_cost: crate::types::mana::ManaCost::NoCost,
+                },
+                right: None,
+            });
+        })
+        .expect("CR 707.8a: a double-faced donor copying a Room keeps both faces");
+        assert_eq!(faces.hidden.name, "Sinuous Predator");
+    }
+
+    /// CR 722.2b: values copied from a preparation creature. Nearest printed board: Mirrorweave targeting Encouraging Aviator ("Whenever this creature attacks, it becomes prepared. …") makes Kessig Prowler a copy of it, and Cackling Counterpart copies the Prowler.
+    /// The token keeps both faces, and stores the prepare spell beside them
+    /// (`GameObject::double_faced_token_alternative`, CR 707.8a + CR 722.2b).
+    #[test]
+    fn copied_double_faces_keeps_both_faces_beside_preparation_values() {
+        let faces = capture_after(Some(LayoutKind::Transform), |_, source| {
+            source.values.prepare_face = Some(Arc::new(BackFaceData::default()));
+        })
+        .expect("CR 707.8a: a double-faced donor copying a preparation creature keeps both faces");
+        assert_eq!(faces.hidden.name, "Sinuous Predator");
+    }
+
+    /// CR 712.8d + CR 707.8a: both back-face flags set shows the front face
+    /// (nearest printed board: Valentin, Dean of the Vein cast as Lisette, Dean
+    /// of the Root, then Moonmist), so the copy is front face up with the
+    /// donor's stored face hidden.
+    #[test]
+    fn copied_double_faces_reads_the_front_face_up_under_both_flags() {
+        let faces = capture_after(Some(LayoutKind::Modal), |obj, _| {
+            obj.transformed = true;
+            obj.modal_back_face = true;
+        })
+        .expect("a donor with both flags set has faces");
+        assert_eq!(faces.up, CopiedFaceUp::Front);
+        assert_eq!(faces.hidden.name, "Sinuous Predator");
+    }
+
+    /// CR 708.2: a face-down donor's `back_face` is its face-down stash, which
+    /// `transform::stored_double_face` refuses. A double-faced card can be face down: CR 712.15
+    /// covers one that enters the battlefield face down, as Soul Summons ("Manifest the top card
+    /// of your library.") can manifest Kessig Prowler; CR 712.16 stops only turning a double-faced
+    /// permanent face down. This stub is synthetic: it marks a Transform-layout face as the stash
+    /// where that printed board stores the manifested card's own face. Nearest printed board:
+    /// Cackling Counterpart copying a Kessig Prowler manifested by Soul Summons.
+    #[test]
+    fn copied_double_faces_refuses_a_face_down_donor() {
+        let faces = capture_after(Some(LayoutKind::Transform), |obj, _| obj.face_down = true);
+        assert!(faces.is_none());
+    }
+
+    /// CR 707.9a/b/d: the fold lands each exception in the stored face's base:
+    /// a type, a trigger, a P/T value and a keyword, and prunes the CDA the P/T
+    /// exception overrides while keeping a non-CDA static.
+    /// No printed copy carries all four exceptions at once: the type is Nexus of Becoming's ("except it's a 3/3 Golem artifact creature in addition to its other types"), the trigger Grub, Notorious Auntie's, the P/T Soul Separator's ("except it's 1/1") and the keyword Kiki-Jiki, Mirror Breaker's ("except it has haste"). The face is a synthetic stand-in for Werewolf of Ancient Hunger, whose printed P/T ability is a CDA ("power and toughness are each equal to the total number of cards in all players' hands"); its fixed CDA and its trample static are not printed text. The printed boards are the integration rows in grub_storied_matriarch_769.rs.
+    #[test]
+    fn fold_copy_exceptions_into_face_lands_exceptions_in_the_face() {
+        let cda = StaticDefinition::continuous()
+            .affected(TargetFilter::SelfRef)
+            .cda()
+            .modifications(vec![ContinuousModification::SetDynamicPower {
+                value: QuantityExpr::Fixed { value: 3 },
+            }]);
+        let non_cda = StaticDefinition::continuous()
+            .affected(TargetFilter::SelfRef)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Trample,
+            }]);
+        let face = BackFaceData {
+            name: "Werewolf of Ancient Hunger".to_string(),
+            power: Some(0),
+            toughness: Some(0),
+            card_types: CardType {
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Werewolf".to_string()],
+                ..CardType::default()
+            },
+            static_definitions: Arc::new(vec![cda, non_cda.clone()]).into(),
+            layout_kind: Some(LayoutKind::Transform),
+            is_swap_snapshot: false,
+            ..BackFaceData::default()
+        };
+        let set_power = ContinuousModification::SetPower { value: 1 };
+        let trigger = TriggerDefinition::new(TriggerMode::Phase);
+        let stamped = vec![
+            ContinuousModification::AddType {
+                core_type: CoreType::Artifact,
+            },
+            ContinuousModification::GrantTrigger {
+                trigger: Box::new(trigger),
+            },
+            set_power.clone(),
+        ];
+
+        let folded = fold_copy_exceptions_into_face(
+            &face,
+            std::slice::from_ref(&set_power),
+            &[Keyword::Haste],
+            &stamped,
+            &[],
+        );
+
+        assert!(folded.card_types.core_types.contains(&CoreType::Artifact));
+        assert_eq!(folded.trigger_definitions.iter_all().count(), 1);
+        assert_eq!(folded.power, Some(1));
+        assert!(folded.keywords.contains(&Keyword::Haste));
+        let statics: Vec<_> = folded.static_definitions.iter_all().cloned().collect();
+        assert_eq!(statics, vec![non_cda], "CR 707.9d: only the CDA is pruned");
+        assert_eq!(folded.layout_kind, Some(LayoutKind::Transform));
+        assert!(!folded.is_swap_snapshot);
+
+        assert_eq!(
+            fold_copy_exceptions_into_face(&face, &[], &[], &[], &[]),
+            face,
+            "no exceptions leave the face as it is"
+        );
+    }
+
+    /// CR 608.2c + CR 614.6: declined replacements preserve each batch's tokens
+    /// in instruction order. Constructed custody fixture, independent of
+    /// the printed spell's event grouping. Both answers use the engine action path.
+    #[test]
+    fn r15_parked_owner_hands_off_two_offered_batches_once() {
+        use crate::game::scenario::{GameScenario, P0};
+        let mut scenario = GameScenario::new();
+        scenario.add_creature_from_oracle(P0, "Jinnie Fay, Jetmir's Second", 3, 3,
+            "If you would create one or more tokens, you may instead create that many 2/2 green Cat creature tokens with haste or that many 3/1 green Dog creature tokens with vigilance.");
+        let mut runner = scenario.build();
+        let source_id = add_copy_source(runner.state_mut(), "Grizzly Bears");
+        let mut copy = named_attack_copy_spec(runner.state(), source_id, Vec::new());
+        copy.tapped = false;
+        copy.enters_attacking = false;
+        copy.attack_request = crate::types::proposed_event::TokenAttackRequest::Unspecified;
+        runner
+            .state_mut()
+            .push_copy_token(PendingCopyTokenResolution {
+                created_ids: Vec::new(),
+                remaining: (0..2)
+                    .map(|_| PendingCopyTokenBatch {
+                        owner: P0,
+                        copy: Box::new(copy.clone()),
+                        count: 1,
+                    })
+                    .collect(),
+                effect_kind: EffectKind::CopyTokenOf,
+                source_id,
+                referent_set: None,
+                offered_batch: OfferedBatchCustody::Settled,
+            });
+        let mut events = Vec::new();
+        drain_pending_copy_token_resolution(runner.state_mut(), &mut events);
+        let created = |events: &[GameEvent]| {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    GameEvent::TokenCreated { object_id, .. } => Some(*object_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for prompt in 0..2 {
+            let WaitingFor::ReplacementChoice {
+                player, candidates, ..
+            } = &runner.state().waiting_for
+            else {
+                panic!(
+                    "required Jinnie Fay prompt {prompt}: {:?}",
+                    runner.state().waiting_for
+                );
+            };
+            assert_eq!(*player, P0);
+            assert!(candidates
+                .iter()
+                .any(|candidate| candidate.source_name == "Jinnie Fay, Jetmir's Second"));
+            let decline = candidates
+                .iter()
+                .position(|candidate| candidate.description == "Decline")
+                .expect("Decline offered");
+            let tokens = created(&events);
+            assert_eq!(tokens.len(), prompt, "one token per answered batch");
+            assert_eq!(
+                runner
+                    .state()
+                    .active_copy_token()
+                    .expect("parked owner")
+                    .created_ids,
+                tokens,
+                "second-prompt owner prefix contains the first token exactly once"
+            );
+            events.extend(
+                runner
+                    .act(GameAction::ChooseReplacement { index: decline })
+                    .expect("decline accepted")
+                    .events,
+            );
+        }
+        let tokens = created(&events);
+        assert_eq!(tokens.len(), 2);
+        assert_ne!(tokens[0], tokens[1]);
+        assert_eq!(runner.state().last_created_token_ids, tokens);
+        assert!(runner.state().active_copy_token().is_none());
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+    }
+
+    /// CR 614.6 + CR 608.2c: a wholly prevented offered batch contributes
+    /// nothing, even when the global ledger still names an earlier creation.
+    /// Constructed fixture: no printed CreateToken replacement uses Prevent.
+    #[test]
+    fn prevented_offered_copy_batch_does_not_adopt_a_prior_ledger() {
+        use crate::game::scenario::{GameScenario, P0};
+        for owner_has_earlier in [false, true] {
+            let mut runner = GameScenario::new().build();
+            let state = runner.state_mut();
+            let source_id = add_copy_source(state, "Ledger donor");
+            let earlier = add_copy_source(state, "Earlier creation");
+            state.last_created_token_ids = vec![earlier];
+            let preventer = add_copy_source(state, "Constructed token preventer");
+            let mut definition = ReplacementDefinition::new(ReplacementEvent::CreateToken)
+                .quantity_modification(QuantityModification::Prevent);
+            definition.mode = crate::types::ability::ReplacementMode::Optional { decline: None };
+            let object = state.objects.get_mut(&preventer).unwrap();
+            object.base_replacement_definitions = Arc::new(vec![definition.clone()]);
+            object.replacement_definitions = vec![definition].into();
+            let mut copy = named_attack_copy_spec(state, source_id, Vec::new());
+            copy.tapped = false;
+            copy.enters_attacking = false;
+            copy.attack_request = crate::types::proposed_event::TokenAttackRequest::Unspecified;
+            let want = if owner_has_earlier {
+                vec![earlier]
+            } else {
+                Vec::new()
+            };
+            let set = TrackedSetId(100);
+            state.tracked_object_sets.insert(set, want.clone());
+            state.push_copy_token(PendingCopyTokenResolution {
+                created_ids: want.clone(),
+                remaining: VecDeque::from([PendingCopyTokenBatch {
+                    owner: P0,
+                    copy: Box::new(copy),
+                    count: 1,
+                }]),
+                effect_kind: EffectKind::CopyTokenOf,
+                source_id,
+                referent_set: Some(set),
+                offered_batch: OfferedBatchCustody::Settled,
+            });
+            let mut events = Vec::new();
+            drain_pending_copy_token_resolution(state, &mut events);
+            let WaitingFor::ReplacementChoice {
+                player, candidates, ..
+            } = &runner.state().waiting_for
+            else {
+                panic!(
+                    "required prevention prompt: {:?}",
+                    runner.state().waiting_for
+                );
+            };
+            assert_eq!(*player, P0);
+            let accept = candidates
+                .iter()
+                .position(|candidate| candidate.description != "Decline")
+                .expect("prevention offered");
+            assert_eq!(
+                runner
+                    .state()
+                    .active_copy_token()
+                    .expect("parked owner")
+                    .offered_batch,
+                OfferedBatchCustody::AtReplacementPrompt
+            );
+            events.extend(
+                runner
+                    .act(GameAction::ChooseReplacement { index: accept })
+                    .expect("prevention accepted")
+                    .events,
+            );
+            assert!(runner.state().resolution_stack.is_empty());
+            assert!(matches!(
+                runner.state().waiting_for,
+                WaitingFor::Priority { .. }
+            ));
+            assert_eq!(copy_token_of_resolved(&events), 1);
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, GameEvent::TokenCreated { .. })));
+            assert_eq!(
+                runner.state().last_created_token_ids,
+                want,
+                "prevented batch adds no stale or duplicate ids"
+            );
+            assert_eq!(runner.state().tracked_object_sets[&set], want);
+        }
+    }
+
+    /// CR 608.2c + CR 111.1: the liminal batch terminal of
+    /// `apply_copy_token_after_replacement_with_created_ids` re-syncs the batch ledger onto an
+    /// ACTIVE CopyToken owner (a resumed batch's route) by merging, so the token an earlier batch
+    /// created stays in the owner's referent and reaches `LastCreated` when the owner drains.
+    #[test]
+    fn liminal_batch_terminal_merges_its_ledger_into_the_active_copy_token_owner() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = add_copy_source(&mut state, "Grizzly Bears");
+        let earlier = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Earlier Copy".to_string(),
+            Zone::Battlefield,
+        );
+        state.push_copy_token(PendingCopyTokenResolution {
+            created_ids: vec![earlier],
+            remaining: VecDeque::new(),
+            effect_kind: EffectKind::CopyTokenOf,
+            source_id,
+            referent_set: None,
+            offered_batch: OfferedBatchCustody::Settled,
+        });
+        let copy = CopyTokenSpec {
+            values: Box::new(crate::game::printed_cards::intrinsic_copiable_values(
+                &state.objects[&source_id],
+            )),
+            display: DisplayIdentity {
+                display_source: DisplaySource::Token,
+                ..Default::default()
+            },
+            extra_keywords: Vec::new(),
+            additional_modifications: Vec::new(),
+            tapped: false,
+            enters_attacking: false,
+            // Single-faced fixture values: no other face to carry.
+            double_faced: None,
+            attack_request: crate::types::proposed_event::TokenAttackRequest::Unspecified,
+            sacrifice_at: None,
+            source_id,
+            controller: PlayerId(0),
+            donor: None,
+        };
+        let mut events = Vec::new();
+        let status = apply_copy_token_after_replacement_with_created_ids(
+            &mut state,
+            PlayerId(0),
+            copy,
+            EtbTapState::from_seeded_tapped(false),
+            Vec::new(),
+            1,
+            Vec::new(),
+            None,
+            &mut events,
+        );
+        assert!(matches!(
+            status.completion,
+            CopyTokenApplyCompletion::Completed
+        ));
+        let created: Vec<ObjectId> = events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::TokenCreated { object_id, .. } => Some(*object_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(created.len(), 1, "REACH-GUARD: the batch created its token");
+        assert!(
+            state.active_copy_token().is_none(),
+            "REACH-GUARD: the liminal terminal drained the active owner"
+        );
+        assert_eq!(copy_token_of_resolved(&events), 1);
+        assert_eq!(
+            state.last_created_token_ids,
+            vec![earlier, created[0]],
+            "the owner's earlier-batch token survives the batch ledger's re-sync"
+        );
+    }
+
+    /// Constructed custody fixture: the first batch is already committed and the
+    /// second is offered. This deliberately makes no claim about Clone Legion's
+    /// grouping. CR 614.12a: the Voice choice precedes the shared entry, so the
+    /// held owner's Margle must remain absent while the order answer delivers it.
+    #[test]
+    fn held_copy_owner_publishes_earlier_tokens_during_replacement_answer() {
+        use crate::game::scenario::{GameScenario, P0, P1};
+        let mut scenario = GameScenario::new();
+        let margle = scenario.add_creature_from_oracle(P0, "Margle, Cousin of Yargle", 5, 2,
+            "Other creatures you control lose all abilities, can't gain abilities, and get +2/+2.").id();
+        let voice = scenario.add_creature_from_oracle(P1, "Voice of All", 2, 2,
+            "Flying\nAs this creature enters, choose a color.\nThis creature has protection from the chosen color.").id();
+        scenario.add_enchantment_from_oracle(P0, "Parallel Lives",
+            "If an effect would create one or more tokens under your control, it creates twice that many of those tokens instead.");
+        scenario.add_enchantment_from_oracle(P1, "Halving Season",
+            "If an opponent would create one or more tokens, they create half that many of each of those kinds of tokens instead, rounded down.\nIf an opponent would put one or more counters on a permanent or player, they put half that many of each of those kinds of counters on that permanent or player instead, rounded down.");
+        let mut runner = scenario.build();
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&margle)
+            .unwrap()
+            .is_token = true;
+        let mut copy = named_attack_copy_spec(runner.state(), voice, Vec::new());
+        copy.tapped = false;
+        copy.enters_attacking = false;
+        copy.attack_request = crate::types::proposed_event::TokenAttackRequest::Unspecified;
+        runner
+            .state_mut()
+            .push_copy_token(PendingCopyTokenResolution {
+                created_ids: vec![margle],
+                remaining: VecDeque::from([PendingCopyTokenBatch {
+                    owner: P0,
+                    copy: Box::new(copy),
+                    count: 1,
+                }]),
+                effect_kind: EffectKind::CopyTokenOf,
+                source_id: voice,
+                referent_set: None,
+                offered_batch: OfferedBatchCustody::Settled,
+            });
+        let mut events = Vec::new();
+        drain_pending_copy_token_resolution(runner.state_mut(), &mut events);
+        let WaitingFor::ReplacementChoice {
+            player, candidates, ..
+        } = &runner.state().waiting_for
+        else {
+            panic!("required order prompt: {:?}", runner.state().waiting_for);
+        };
+        assert_eq!(*player, P0);
+        assert_eq!(candidates.len(), 2);
+        let index = candidates
+            .iter()
+            .position(|candidate| candidate.source_name == "Parallel Lives")
+            .unwrap();
+        assert_eq!(
+            runner.state().active_copy_token().unwrap().created_ids,
+            vec![margle]
+        );
+        runner.act(GameAction::ChooseReplacement { index }).unwrap();
+        let WaitingFor::NamedChoice {
+            player, options, ..
+        } = &runner.state().waiting_for
+        else {
+            panic!(
+                "the held owner's publication must preserve Voice's entry choice: {:?}",
+                runner.state().waiting_for
+            );
+        };
+        assert_eq!(*player, P0);
+        let choice = options[0].clone();
+        runner.act(GameAction::ChooseOption { choice }).unwrap();
+        let copies: Vec<_> = runner
+            .state()
+            .objects
+            .values()
+            .filter(|obj| obj.is_token && obj.name == "Voice of All")
+            .collect();
+        assert_eq!(copies.len(), 1);
+        assert!(copies[0]
+            .chosen_attributes
+            .iter()
+            .any(|choice| matches!(choice, ChosenAttribute::Color(_))));
+        assert_eq!(
+            runner.state().last_created_token_ids,
+            vec![margle, copies[0].id]
+        );
+        assert!(runner.state().active_copy_token().is_none());
+        assert!(runner.state().active_copy_token_resolution_tokens.is_none());
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+    }
+
+    /// R16 constructed ledger fixture, independent of any spell's batch grouping.
+    /// The earlier batch and owner are seeded; only the next batch is delivered.
+    /// CR 614.6 + CR 609.3: a batch halved to zero creates nothing and cannot
+    /// report an earlier batch's ids as its own.
+    #[test]
+    fn ledger_fixture_zero_commit_copy_batch_reports_no_stale_ids() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = add_copy_source(&mut state, "Ledger donor");
+        let earlier = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Earlier copy".to_string(),
+            Zone::Battlefield,
+        );
+        state.push_copy_token(PendingCopyTokenResolution {
+            created_ids: vec![earlier],
+            remaining: VecDeque::new(),
+            effect_kind: EffectKind::CopyTokenOf,
+            source_id,
+            referent_set: None,
+            offered_batch: OfferedBatchCustody::Settled,
+        });
+        state.last_created_token_ids = vec![earlier];
+        // Construct the token-count replacement directly: this is a ledger
+        // unit fixture, not a printed-card or parser-support claim.
+        let halver = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(1),
+            "Ledger halver".to_string(),
+            Zone::Battlefield,
+        );
+        let definition = ReplacementDefinition::new(ReplacementEvent::CreateToken)
+            .token_owner_scope(ControllerRef::Opponent)
+            .quantity_modification(QuantityModification::Half);
+        let object = state.objects.get_mut(&halver).unwrap();
+        object.base_replacement_definitions = Arc::new(vec![definition.clone()]);
+        object.replacement_definitions = vec![definition].into();
+        let mut copy = named_attack_copy_spec(&state, source_id, Vec::new());
+        copy.tapped = false;
+        copy.enters_attacking = false;
+        copy.attack_request = crate::types::proposed_event::TokenAttackRequest::Unspecified;
+        let spec =
+            super::super::token::copy_probe_spec_for(source_id, PlayerId(0), None, &copy.values);
+        let proposed = ProposedEvent::CreateToken {
+            redirected_to: None,
+            owner: PlayerId(0),
+            spec: Box::new(spec),
+            copy: Some(Box::new(copy)),
+            enter_tapped: EtbTapState::from_seeded_tapped(false),
+            count: 1,
+            appended: Vec::new(),
+            applied: Default::default(),
+        };
+        let mut events = Vec::new();
+        let crate::game::replacement::ReplacementResult::Execute(event) =
+            crate::game::replacement::replace_event(&mut state, proposed, &mut events)
+        else {
+            panic!("the constructed halver must settle without a choice");
+        };
+        assert!(
+            matches!(
+                &event,
+                ProposedEvent::CreateToken {
+                    count: 0,
+                    copy: Some(_),
+                    ..
+                }
+            ),
+            "REACH-GUARD: replacement delivers a zero-count copy batch"
+        );
+        assert!(
+            super::super::token::apply_create_token_after_replacement_with_created_ids(
+                &mut state,
+                event,
+                Vec::new(),
+                crate::types::game_state::PendingEffectResolutionEvent::Suppress,
+                &mut events,
+            )
+        );
+        assert!(
+            state.last_created_token_ids.is_empty(),
+            "the zero-commit batch must not republish the earlier batch's ledger"
+        );
+        assert_eq!(
+            state
+                .active_copy_token()
+                .expect("the owner remains parked")
+                .created_ids,
+            vec![earlier],
+            "the owner receives no duplicate or stale ids"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, GameEvent::TokenCreated { .. })),
+            "the zero-count batch commits no tokens"
+        );
+    }
+
+    /// H1 state: a parked, unbound owner holding `[t1, t2]`, a referent `A`
+    /// that already lists `t1`, and an unrelated chain set `B = [x]` current.
+    fn completing_owner_under_a_foreign_chain_set() -> (GameState, [ObjectId; 3], [TrackedSetId; 2])
+    {
+        let mut state = GameState::new_two_player(42);
+        let (t1, t2, x) = (ObjectId(901), ObjectId(902), ObjectId(903));
+        let (a, b) = (TrackedSetId(7), TrackedSetId(8));
+        state.tracked_object_sets.insert(a, vec![t1]);
+        state.tracked_object_sets.insert(b, vec![x]);
+        state.next_tracked_set_id = 9;
+        state.chain_tracked_set_id = Some(b);
+        state.push_copy_token(PendingCopyTokenResolution {
+            created_ids: vec![t1, t2],
+            remaining: VecDeque::new(),
+            effect_kind: EffectKind::CopyTokenOf,
+            source_id: ObjectId(900),
+            referent_set: None,
+            offered_batch: OfferedBatchCustody::Settled,
+        });
+        (state, [t1, t2, x], [a, b])
+    }
+
+    fn copy_token_of_resolved(events: &[GameEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    GameEvent::EffectResolved {
+                        kind: EffectKind::CopyTokenOf,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    /// H1 — CR 608.2c + CR 603.7a: a completing CopyToken owner publishes every
+    /// token it created into the set it was bound to at its pause, and makes
+    /// that set the chain's again; the chain set current at completion (here a
+    /// foreign `B`) is left untouched.
+    #[test]
+    fn completing_copy_token_owner_publishes_into_its_bound_referent() {
+        let (mut state, [t1, t2, x], [a, b]) = completing_owner_under_a_foreign_chain_set();
+        state
+            .active_copy_token_mut()
+            .expect("REACH-GUARD: the owner is the active frame")
+            .referent_set = Some(a);
+        let mut events = Vec::new();
+        drain_pending_copy_token_resolution(&mut state, &mut events);
+
+        assert!(state.active_copy_token().is_none(), "the owner is consumed");
+        assert_eq!(copy_token_of_resolved(&events), 1);
+        assert_eq!(
+            state.tracked_object_sets[&a],
+            vec![t1, t2],
+            "the bound referent gains the post-pause token, and t1 is not duplicated"
+        );
+        assert_eq!(
+            state.tracked_object_sets[&b],
+            vec![x],
+            "the foreign chain set is untouched"
+        );
+        assert_eq!(state.chain_tracked_set_id, Some(a));
+        assert_eq!(state.last_created_token_ids, vec![t1, t2]);
+    }
+
+    /// H1 paired guard: an owner that never paused under a tracked-set consumer
+    /// (`referent_set: None`) publishes nothing and leaves the chain alone, but
+    /// still completes its instruction.
+    #[test]
+    fn completing_copy_token_owner_without_referent_publishes_nothing() {
+        let (mut state, [t1, t2, x], [a, b]) = completing_owner_under_a_foreign_chain_set();
+        let mut events = Vec::new();
+        drain_pending_copy_token_resolution(&mut state, &mut events);
+
+        assert!(state.active_copy_token().is_none(), "the owner is consumed");
+        assert_eq!(copy_token_of_resolved(&events), 1);
+        assert_eq!(state.tracked_object_sets[&a], vec![t1]);
+        assert_eq!(state.tracked_object_sets[&b], vec![x]);
+        assert_eq!(state.chain_tracked_set_id, Some(b));
+        assert_eq!(state.last_created_token_ids, vec![t1, t2]);
+    }
+
+    /// CR 614.6 + CR 608.2c: an owner that resumes with its offered batch still marked
+    /// adopts the tokens the replacing creation left in the ledger, after the ones it
+    /// already lists, and settles. A settled owner adopts nothing, and a marked owner whose
+    /// batch was replaced by nothing adopts nothing.
+    #[test]
+    fn resumed_owner_adopts_a_substituted_batch_only_while_marked() {
+        let [earlier, s1, s2] = [ObjectId(31), ObjectId(32), ObjectId(33)];
+        let cases = [
+            (
+                OfferedBatchCustody::AtReplacementPrompt,
+                vec![s1, s2],
+                vec![earlier, s1, s2],
+            ),
+            (OfferedBatchCustody::Settled, vec![s1, s2], vec![earlier]),
+            (
+                OfferedBatchCustody::AtReplacementPrompt,
+                Vec::new(),
+                vec![earlier],
+            ),
+        ];
+        for (offered, ledger, want) in cases {
+            let mut state = GameState::new_two_player(45);
+            state.push_copy_token(PendingCopyTokenResolution {
+                created_ids: vec![earlier],
+                remaining: VecDeque::new(),
+                effect_kind: EffectKind::CopyTokenOf,
+                source_id: ObjectId(900),
+                referent_set: None,
+                offered_batch: offered,
+            });
+            state.last_created_token_ids = ledger.clone();
+            let mut events = Vec::new();
+            drain_pending_copy_token_resolution(&mut state, &mut events);
+
+            assert!(state.active_copy_token().is_none(), "the owner is consumed");
+            assert_eq!(
+                copy_token_of_resolved(&events),
+                1,
+                "REACH-GUARD: the owner completes its instruction"
+            );
+            assert_eq!(
+                state.last_created_token_ids, want,
+                "{offered:?} owner resumed over the ledger {ledger:?}"
+            );
+        }
+    }
+
+    fn parked_copy_token_owner(created_ids: Vec<ObjectId>) -> PendingCopyTokenResolution {
+        PendingCopyTokenResolution {
+            created_ids,
+            remaining: VecDeque::new(),
+            effect_kind: EffectKind::CopyTokenOf,
+            source_id: ObjectId(900),
+            referent_set: None,
+            offered_batch: OfferedBatchCustody::Settled,
+        }
+    }
+
+    /// CR 614.12 + CR 111.1: the published resolution tokens and the batch prefix overlap;
+    /// the co-entrants keep first-seen order, list each token once, and leave out the
+    /// entrant itself.
+    #[test]
+    fn copy_token_co_entrants_dedups_published_tokens_and_batch_prefix_in_order() {
+        let mut state = GameState::new_two_player(42);
+        state.active_copy_token_resolution_tokens =
+            Some(vec![ObjectId(1), ObjectId(2), ObjectId(3)]);
+        assert_eq!(
+            copy_token_co_entrants(
+                &state,
+                ObjectId(2),
+                &[ObjectId(3), ObjectId(4), ObjectId(4)]
+            ),
+            vec![ObjectId(1), ObjectId(3), ObjectId(4)]
+        );
+    }
+
+    /// With no published slot the innermost parked `CopyToken` frame's tokens are the
+    /// resolution's; an outer frame's are not read.
+    #[test]
+    fn copy_token_co_entrants_reads_the_innermost_parked_frame_without_a_published_slot() {
+        let mut state = GameState::new_two_player(42);
+        state.push_copy_token(parked_copy_token_owner(vec![ObjectId(10), ObjectId(11)]));
+        state.push_copy_token(parked_copy_token_owner(vec![ObjectId(20), ObjectId(21)]));
+        assert!(
+            state.active_copy_token_resolution_tokens.is_none(),
+            "REACH-GUARD: no published slot, so the frame fallback runs"
+        );
+        assert_eq!(
+            copy_token_co_entrants(&state, ObjectId(21), &[ObjectId(22), ObjectId(20)]),
+            vec![ObjectId(20), ObjectId(22)]
+        );
+    }
+
+    /// A published slot wins over a parked frame (an outer resolution's frame is never read
+    /// while one is published), and the entrant is excluded from both sources.
+    #[test]
+    fn copy_token_co_entrants_prefers_the_published_slot_and_excludes_the_entrant() {
+        let mut state = GameState::new_two_player(42);
+        state.push_copy_token(parked_copy_token_owner(vec![ObjectId(10)]));
+        state.active_copy_token_resolution_tokens = Some(vec![ObjectId(5), ObjectId(6)]);
+        assert_eq!(
+            copy_token_co_entrants(&state, ObjectId(5), &[ObjectId(5), ObjectId(7)]),
+            vec![ObjectId(6), ObjectId(7)]
+        );
+    }
+
+    /// A liminal token entry `entry_ref` whose batch already created `created_ids`.
+    fn liminal_token_entry(
+        entry_ref: ObjectId,
+        created_ids: Vec<ObjectId>,
+    ) -> crate::types::game_state::LiminalEntry {
+        let object = GameObject::new(
+            entry_ref,
+            CardId(0),
+            PlayerId(0),
+            "Liminal Copy".to_string(),
+            Zone::Battlefield,
+        );
+        crate::types::game_state::LiminalEntry {
+            copy_settlement: None,
+            object: crate::types::game_state::LiminalEntrant::Token(
+                crate::types::game_state::TokenProjection::materialize(object),
+            ),
+            name: "Liminal Copy".to_string(),
+            source_id: ObjectId(999),
+            controller: PlayerId(0),
+            enters_attacking: false,
+            attack_destination: crate::types::ability::EntryAttackDestination::AnyDefender,
+            attach_to: None,
+            sacrifice_at: None,
+            remaining_count: 0,
+            created_ids,
+            copy_resume: None,
+            spec_resume: None,
+            enter_tapped: EtbTapState::Unspecified,
+            enter_with_counters: Vec::new(),
+            kind: crate::types::game_state::LiminalEntryKind::Token,
+            replacement_applied: HashSet::new(),
+        }
+    }
+
+    /// CR 614.12 + CR 111.1: an entering token's co-entrants are the resolution's tokens
+    /// plus its batch: the liminal entry's prefix while its entry is decided (i), and the
+    /// ledger that lists it once it has committed (ii). Anything else, the placed-route
+    /// payment's entrant included, has none (iii).
+    #[test]
+    fn entering_token_co_entrants_reads_the_liminal_prefix_or_the_ledger_that_lists_it() {
+        let (a, b, e) = (ObjectId(1), ObjectId(2), ObjectId(5));
+
+        let mut liminal = GameState::new_two_player(42);
+        liminal.push_copy_token(parked_copy_token_owner(vec![b]));
+        liminal
+            .liminal_entries
+            .insert(e, liminal_token_entry(e, vec![a]));
+        assert_eq!(entering_token_co_entrants(&liminal, e), vec![b, a], "(i)");
+
+        let mut committed = GameState::new_two_player(42);
+        committed.push_copy_token(parked_copy_token_owner(vec![b]));
+        committed.last_created_token_ids = vec![a, e];
+        assert!(
+            committed.liminal_entries.is_empty(),
+            "REACH-GUARD (ii): the entry has committed"
+        );
+        assert_eq!(
+            entering_token_co_entrants(&committed, e),
+            vec![b, a],
+            "(ii)"
+        );
+
+        let mut unlisted = GameState::new_two_player(42);
+        unlisted.push_copy_token(parked_copy_token_owner(vec![b]));
+        unlisted.last_created_token_ids = vec![a];
+        assert!(
+            !copy_token_co_entrants(&unlisted, e, &unlisted.last_created_token_ids).is_empty(),
+            "REACH-GUARD (iii): the frame and the ledger hold tokens"
+        );
+        assert!(entering_token_co_entrants(&unlisted, e).is_empty(), "(iii)");
+    }
+
+    /// No published slot, no parked frame, and no batch prefix: nothing co-enters.
+    #[test]
+    fn copy_token_co_entrants_is_empty_without_any_source() {
+        let state = GameState::new_two_player(42);
+        assert!(copy_token_co_entrants(&state, ObjectId(1), &[]).is_empty());
+
+        let mut published_empty = GameState::new_two_player(42);
+        published_empty.active_copy_token_resolution_tokens = Some(Vec::new());
+        published_empty.push_copy_token(parked_copy_token_owner(vec![ObjectId(10)]));
+        assert!(
+            copy_token_co_entrants(&published_empty, ObjectId(1), &[]).is_empty(),
+            "an empty published slot still shadows the parked frame"
+        );
+    }
+}

@@ -1,0 +1,414 @@
+{
+  "search": {
+    "title": "Buscar",
+    "subtitle": "Adicione cartas à lista atual.",
+    "reset": "Redefinir",
+    "textPlaceholder": "Buscar cartas...",
+    "allTypes": "Todos os tipos",
+    "cardType": "Tipo de carta",
+    "browseFormatFilter": "Legal no formato",
+    "cmcMax": "CMC máx.:",
+    "sets": "Coleções",
+    "addSetPlaceholder": "Adicionar código da coleção...",
+    "addSet": "Adicionar",
+    "removeSet": "Remover {{name}}",
+    "emptyHint": "Adicione um filtro para começar a explorar",
+    "searching": "Buscando...",
+    "searchFailed": "Falha na busca",
+    "results_one": "{{count}} resultado",
+    "results_other": "{{count}} resultados",
+    "browseFormat": {
+      "all": "Todas as cartas"
+    }
+  },
+  "filters": {
+    "title": "Filtros",
+    "close": "Fechar filtros",
+    "done": "Concluído",
+    "search": "Buscar"
+  },
+  "deck": {
+    "backToDeck": "Voltar ao deck",
+    "listView": "Visualização em lista",
+    "stackView": "Visualização em pilha",
+    "groupType": "Tipo",
+    "groupColor": "Cor",
+    "groupByType": "Agrupar por tipo",
+    "groupByColor": "Agrupar por cor"
+  },
+  "tabs": {
+    "ariaLabel": "Superfície do construtor de decks",
+    "deck": "Deck",
+    "info": "Info"
+  },
+  "toolbar": {
+    "menu": "Menu",
+    "deckBuilder": "Construtor de Decks",
+    "untitledDeck": "Deck Sem Título",
+    "deckName": "Nome do deck",
+    "format": "Formato",
+    "bracket": "Bracket",
+    "saved": "Salvo ✓",
+    "clone": "Clonar",
+    "cloneTitle": "Salvar uma cópia com um novo nome",
+    "loadDeck": "Carregar deck...",
+    "nameToSave": "Dê um nome ao deck para salvá-lo",
+    "savedToastTitle": "Deck salvo",
+    "savedToastDescription": "\"{{name}}\" foi salvo nos seus decks.",
+    "clonedToastTitle": "Deck clonado",
+    "clonedToastDescription": "Uma cópia foi salva como \"{{name}}\"."
+  },
+  "unsaved": {
+    "title": "Alterações não salvas",
+    "dismiss": "Dispensar diálogo",
+    "bodyLeaving": "Você tem alterações não salvas neste deck. Salvar antes de sair?",
+    "bodyLoading": "Você tem alterações não salvas neste deck. Salvar antes de carregar outro deck?",
+    "discard": "Descartar",
+    "saveAndContinue": "Salvar e continuar"
+  },
+  "saveConflict": {
+    "title": "Deck alterado em outro lugar",
+    "bodyChanged": "\"{{name}}\" foi alterado em outro lugar desde que este editor o abriu ou salvou pela última vez, então nada foi salvo. Carregue a versão salva para vê-la (suas alterações não salvas serão descartadas) ou salve sua versão mesmo assim.",
+    "bodyDeleted": "\"{{name}}\" foi excluído em outro lugar desde que este editor o abriu ou salvou pela última vez, então nada foi salvo. Salve sua versão mesmo assim.",
+    "loadSaved": "Carregar versão salva",
+    "saveMine": "Salvar minha versão"
+  },
+  "card": {
+    "moveToSideboard": "Mover um {{name}} para o sideboard",
+    "moveToMain": "Mover um {{name}} para o deck principal",
+    "removeOne": "Remover um {{name}}",
+    "addOne": "Adicionar um {{name}}",
+    "copyLimit": "{{name}} está no limite de cópias",
+    "makeCommander": "Tornar {{name}} o comandante",
+    "makeCommanderTitle": "Tornar este o meu comandante",
+    "chooseArtFor": "Escolher arte para {{name}}",
+    "alternateArtTap": "Arte alternativa disponível — toque para escolher",
+    "alternateArtRightClick": "Arte alternativa disponível — clique com o botão direito para escolher",
+    "unsupportedExpand_one": "{{count}} mecânica não suportada; expandir detalhes",
+    "unsupportedExpand_other": "{{count}} mecânicas não suportadas; expandir detalhes",
+    "unsupportedTitle_one": "{{count}} mecânica não suportada — clique para expandir",
+    "unsupportedTitle_other": "{{count}} mecânicas não suportadas — clique para expandir",
+    "moveToTarget": "Mover um {{name}} para {{target}}"
+  },
+  "grid": {
+    "allFormats": "Todos",
+    "addCard": "Adicionar {{name}}",
+    "notLegal": "{{name}} - Não válido em {{format}}",
+    "notFormat": "Não {{format}}"
+  },
+  "deckList": {
+    "currentList": "Lista Atual",
+    "import": "Importar",
+    "importTitle": "Importar deck de texto (formato MTGA ou .dck)",
+    "export": "Exportar",
+    "exportTitle": "Exportar deck",
+    "mainTab": "Principal ({{count}})",
+    "sideboardTab": "Sideboard ({{count}})",
+    "mainDeckHeading_one": "Deck Principal ({{count}} carta)",
+    "mainDeckHeading_other": "Deck Principal ({{count}} cartas)",
+    "sideboardUnlimited": "Sideboard ({{count}})",
+    "sideboardLimited": "Sideboard ({{count}}/{{max}})",
+    "sideboardExceeds": "O sideboard excede o limite de {{max}} cartas",
+    "sideboardEmptyHint": "Passe o mouse sobre uma carta do deck principal e clique em → para movê-la para cá.",
+    "group": {
+      "Creatures": "Criaturas",
+      "Planeswalkers": "Planeswalkers",
+      "Instants": "Mágicas Instantâneas",
+      "Sorceries": "Feitiços",
+      "Artifacts": "Artefatos",
+      "Enchantments": "Encantamentos",
+      "Battles": "Batalhas",
+      "Lands": "Terrenos",
+      "Other": "Outros"
+    },
+    "colorGroup": {
+      "White": "Branco",
+      "Blue": "Azul",
+      "Black": "Preto",
+      "Red": "Vermelho",
+      "Green": "Verde",
+      "Multicolor": "Multicolorido",
+      "Colorless": "Incolor",
+      "Lands": "Terrenos"
+    },
+    "importModalTitle": "Importar Deck",
+    "pastePlaceholder": "Cole a lista do deck (formato MTGA ou .dck)...",
+    "fromFile": "De Arquivo",
+    "parse": "Processar",
+    "parsing": "Processando…",
+    "parseError": "Nenhuma carta encontrada. Cole um deck no formato MTGA ou .dck.",
+    "exportModalTitle": "Exportar Deck",
+    "saveToFile": "Salvar em Arquivo",
+    "copied": "Copiado!",
+    "copy": "Copiar",
+    "maybeboardTab": "Maybeboard ({{count}})",
+    "mainName": "Principal",
+    "sideboardName": "Sideboard",
+    "maybeboardName": "Maybeboard",
+    "maybeboard": "Maybeboard ({{count}})",
+    "maybeboardEmptyHint": "Cartas que você está considerando. Toque em → Maybeboard em uma carta do deck para guardá-la aqui.",
+    "commanderHeading": "Comandante",
+    "removeCommander": "Remover {{name}} como comandante"
+  },
+  "moveList": {
+    "empty": "Vazio"
+  },
+  "stack": {
+    "deckView": "Visualização do Deck",
+    "visualDeckStack": "Pilha Visual do Deck",
+    "mainBadge": "Principal {{count}}",
+    "sideboardBadge": "Sideboard {{count}}",
+    "emptyHint": "As cartas adicionadas aparecerão aqui como uma pilha escalonada.",
+    "commanderBadge": "Comandante",
+    "commanderLane": "Comandante",
+    "mainDeckLane": "Deck Principal",
+    "noCommander": "Nenhum comandante selecionado.",
+    "mainEmpty": "As cartas do deck principal aparecerão aqui.",
+    "cardCount_one": "{{count}} carta",
+    "cardCount_other": "{{count}} cartas",
+    "mainSideBadge": "{{main}} principal + {{side}} sideboard",
+    "groupCards_one": "{{count}} carta",
+    "groupCards_other": "{{count}} cartas",
+    "group": {
+      "Creatures": "Criaturas",
+      "Planeswalkers": "Planeswalkers",
+      "Instants": "Mágicas Instantâneas",
+      "Sorceries": "Feitiços",
+      "Artifacts": "Artefatos",
+      "Enchantments": "Encantamentos",
+      "Battles": "Batalhas",
+      "Lands": "Terrenos",
+      "Other": "Outros"
+    },
+    "colorGroup": {
+      "White": "Branco",
+      "Blue": "Azul",
+      "Black": "Preto",
+      "Red": "Vermelho",
+      "Green": "Verde",
+      "Multicolor": "Multicolorido",
+      "Colorless": "Incolor",
+      "Lands": "Terrenos"
+    },
+    "sideboardGroup": "Sideboard",
+    "addOne": "Adicionar um {{name}}",
+    "copyLimit": "{{name}} está no limite de cópias",
+    "removeOne": "Remover um {{name}}",
+    "removeCommander": "Remover {{name}} como comandante",
+    "maybeboardBadge": "Maybeboard {{count}}",
+    "mainName": "Principal",
+    "sideboardName": "Sideboard",
+    "maybeboardName": "Maybeboard",
+    "mainMaybeBadge": "{{main}} principal + {{side}} maybe",
+    "maybeboardGroup": "Maybeboard"
+  },
+  "printingPicker": {
+    "title": "Escolher Arte",
+    "noPrintings": "Nenhuma impressão alternativa disponível para esta carta.",
+    "filterPlaceholder": "Filtrar por coleção ou número de coleção…",
+    "filterAriaLabel": "Filtrar impressões",
+    "count_one": "{{count}} impressão",
+    "count_other": "{{count}} impressões",
+    "countMatching_one": "{{count}} impressão correspondente a “{{query}}”",
+    "countMatching_other": "{{count}} impressões correspondentes a “{{query}}”",
+    "useDefault": "Usar Padrão",
+    "noMatches": "Nenhuma impressão corresponde ao seu filtro.",
+    "noImage": "Sem imagem",
+    "showMore_one": "Mostrar mais ({{count}} restante)",
+    "showMore_other": "Mostrar mais ({{count}} restantes)"
+  },
+  "stats": {
+    "formatLegality": "Validade no Formato",
+    "engineCoverage": "Cobertura do Motor",
+    "unsupportedTitle": "Não suportadas:\n{{list}}"
+  },
+  "commanderPanel": {
+    "heading": "Comandante",
+    "noCommander": "Nenhum comandante selecionado",
+    "remove": "Remover",
+    "identity": "Identidade:",
+    "setAsCommander": "Definir como comandante:",
+    "cardCount": "{{count}}/{{expected}} cartas",
+    "cardCountNoMinimum_one": "{{count}} carta",
+    "cardCountNoMinimum_few": "{{count}} cartas",
+    "cardCountNoMinimum_many": "{{count}} cartas",
+    "cardCountNoMinimum_other": "{{count}} cartas",
+    "singletonViolations": "Violações de singleton: {{cards}}",
+    "colorViolations": "Violações de identidade de cor: {{cards}}",
+    "signatureSpell": {
+      "heading": "Feitiço de assinatura",
+      "noSignatureSpell": "Nenhum feitiço de assinatura selecionado",
+      "setAsSignatureSpell": "Definir como feitiço de assinatura:",
+      "remove": "Remover feitiço de assinatura",
+      "mustBeInstantOrSorcery": "O feitiço de assinatura deve ser uma mágica instantânea ou feitiçaria",
+      "outsideColorIdentity": "{{name}}: fora da identidade de cor do Oathbreaker"
+    },
+    "companion": {
+      "heading": "Companheiro",
+      "noCompanion": "Nenhum companheiro selecionado",
+      "remove": "Remover companheiro"
+    }
+  },
+  "manaCurve": {
+    "title": "Curva de Mana",
+    "colors": "Cores"
+  },
+  "legality": {
+    "legal": "Válido",
+    "banned": "Banido",
+    "restricted": "Restrito",
+    "notLegal": "Não Válido"
+  },
+  "contextMenu": {
+    "chooseArt": "Escolher Arte…",
+    "noAlternates": "Sem impressões alternativas",
+    "clearOverride": "Limpar Substituição de Arte"
+  },
+  "bracket": {
+    "card": {
+      "estimatedLabel": "Bracket estimado",
+      "tierName": "B{{tier}} {{label}}",
+      "tierShort": "B{{tier}}",
+      "declaredNone": "Declarado: nenhum",
+      "declared": "Declarado: B{{tier}} {{label}}",
+      "youMarker": "Você",
+      "belowFloor": "Você declarou B{{declared}}, mas este deck não pode ficar abaixo de B{{floor}}. A IA joga o seu B{{declared}} declarado.",
+      "partialCoverage_one": "{{count}} nome de carta não foi encontrado; as contagens podem estar baixas",
+      "partialCoverage_few": "{{count}} nomes de cartas não foram encontrados; as contagens podem estar baixas",
+      "partialCoverage_many": "{{count}} nomes de cartas não foram encontrados; as contagens podem estar baixas",
+      "partialCoverage_other": "{{count}} nomes de cartas não foram encontrados; as contagens podem estar baixas",
+      "combosUnchecked": "Os combos de duas cartas não foram verificados nesta compilação. Responda à pergunta sobre combos acima para incluí-los.",
+      "tabsLabel": "Detalhes do bracket",
+      "tabWhy": "Por que B{{tier}}",
+      "tabBringDown": "Reduzir",
+      "commanderTag": "Comandante",
+      "listComma": ", ",
+      "listOr": " ou ",
+      "why": {
+        "nothingRaises": "Nada neste deck o eleva acima de B2, onde toda estimativa começa.",
+        "rulesOutB1": "Estes impedem declarar B1:"
+      },
+      "reason": {
+        "cardRule": "{{axis}}: {{count}}",
+        "comboStandalone": "Combo de duas cartas",
+        "comboEarly": "Combo rápido de duas cartas",
+        "ownerAnswer": "Sua resposta sobre combos",
+        "ownerIntended": "Você disse que este deck tem um combo de duas cartas intencional.",
+        "ownerIntendedEarly": "Você disse que este deck tem um combo de duas cartas no início do jogo.",
+        "ownerIntendedLate": "Você disse que este deck tem um combo de duas cartas que só se completa tarde.",
+        "comboFromTable": "(combo)"
+      },
+      "combo": {
+        "assembles": "se monta por {{cost}} de mana"
+      },
+      "explain": {
+        "cardRule": "B{{tier}} permite até {{allowed}}; este deck tem {{observed}}.",
+        "cardRuleNone": "B{{tier}} não permite nenhuma; este deck tem {{observed}}.",
+        "comboStandalone": "B1 e B2 não permitem combos infinitos de duas cartas intencionais.",
+        "comboEarly": "B3 só permite combos de duas cartas se eles se completarem tarde (mais de {{ceiling}} de mana).",
+        "ownerAnswer": "A phase não consegue verificar esta resposta; ela usa o que você informou. Altere na pergunta sobre combos acima."
+      },
+      "source": "{{document}}, {{published}} ↗",
+      "ladder": {
+        "removeAll_one": "Remova-a:",
+        "removeAll_few": "Remova todas as {{count}}:",
+        "removeAll_many": "Remova todas as {{count}}:",
+        "removeAll_other": "Remova todas as {{count}}:",
+        "removeSome_one": "Remova {{count}} entre:",
+        "removeSome_few": "Remova {{count}} entre:",
+        "removeSome_many": "Remova {{count}} entre:",
+        "removeSome_other": "Remova {{count}} entre:",
+        "breakCombo": "Quebre o combo",
+        "removeOneOf": "Remova uma entre:",
+        "removeThis": "Remova:",
+        "replaceCommander_one": "Para descer mais, também é preciso outro comandante:",
+        "replaceCommander_few": "Para descer mais, também são necessários {{count}} comandantes diferentes:",
+        "replaceCommander_many": "Para descer mais, também são necessários {{count}} comandantes diferentes:",
+        "replaceCommander_other": "Para descer mais, também são necessários {{count}} comandantes diferentes:",
+        "changeComboAnswer": "Altere sua resposta sobre combos na pergunta acima.",
+        "footnote": "B2 é o mais baixo que a estimativa chega; B1 depende do tema do deck."
+      }
+    },
+    "unavailable": "A estimativa de bracket precisa de dados de cartas que ainda não foram carregados.",
+    "addCommander": "Adicione um comandante para ver sua estimativa de bracket.",
+    "axis": {
+      "gameChangers": "Game Changers",
+      "massLandDenial": "Negação em massa de terrenos",
+      "extraTurns": "Turnos extras",
+      "efficientTutors": "Tutores eficientes"
+    },
+    "combo": {
+      "attribution": "Dados de combos: {{attribution}}, captura de {{date}}",
+      "outcome": {
+        "wins": "Vence o jogo",
+        "unbounded": "{{resource}} sem limite"
+      },
+      "resource": {
+        "mana": "mana",
+        "damage": "dano",
+        "lifeLoss": "perda de vida",
+        "lifegain": "ganho de vida",
+        "mill": "moagem",
+        "draw": "compra de cartas",
+        "tokens": "fichas",
+        "combat": "fases de combate",
+        "turns": "turnos"
+      }
+    },
+    "dataVersion": "Dados: {{version}}",
+    "aboutBrackets": "Sobre brackets ↗",
+    "estimatedChip": "Estimado: B{{tier}}",
+    "estimatedChipFull": "Bracket estimado: B{{tier}} {{label}}",
+    "manualChip": "B{{tier}}",
+    "manualChipFull": "Bracket declarado: B{{tier}} {{label}}"
+  },
+  "bracketPicker": {
+    "ariaLabel": "Bracket do deck",
+    "unrated": "Sem classificação"
+  },
+  "signals": {
+    "title": "Sinais do deck",
+    "disclaimer": "Estatísticas descritivas do texto analisado das cartas do deck. Não são critérios de bracket e nunca alteram a estimativa.",
+    "avgManaValue": "Valor de mana médio (não terrenos): {{value}}",
+    "notMeasurable": "não mensurável",
+    "noCommander": "Adicione um comandante para ver os sinais do deck.",
+    "unavailable": "Os sinais do deck precisam de dados de cartas, que ainda não foram carregados.",
+    "unresolved": "{{n}} nomes de cartas não foram encontrados nos dados de cartas.",
+    "kind": {
+      "counterspells": "Contramágicas",
+      "spot_removal": "Remoção pontual",
+      "sweepers": "Limpadores de mesa",
+      "card_advantage": "Vantagem de cartas",
+      "free_interaction": "Interação gratuita",
+      "mana_producers": "Produtores de mana",
+      "land_fetch": "Busca de terrenos",
+      "rituals": "Rituais",
+      "extra_land_drops": "Terrenos adicionais por turno"
+    }
+  },
+  "comboBarometer": {
+    "ariaLabel": "Combo infinito de duas cartas",
+    "question": "Combo infinito intencional de duas cartas?",
+    "undeclared": "Sem resposta",
+    "noneIntended": "Nenhum intencional",
+    "intended": "Intencional",
+    "windowAriaLabel": "Quando pode ser montado?",
+    "windowUnstated": "Não especificado",
+    "windowEarly": "Início de jogo",
+    "windowLate": "Apenas no fim do jogo"
+  },
+  "warnings": {
+    "commanderCount": "O deck tem {{count}} cartas (precisa de exatamente {{expected}})",
+    "singleton": "{{name}}: várias cópias (formato singleton)",
+    "colorIdentity": "{{name}}: fora da identidade de cor do comandante",
+    "minimumCount": "O deck tem {{count}} cartas (mínimo de 60)",
+    "maxCopies": "{{name}}: {{count}} cópias (máx. 4)",
+    "companionInMain": "{{name}} é seu companheiro, mas também está no deck principal — isso viola sua condição de construção. Remova-o do deck principal para usá-lo como companheiro."
+  },
+  "switcher": {
+    "starred": "Destacados",
+    "unfiled": "Sem pasta",
+    "searchPlaceholder": "Buscar baralhos…",
+    "noMatches": "Nenhum baralho"
+  }
+}

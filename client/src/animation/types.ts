@@ -1,0 +1,208 @@
+import type { GameEvent, GameState } from "../adapter/types";
+import { damageCauseOf } from "./damageCause";
+
+/** Visual effects tier.
+ *  - `full`: New-style card flights with a drop shadow, and landing dust when
+ *    a card lands on the battlefield. Pixel ratio is capped lower on touch
+ *    devices than on desktop.
+ *  - `reduced`: the same flights and paths, with no shadow or dust, at a pixel
+ *    ratio no higher than `full`'s touch cap.
+ *  - `minimal`: today's animations in either style; no overlay, canvas or
+ *    renderer is created.
+ *  Non-flight effects keep their own tier gates. */
+export type VfxQuality = "full" | "reduced" | "minimal";
+
+/** Card-animation style, independent of {@link VfxQuality}. `"webgl"` is the
+ *  New style: WebGL card effects drawn on the shared overlay. `"classic"` is the
+ *  pre-overlay DOM/framer-motion animations, the same path the New style falls
+ *  back to when WebGL is unavailable. */
+export type CardAnimationStyle = "webgl" | "classic";
+
+/** Continuous animation-speed multiplier. `0` short-circuits the wait entirely
+ *  (the legacy "instant" mode). Values above 1 slow things down; below 1 speed
+ *  things up. The slider in settings exposes this directly. */
+export const ANIMATION_SPEED_DEFAULT = 1.0;
+export const ANIMATION_SPEED_MIN = 0;
+export const ANIMATION_SPEED_MAX = 2;
+export const ANIMATION_SPEED_STEP = 0.05;
+
+/** Per-category pacing multipliers applied to event durations *before* the
+ *  global animation-speed multiplier. The `category()` lookup below routes
+ *  every animated event into exactly one of these buckets. */
+export type PacingCategory = "effects" | "combat" | "banners";
+
+export const PACING_CATEGORIES: readonly PacingCategory[] = ["effects", "combat", "banners"] as const;
+
+// Per-category labels/descriptions are frontend-authored display text and are
+// translated at the render site via `t("pacing.labels.<category>")` /
+// `t("pacing.descriptions.<category>")` (settings namespace).
+
+export const PACING_DEFAULT = 1.0;
+export const PACING_MIN = 0;
+export const PACING_MAX = 2;
+export const PACING_STEP = 0.05;
+
+export function defaultPacingMultipliers(): Record<PacingCategory, number> {
+  return { effects: PACING_DEFAULT, combat: PACING_DEFAULT, banners: PACING_DEFAULT };
+}
+
+/** Maps an event type to its pacing category. Anything not listed falls into
+ *  `"effects"`. Keep the table sparse — only events that need a non-default
+ *  category appear here. */
+const EVENT_PACING_CATEGORY: Record<string, PacingCategory> = {
+  DamageDealt: "combat",
+  GroupedDamageFlurry: "combat",
+};
+
+export function eventCategory(eventType: string): PacingCategory {
+  return EVENT_PACING_CATEGORY[eventType] ?? "effects";
+}
+
+export type GroupedDamageFlurryEvent = {
+  type: "GroupedDamageFlurry";
+  data: {
+    player_id: number;
+    source_ids: number[];
+    total_damage: number;
+    hit_count: number;
+  };
+};
+
+export type AnimationEvent = GameEvent | GroupedDamageFlurryEvent;
+
+export interface StepEffect {
+  event: AnimationEvent;
+  duration: number;
+  displayOnly?: true;
+}
+
+export interface AnimationStep {
+  effects: StepEffect[];
+  duration: number;
+}
+
+export type PositionSnapshot = Map<number, DOMRect>;
+
+/** Combat pacing defaults (normal speed). */
+export const COMBAT_ENGAGEMENT_DURATION_MS = 900;
+export const GROUPED_COMBAT_DAMAGE_THRESHOLD = 12;
+export const GROUPED_COMBAT_DAMAGE_DURATION_MS = 900;
+export const GROUPED_DAMAGE_FLURRY_IMPACT_DELAY_MS = 260;
+export const DAMAGE_FLURRY_SOURCE_SAMPLE_LIMIT = 16;
+export const DAMAGE_FLURRY_PROJECTILE_MIN = 8;
+export const DAMAGE_FLURRY_PROJECTILE_MAX = 32;
+export const DAMAGE_FLURRY_TRAIL_PARTICLE_MAX = 96;
+export const GROUPED_EVENT_RUN_THRESHOLD = 8;
+export const GROUPED_TOKEN_CREATION_THRESHOLD = GROUPED_EVENT_RUN_THRESHOLD;
+
+/** Base duration of the meld forge-and-flip animation, before pacing. */
+export const MELD_FORGE_DURATION_MS = 3200;
+
+/**
+ * Phase boundaries of the meld animation, as fractions of its duration: the
+ * two cards gather over the anvil, take three hammer blows, fuse into one
+ * white-hot blank, and the blank turns over to the combined oversized face.
+ * The tail after `flipped` holds the revealed card while it cools.
+ */
+export const MELD_FORGE_PHASES = {
+  gathered: 0.2,
+  strikes: [0.3, 0.4, 0.5],
+  fused: 0.58,
+  flipped: 0.8,
+} as const;
+
+export const EVENT_DURATIONS: Record<string, number> = {
+  ZoneChanged: 400,
+  DamageDealt: COMBAT_ENGAGEMENT_DURATION_MS,
+  LifeChanged: 300,
+  SpellCast: 500,
+  CreatureDestroyed: 400,
+  TokenCreated: 400,
+  CounterAdded: 200,
+  CounterRemoved: 200,
+  PermanentTapped: 200,
+  PermanentUntapped: 200,
+  Melded: MELD_FORGE_DURATION_MS,
+};
+
+export const DEFAULT_DURATION = 200;
+
+
+/** How long the card slam flight phase takes before impact (ms, before speed multiplier). */
+export const CARD_SLAM_FLIGHT_MS = 200;
+
+export function isPlayerDamageAnimationEvent(event: AnimationEvent, playerId: number): boolean {
+  if (event.type === "GroupedDamageFlurry") {
+    return event.data.player_id === playerId;
+  }
+  return event.type === "DamageDealt" && "Player" in event.data.target && event.data.target.Player === playerId;
+}
+
+/** How long a card VFX damage cause (a thrown fireball, a lightning strike)
+ *  takes to reach its target (ms, before speed multiplier). */
+export const DAMAGE_CAUSE_IMPACT_MS = 440;
+
+/** When `event`'s hit lands. `causeState` is the pre-event state when card VFX
+ *  present damage causes (`damageCauseOf`), else `null`. */
+export function impactDelayMsForAnimationEvent(event: AnimationEvent, causeState: GameState | null = null): number {
+  if (event.type === "GroupedDamageFlurry") return GROUPED_DAMAGE_FLURRY_IMPACT_DELAY_MS;
+  if (event.type === "DamageDealt" && "Player" in event.data.target) {
+    return damageCauseOf(event, causeState) ? DAMAGE_CAUSE_IMPACT_MS : CARD_SLAM_FLIGHT_MS;
+  }
+  return 0;
+}
+
+/**
+ * How long after its step begins a life change for `playerId` visually lands,
+ * before the speed multiplier.
+ *
+ * A life change is presented by whatever hit caused it — a card slam or damage
+ * cause for direct player damage, the flurry for a collapsed swarm — so the delay comes from that
+ * impact event, and is zero when the change has no hit behind it (a drain, a
+ * paid cost). The displayed total, its flash, and the impact VFX must land
+ * together, so every one of them resolves the delay here rather than each
+ * picking its own impact event out of the step.
+ */
+export function lifeChangeImpactDelayMs(
+  lifeEffect: StepEffect,
+  effects: readonly StepEffect[],
+  playerId: number,
+  causeState: GameState | null = null,
+): number {
+  const playerDamageEffect = effects.find(
+    (effect) => isPlayerDamageAnimationEvent(effect.event, playerId),
+  );
+  const groupedDamageEffect = lifeEffect.displayOnly
+    ? effects.find((effect) => effect.event.type === "GroupedDamageFlurry")
+    : undefined;
+  const impactEvent = playerDamageEffect?.event ?? groupedDamageEffect?.event;
+  return impactEvent ? impactDelayMsForAnimationEvent(impactEvent, causeState) : 0;
+}
+
+/** Base "your turn / opponent's turn" banner display duration, before any
+ *  pacing multipliers apply. */
+export const TURN_BANNER_DURATION_MS = 1500;
+
+/** Base time an ability roll's result stays on screen after its dice or coin
+ *  land, before the animation speed multiplier. The overlay's close countdown
+ *  starts at the landing (uiStore `settleDiceRoll`), so a result that lands
+ *  within `DICE_ROLL_LANDING_TIMEOUT_MS` keeps its full beat however long the
+ *  3D chunk and WebGL took to start. */
+export const DICE_RESULT_HOLD_MS = 1200;
+
+/** Floor for that beat at fast animation speeds, so the result stays readable
+ *  however fast the tumble plays. Instant speed (0) skips the overlay instead. */
+export const DICE_RESULT_MIN_HOLD_MS = 800;
+
+/** Base minimum time an ability roll stays on screen from when it shows,
+ *  before the animation speed multiplier: about one tumble plus the result's
+ *  beat. A result that shows at once (the static face under reduced motion or
+ *  without WebGL) gets about the time an animated roll takes. */
+export const DICE_ROLL_MIN_DURATION_MS = 2400;
+
+/** Wall-clock wait for an ability roll's landing report, after which its
+ *  result shows as the static face and counts down from there (a 3D chunk that
+ *  never arrives, or a renderer that stops drawing). It is not speed-scaled: it
+ *  must outlast the slowest landing, a 3.2s tumble at the slowest speed, plus
+ *  the 3D chunk's load and WebGL start-up. */
+export const DICE_ROLL_LANDING_TIMEOUT_MS = 8000;

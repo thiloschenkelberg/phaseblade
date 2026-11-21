@@ -1,0 +1,452 @@
+pub use phase_ast::types::player::*;
+
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+
+use super::ability::is_false;
+use super::card_printing::SharedPrinting;
+use super::display_only::DisplayOnly;
+use super::event_kinds::BendingType;
+use super::identifiers::ObjectId;
+use super::mana::{ManaColor, ManaPool};
+
+use crate::game::deck_loading::DeckEntry;
+
+/// `skip_serializing_if` for zero-default turn-window counters: omitting them
+/// at rest keeps the StateUpdate wire shape identical to upstream (fixture +
+/// bandwidth budgets) while still transmitting live nonzero windows.
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Status of a player in the game. Mirrors `PhaseStatus` for permanents — a
+/// phased-out player is treated as though they don't exist for targeting,
+/// damage, attacking, and SBA loss-from-life purposes, but they remain in the
+/// game state (never removed from `state.players`). Their phased-out turn
+/// proceeds with the player still as the active player; the status is cleared
+/// at the next time a `Duration::UntilNextTurnOf` effect that phased them
+/// out would expire (the active player's untap step).
+///
+/// CR 702.26 governs *permanent* phasing only; the player-phasing semantics
+/// are derived from card Oracle text on the small set of cards (e.g.,
+/// historical Teferi's Protection wording) that say "you phase out". The
+/// invariants below mirror the permanent-phasing invariants:
+///
+/// - Status is the sole encoding of phased-in vs phased-out — the player
+///   never leaves `state.players`.
+/// - While phased out, the player can't be targeted, attacked, dealt damage,
+///   or lose the game from 0-or-less life. These exclusions live at single
+///   choke points (`game/targeting.rs::add_players`,
+///   `game/combat.rs::get_valid_attack_targets`,
+///   `game/effects/deal_damage.rs::apply_damage_after_replacement`,
+///   `game/sba.rs::check_player_life`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(tag = "type")]
+pub enum PlayerStatus {
+    #[default]
+    Active,
+    PhasedOut,
+}
+
+impl PlayerStatus {
+    pub fn is_phased_in(&self) -> bool {
+        matches!(self, PlayerStatus::Active)
+    }
+
+    pub fn is_phased_out(&self) -> bool {
+        matches!(self, PlayerStatus::PhasedOut)
+    }
+}
+
+/// CR 702.139: Tracks a declared companion outside the game.
+/// The companion is not a `GameObject` until it moves to hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompanionInfo {
+    /// The companion card's face data for creating a GameObject when moved to hand.
+    pub card: DeckEntry,
+    /// CR 702.139c: Whether the companion has been put into hand this game (once per game).
+    pub used: bool,
+    /// CR 702.139a + CR 203.1 + CR 206.1: the owner's printing of the revealed companion,
+    /// captured at the reveal from the source it was revealed from (display-only).
+    #[serde(default, skip_serializing_if = "DisplayOnly::is_none")]
+    pub printing: DisplayOnly<Option<SharedPrinting>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Player {
+    pub id: PlayerId,
+    pub life: i32,
+    /// This seat has NO life total, so `life` is meaningless for it and must not
+    /// be presented as a resource. Damage and life loss it would take are
+    /// redirected into milling its library, and it is exempt from the CR 704.5a
+    /// "0 or less life" state-based action.
+    ///
+    /// True only for the Horde seat in a `GameFormat::Horde` game (a casual
+    /// variant, hence no CR number — see `horde::player_has_no_life_total`). Set
+    /// once at deck load, since the Horde seat is fixed for the whole game.
+    ///
+    /// Engine-derived and serialized so clients can render the seat truthfully
+    /// (showing its library — the Horde's real clock, as it loses by decking out)
+    /// instead of a frozen life total, WITHOUT re-deriving "which seat is the
+    /// Horde" on the frontend.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub has_no_life_total: bool,
+    pub mana_pool: ManaPool,
+
+    // Per-player zones
+    pub library: im::Vector<ObjectId>,
+    pub hand: im::Vector<ObjectId>,
+    pub graveyard: im::Vector<ObjectId>,
+    /// CR 717.2: Supplementary Attraction deck (command zone), top at front.
+    #[serde(default)]
+    pub attraction_deck: im::Vector<ObjectId>,
+    /// Unstable Contraptions: supplementary Contraption deck (command zone),
+    /// top at front.
+    #[serde(default)]
+    pub contraption_deck: im::Vector<ObjectId>,
+    /// Unstable Contraptions: the sprocket currently holding the CRANK!
+    /// counter for this player. Starts on sprocket 3.
+    #[serde(default = "default_contraption_crank_sprocket")]
+    pub contraption_crank_sprocket: u8,
+    /// CR 123.2c: Revealed sticker sheets this player has access to this game.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sticker_sheets: Vec<String>,
+
+    // Tracking
+    pub has_drawn_this_turn: bool,
+    pub lands_played_this_turn: u8,
+    pub poison_counters: u32,
+    /// CR 122.1: Energy counters are a kind of counter that a player may have.
+    #[serde(default)]
+    pub energy: u32,
+    #[serde(default)]
+    pub life_gained_this_turn: u32,
+    #[serde(default)]
+    pub life_lost_this_turn: u32,
+    /// CR 107.14 + CR 122.1: Energy counters this player has paid or otherwise
+    /// lost this turn. Bumped on every energy decrement in
+    /// `GameState::apply_resolved_player_edit` and reset at turn start. Read by
+    /// `QuantityRef::EnergyPaidOrLostThisTurn` (Blaster Hulk).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub energy_paid_or_lost_this_turn: u32,
+    /// CR 603.4: Amount of life lost during the previous turn, snapshotted at turn start.
+    /// Used by "if an opponent lost life during their last turn" intervening-if conditions.
+    #[serde(default)]
+    pub life_lost_last_turn: u32,
+    /// CR 601.2i + CR 603.4: Number of spells this player cast during the
+    /// previous turn, latched at the turn boundary from that turn's per-player
+    /// cast journal (`GameState::spells_cast_this_turn_by_player`) before the
+    /// journal is cleared. Read by `QuantityRef::SpellsCast { window: LastTurn }`
+    /// ("a player cast two or more spells last turn", the werewolf transform
+    /// clause). A player who has left the game keeps their snapshot (CR 800.4i).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub spells_cast_last_turn: u32,
+    #[serde(default)]
+    pub descended_this_turn: bool,
+    #[serde(default)]
+    pub cards_drawn_this_turn: u32,
+    /// CR 121.1 + CR 603.4: Number of cards this player drew during the
+    /// previous turn, snapshotted at turn start. Used by "if you drew a card
+    /// last turn" intervening-if conditions (Mine Is the Only Truth).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub cards_drawn_last_turn: u32,
+    /// CR 601.2i + CR 603.4: Number of spells this player's opponents have
+    /// cast since this player's last turn ended. Bumped in
+    /// `ledger::apply_resolved_ledger_edit` on every finalized cast, reset
+    /// for the completed player in `turns.rs::start_next_turn`. Used by "if
+    /// no opponent cast a spell since your last turn ended" intervening-if
+    /// conditions (I Bask in Your Silent Awe).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub opponent_spells_cast_since_own_last_turn: u32,
+    /// CR 121.1 + CR 504.1: Number of cards this player has drawn during the
+    /// current step. Reset on every step transition (`turns.rs::advance_phase`)
+    /// and at turn start (`start_next_turn`). Used by
+    /// `ReplacementCondition::ExceptFirstDrawInDrawStep` and
+    /// `TriggerCondition::ExceptFirstDrawInDrawStep` to identify the first
+    /// card-draw of each draw step (CR 504.1's turn-based action).
+    #[serde(default)]
+    pub cards_drawn_this_step: u32,
+    /// CR 702.179b: Players have no speed until a rule or effect sets it.
+    /// `None` means the player currently has no speed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<u8>,
+    /// CR 702.179d: The inherent speed trigger can increase speed only once each turn.
+    #[serde(default)]
+    pub speed_trigger_used_this_turn: bool,
+    /// CR 700.13: Whether this player has committed a crime this turn (stored
+    /// as 0 or 1 for `QuantityRef` condition evaluation).
+    #[serde(default)]
+    pub crimes_committed_this_turn: u32,
+    /// CR 704.5b: Set when this player attempted to draw from an empty library.
+    /// Checked by SBAs — the player loses the game.
+    #[serde(default)]
+    pub drew_from_empty_library: bool,
+
+    /// Number of turns this player has taken (cumulative, never reset).
+    /// Used by "your Nth turn of the game" Oracle conditions (QuantityRef::TurnsTaken).
+    #[serde(default)]
+    pub turns_taken: u32,
+
+    /// CR 103.2a: Card count of this player's submitted starting deck
+    /// (library + command-zone decklist cards, single-counted; sideboard and
+    /// companion excluded per CR 103.2a / CR 702.139b). Latched once at deck
+    /// load by `load_deck_into_state` and never mutated mid-game — the rules
+    /// past tense in Whtz, the Bibliophile's "if you had 200 or more cards in
+    /// your starting deck" reads this snapshot, not the live library.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub starting_deck_size: u32,
+
+    // Elimination tracking (N-player support)
+    #[serde(default)]
+    pub is_eliminated: bool,
+
+    /// Avatar crossover: which bending types this player has performed this turn.
+    #[serde(
+        default,
+        serialize_with = "crate::types::deterministic_serde::hash_set"
+    )]
+    pub bending_types_this_turn: HashSet<BendingType>,
+
+    /// CR 122.1: Player counters (experience, rad, ticket, etc.).
+    /// Poison counters route to the dedicated `poison_counters` field via method accessors.
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        serialize_with = "crate::types::deterministic_serde::hash_map"
+    )]
+    pub player_counters: HashMap<PlayerCounterKind, u32>,
+
+    /// Phasing status. Default `Active`. While `PhasedOut`, the player is
+    /// excluded from targeting/attack/damage/SBA-loss filter choke points.
+    /// See `PlayerStatus` for the full invariant list.
+    #[serde(default)]
+    pub status: PlayerStatus,
+
+    /// CR 702.139: The player's declared companion (if any). Lives outside the game.
+    /// Stored as card data (not a GameObject) until moved to hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion: Option<CompanionInfo>,
+    /// Digital-only Alchemy (no CR entry): the number this player last noted
+    /// ("note its power", "note that excess damage"). Read by
+    /// `QuantityRef::NotedNumber` ("where X is the noted number",
+    /// Dragonborn Immolator / Mephit's Enthusiasm / Molten Impact). A new
+    /// note overwrites; `None` (nothing noted) reads as 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noted_number: Option<i32>,
+
+    /// CR 607.2d / CR 607.2m (by analogy): durable per-player chosen attributes —
+    /// the player-axis mirror of `GameObject.chosen_attributes`. Today this holds
+    /// the "last chose <anchor>" label (`ChosenAttribute::Label`) for planar
+    /// anchor choices (Two Streams Facility). Players never change zones, so a
+    /// per-player choice persists until it is reassigned (unlike an object's
+    /// `chosen_attributes`, which clears on zone change per CR 400.7).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chosen_attributes: Vec<crate::types::ability::ChosenAttribute>,
+
+    // Derived fields (computed in WASM bridge, not persisted)
+    #[serde(skip_deserializing, default)]
+    pub can_look_at_top_of_library: bool,
+
+    /// CR 903.4: Combined color identity of this player's commander(s).
+    /// Derived per-tick by `derive_display_state` from `state.deck_pools` /
+    /// command-zone objects so the frontend can render
+    /// `ManaPip::AnyInCommandersIdentity` (Command Tower, Path of Ancestry)
+    /// without recomputing identity client-side. Empty when the player has
+    /// no commander or has only a colorless commander (CR 903.4f).
+    #[serde(skip_deserializing, default)]
+    pub commander_color_identity: Vec<ManaColor>,
+}
+
+impl Default for Player {
+    fn default() -> Self {
+        Player {
+            id: PlayerId(0),
+            life: 20,
+            has_no_life_total: false,
+            mana_pool: ManaPool::default(),
+            library: im::Vector::new(),
+            hand: im::Vector::new(),
+            graveyard: im::Vector::new(),
+            attraction_deck: im::Vector::new(),
+            contraption_deck: im::Vector::new(),
+            contraption_crank_sprocket: default_contraption_crank_sprocket(),
+            sticker_sheets: Vec::new(),
+            has_drawn_this_turn: false,
+            lands_played_this_turn: 0,
+            poison_counters: 0,
+            energy: 0,
+            life_gained_this_turn: 0,
+            life_lost_this_turn: 0,
+            energy_paid_or_lost_this_turn: 0,
+            life_lost_last_turn: 0,
+            spells_cast_last_turn: 0,
+            descended_this_turn: false,
+            cards_drawn_this_turn: 0,
+            cards_drawn_last_turn: 0,
+            opponent_spells_cast_since_own_last_turn: 0,
+            cards_drawn_this_step: 0,
+            speed: None,
+            speed_trigger_used_this_turn: false,
+            crimes_committed_this_turn: 0,
+            drew_from_empty_library: false,
+            turns_taken: 0,
+            is_eliminated: false,
+            bending_types_this_turn: HashSet::new(),
+            player_counters: HashMap::new(),
+            companion: None,
+            chosen_attributes: Vec::new(),
+            noted_number: None,
+            can_look_at_top_of_library: false,
+            commander_color_identity: Vec::new(),
+            status: PlayerStatus::Active,
+            starting_deck_size: 0,
+        }
+    }
+}
+
+fn default_contraption_crank_sprocket() -> u8 {
+    3
+}
+
+impl Player {
+    /// CR 101.4 + CR 608.2d: The number this player most recently chose for a
+    /// per-player `Effect::Choose { ChoiceType::NumberRange }` ("each player
+    /// secretly chooses a number 0 or greater"). `None` when this player has
+    /// not chosen a number — the aggregate readers of
+    /// [`crate::types::ability::QuantityRef::PlayerChosenNumber`] use that to
+    /// exclude non-choosers from a highest/lowest fold instead of counting them
+    /// as 0.
+    ///
+    /// Reads the secret and the revealed variants interchangeably: revealing a
+    /// number changes who may SEE it, never what it is, so every rules read
+    /// ("the highest number", "each player who chose the lowest number") must
+    /// return the same value on both sides of the reveal.
+    pub fn chosen_number(&self) -> Option<u32> {
+        use crate::types::ability::ChosenAttribute;
+        self.chosen_attributes.iter().find_map(|attr| match attr {
+            ChosenAttribute::Number(n) | ChosenAttribute::RevealedNumber(n) => Some(*n),
+            _ => None,
+        })
+    }
+
+    /// CR 101.4 + CR 608.2c: Publish this player's secretly-chosen number, the
+    /// state transition behind "then all players reveal those numbers
+    /// simultaneously". Returns the revealed value, or `None` when this player
+    /// chose no number (CR 609.3 — revealing nothing is a legal no-op, which is
+    /// what lets a card name every player when only some of them chose).
+    /// Idempotent: an already-revealed number stays revealed.
+    pub fn reveal_chosen_number(&mut self) -> Option<u32> {
+        use crate::types::ability::ChosenAttribute;
+        let value = self.chosen_number()?;
+        self.chosen_attributes.retain(|attribute| {
+            !matches!(
+                attribute,
+                ChosenAttribute::Number(_) | ChosenAttribute::RevealedNumber(_)
+            )
+        });
+        self.chosen_attributes
+            .push(ChosenAttribute::RevealedNumber(value));
+        Some(value)
+    }
+
+    /// CR 122.1: Get the current count of a player counter.
+    /// Poison counters route to the dedicated field (SBA at CR 704.5c).
+    pub fn player_counter(&self, kind: &PlayerCounterKind) -> u32 {
+        match kind {
+            PlayerCounterKind::Poison => self.poison_counters,
+            _ => self.player_counters.get(kind).copied().unwrap_or(0),
+        }
+    }
+
+    /// CR 122.1: Add counters of a given type to this player.
+    /// Poison counters route to the dedicated field (SBA at CR 104.3d).
+    pub fn add_player_counters(&mut self, kind: &PlayerCounterKind, count: u32) {
+        match kind {
+            PlayerCounterKind::Poison => self.poison_counters += count,
+            _ => *self.player_counters.entry(*kind).or_insert(0) += count,
+        }
+    }
+
+    /// CR 122.3: Remove counters of a given type from this player.
+    /// Saturates at zero. Removes the map key when count reaches 0
+    /// so `skip_serializing_if = "HashMap::is_empty"` stays clean.
+    pub fn remove_player_counters(&mut self, kind: &PlayerCounterKind, count: u32) {
+        match kind {
+            PlayerCounterKind::Poison => {
+                self.poison_counters = self.poison_counters.saturating_sub(count);
+            }
+            _ => {
+                if let Some(val) = self.player_counters.get_mut(kind) {
+                    *val = val.saturating_sub(count);
+                    if *val == 0 {
+                        self.player_counters.remove(kind);
+                    }
+                }
+            }
+        }
+    }
+
+    /// True when this player is phased in (the normal state).
+    pub fn is_phased_in(&self) -> bool {
+        self.status.is_phased_in()
+    }
+
+    /// True when this player is phased out (excluded from targeting/damage/
+    /// attack/SBA per the player-phasing exclusion choke points).
+    pub fn is_phased_out(&self) -> bool {
+        self.status.is_phased_out()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The turn-window counters must not perturb the StateUpdate wire shape
+    /// at rest (production fixture + bandwidth budgets), while live nonzero
+    /// windows still transmit and omitted fields read back as zero.
+    #[test]
+    fn turn_window_counters_skip_zero_on_the_wire() {
+        let rest = Player::default();
+        let json = serde_json::to_value(&rest).expect("serialize");
+        let object = json.as_object().expect("object");
+        assert!(!object.contains_key("cards_drawn_last_turn"));
+        assert!(!object.contains_key("opponent_spells_cast_since_own_last_turn"));
+        let back: Player = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.cards_drawn_last_turn, 0);
+        assert_eq!(back.opponent_spells_cast_since_own_last_turn, 0);
+
+        let live = Player {
+            cards_drawn_last_turn: 3,
+            opponent_spells_cast_since_own_last_turn: 1,
+            ..Player::default()
+        };
+        let json = serde_json::to_value(&live).expect("serialize");
+        assert_eq!(json["cards_drawn_last_turn"], 3);
+        assert_eq!(json["opponent_spells_cast_since_own_last_turn"], 1);
+    }
+
+    /// CR 103.2a: the latched starting-deck count omits the default zero on
+    /// the wire (old saves without the key load as 0), while a live nonzero
+    /// latch round-trips. Whtz, the Bibliophile's "if you had 200 or more
+    /// cards in your starting deck" reads this snapshot.
+    #[test]
+    fn starting_deck_size_latch_skips_zero_on_the_wire() {
+        let rest = Player::default();
+        let json = serde_json::to_value(&rest).expect("serialize");
+        let object = json.as_object().expect("object");
+        assert!(!object.contains_key("starting_deck_size"));
+        let back: Player = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.starting_deck_size, 0);
+
+        let live = Player {
+            starting_deck_size: 200,
+            ..Player::default()
+        };
+        let json = serde_json::to_value(&live).expect("serialize");
+        assert_eq!(json["starting_deck_size"], 200);
+        let back: Player = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.starting_deck_size, 200);
+    }
+}

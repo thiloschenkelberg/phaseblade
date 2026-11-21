@@ -1,0 +1,496 @@
+/**
+ * GameSetupPage — cEDH bracket warning chip tests.
+ *
+ * The warning chip renders when:
+ *   activeDeckName !== null
+ *   && cedhMode
+ *   && !isDeckCedhLegal(humanDeckBracket)
+ *
+ * `activeDeckName` is read from localStorage (ACTIVE_DECK_KEY) on mount.
+ * `humanDeckBracket` is read via `loadSavedDeckBracket(activeDeckName)`
+ * which parses the stored deck JSON's `bracket` field from localStorage.
+ * `aiSeats` lives in the preferences store.
+ *
+ * Heavy sub-components (MyDecks, MenuShell, MenuParticles, ScreenChrome,
+ * AiOpponentConfig, FormatPicker, ModalPanelShell, useCardImage, audio,
+ * WASM adapter, deckCompatibility, useBracketEstimate) are mocked so the
+ * test only exercises the warning-chip render condition.
+ */
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { act } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+
+import { ACTIVE_DECK_KEY, STORAGE_KEY_PREFIX } from "../../constants/storage";
+import { usePreferencesStore } from "../../stores/preferencesStore";
+import { deckSupplyForFormat } from "../../services/engineRuntime";
+import { GameSetupPage } from "../GameSetupPage";
+
+// ── Mock heavy sub-components and services ─────────────────────────────────
+
+vi.mock("../../components/menu/MenuParticles", () => ({
+  MenuParticles: () => null,
+}));
+
+vi.mock("../../hooks/useCardImage", () => ({
+  useCardImage: () => ({ src: null, isLoading: false }),
+}));
+
+const compat = vi.hoisted(() => ({ evaluateDeckCompatibility: vi.fn() }));
+vi.mock("../../services/deckCompatibility", () => ({
+  evaluateDeckCompatibilityBatch: vi.fn().mockResolvedValue({}),
+  evaluateDeckCompatibility: compat.evaluateDeckCompatibility,
+}));
+
+vi.mock("../../hooks/useBracketEstimate", () => ({
+  useBracketEstimate: () => ({ estimate: null, loading: false, unsupported: false }),
+}));
+
+vi.mock("../../adapter/wasm-adapter", () => ({
+  getSharedAdapter: () => ({ warmCardDatabase: () => Promise.resolve() }),
+}));
+
+vi.mock("../../services/engineRuntime", async () => ({
+  ...(await vi.importActual<typeof import("../../services/engineRuntime")>(
+    "../../services/engineRuntime",
+  )),
+  bestOfThreeCeilingForFormat: vi.fn(async (format: string) => (format === "Dandan" ? "Bo1" : "Bo3")),
+  deckSupplyForFormat: vi.fn(async (format: string) =>
+    format === "Dandan" ? "HostPile" : format === "Momir" ? "EngineFixed" : "PlayerBuilt"),
+}));
+
+vi.mock("../../audio/useAudioContext", () => ({
+  useAudioContext: () => undefined,
+}));
+
+vi.mock("../../services/aiDeckCatalog", async () => {
+  const actual =
+    await vi.importActual<typeof import("../../services/aiDeckCatalog")>(
+      "../../services/aiDeckCatalog",
+    );
+  // Stable identity like the real hook's state result: GameSetupPage derives
+  // its settled catalog from this in an effect, and a fresh literal every
+  // render would churn that effect. The factory runs once per file, so this
+  // single object is shared across renders.
+  const stubCatalogResult = { candidates: [], allCandidates: [], loading: false, error: null };
+  return {
+    ...actual,
+    useAiDeckCatalog: () => stubCatalogResult,
+  };
+});
+
+vi.mock("../../hooks/useSetSymbols", () => ({
+  useSetSymbol: () => null,
+}));
+
+// MyDecks is a heavy component — stub it so tests focus on the warning chip.
+vi.mock("../../components/menu/MyDecks", async () => {
+  const actual = await vi.importActual<typeof import("../../components/menu/MyDecks")>(
+    "../../components/menu/MyDecks",
+  );
+  return {
+    ...actual,
+    MyDecks: () => null,
+  };
+});
+
+vi.mock("../../hooks/useDecks", async () => {
+  const actual = await vi.importActual<typeof import("../../hooks/useDecks")>(
+    "../../hooks/useDecks",
+  );
+  return {
+    ...actual,
+    useDecks: () => ({ decks: null, status: "success" as const }),
+  };
+});
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/** Write a minimal deck JSON into localStorage with an optional bracket tag. */
+function seedDeck(deckName: string, bracket?: number): void {
+  const data: Record<string, unknown> = {
+    main: [{ name: "Island", count: 100 }],
+    sideboard: [],
+  };
+  if (bracket !== undefined) {
+    data.bracket = bracket;
+  }
+  localStorage.setItem(STORAGE_KEY_PREFIX + deckName, JSON.stringify(data));
+}
+
+/** Set the active deck in localStorage (simulates the user having selected a deck previously). */
+function setActiveDeck(deckName: string): void {
+  localStorage.setItem(ACTIVE_DECK_KEY, deckName);
+}
+
+function LocationProbe() {
+  const { search } = useLocation();
+  return <div data-testid="game-route">{search}</div>;
+}
+
+function renderGameSetupPage(initialEntry = "/game-setup") {
+  return render(
+    <MemoryRouter initialEntries={[initialEntry]}>
+      <Routes>
+        <Route path="/game-setup" element={<GameSetupPage />} />
+        <Route path="/" element={<div>Home</div>} />
+        <Route path="/game/:id" element={<LocationProbe />} />
+        <Route path="/deck-builder" element={<div>Deck Builder</div>} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+// ── Test suite ─────────────────────────────────────────────────────────────
+
+beforeEach(() => {
+  localStorage.clear();
+  act(() => {
+    // Reset to a single seat at Medium with cEDH mode off so each test starts
+    // from a known state.
+    usePreferencesStore.getState().ensureAiSeatCount(1);
+    usePreferencesStore.getState().setAiSeatDifficulty(0, "Medium");
+    usePreferencesStore.getState().setCedhMode(false);
+    usePreferencesStore.setState({
+      lastFormat: null,
+      lastPlayerCount: 2,
+      lastMatchType: "Bo1",
+      lastLoopDetection: { type: "Off" },
+    });
+  });
+});
+
+afterEach(cleanup);
+
+describe("GameSetupPage — cEDH bracket warning chip", () => {
+  it("offers implemented multiplayer variants in the format picker", async () => {
+    const user = userEvent.setup();
+    renderGameSetupPage();
+
+    await user.click(await screen.findByRole("button", { name: /Commander/i }));
+
+    expect(screen.getByText("Two-Headed Giant")).toBeInTheDocument();
+    expect(screen.getByText("Planechase")).toBeInTheDocument();
+    expect(screen.getByText("Archenemy")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Free-for-All/i })).toBeInTheDocument();
+  });
+
+  it("restores the format chip after a pointer-style open does not move focus", async () => {
+    renderGameSetupPage();
+    const trigger = await screen.findByRole("button", { name: /Commander/i });
+
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.click(trigger);
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(dialog).toHaveFocus());
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(trigger).toHaveFocus();
+  });
+
+  it("accepts a Two-Headed Giant URL format on the setup page", async () => {
+    renderGameSetupPage("/game-setup?format=TwoHeadedGiant");
+
+    expect(await screen.findByText("Two-Headed Giant")).toBeInTheDocument();
+  });
+
+  it("accepts Planechase on the setup page and explains the AI limitation", async () => {
+    renderGameSetupPage("/game-setup?format=Planechase");
+
+    expect(await screen.findByText("Planechase")).toBeInTheDocument();
+    expect(screen.getByText(/AI matches are not supported/i)).toBeInTheDocument();
+  });
+
+  it("accepts Planechase Commander on the setup page and explains the AI limitation", async () => {
+    renderGameSetupPage("/game-setup?format=PlanechaseCommander");
+
+    expect(await screen.findByText("Planechase Commander")).toBeInTheDocument();
+    expect(screen.getByText(/AI matches are not supported/i)).toBeInTheDocument();
+  });
+
+  it("restores a Two-Headed Giant setup preference", async () => {
+    act(() => {
+      usePreferencesStore.setState({
+        lastFormat: "TwoHeadedGiant",
+        lastPlayerCount: 4,
+        lastMatchType: "Bo3",
+      });
+    });
+
+    renderGameSetupPage();
+
+    expect(await screen.findByText("Two-Headed Giant")).toBeInTheDocument();
+  });
+
+  it("shows the warning chip when the human deck is non-cEDH and cEDH mode is on", async () => {
+    // Deck with bracket 2 (Core) — not cEDH-legal.
+    seedDeck("My Deck", 2);
+    setActiveDeck("My Deck");
+
+    act(() => {
+      usePreferencesStore.getState().setCedhMode(true);
+    });
+
+    renderGameSetupPage();
+
+    await waitFor(() => {
+      const alert = screen.getByRole("alert");
+      expect(alert).toBeInTheDocument();
+      expect(alert).toHaveTextContent(/Your deck is bracket/i);
+      expect(alert).toHaveTextContent(/vs\. a cEDH AI/i);
+    });
+  });
+
+  it("does not show the warning chip when the human deck is cEDH-legal (bracket 5)", async () => {
+    // Deck with bracket 5 — cEDH-legal.
+    seedDeck("cEDH Deck", 5);
+    setActiveDeck("cEDH Deck");
+
+    act(() => {
+      usePreferencesStore.getState().setCedhMode(true);
+    });
+
+    renderGameSetupPage();
+
+    // The deck name appearing is the signal that the deck finished loading.
+    expect(await screen.findByText("cEDH Deck")).toBeInTheDocument();
+
+    // Warning must not be present.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("does not show the warning chip when cEDH mode is off", async () => {
+    // Deck with bracket 2 — would trigger the warning if cEDH mode were on.
+    seedDeck("Casual Deck", 2);
+    setActiveDeck("Casual Deck");
+
+    // cEDH mode is off (reset in beforeEach); per-seat difficulty is irrelevant.
+    act(() => {
+      usePreferencesStore.getState().setCedhMode(false);
+    });
+
+    renderGameSetupPage();
+
+    expect(await screen.findByText("Casual Deck")).toBeInTheDocument();
+
+    // No warning chip.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+  describe("best-of-three ceiling", () => {
+    async function startMatchAndReadSearch(): Promise<string> {
+      const user = userEvent.setup();
+      await user.click(await screen.findByRole("button", { name: /^Start Match/ }));
+      return (await screen.findByTestId("game-route")).textContent ?? "";
+    }
+
+    it("G1: Dandan disables Bo3, navigates match=bo1, and keeps the remembered Bo3", async () => {
+      act(() => {
+        usePreferencesStore.setState({ lastFormat: "Dandan", lastPlayerCount: 2, lastMatchType: "Bo3" });
+      });
+      renderGameSetupPage();
+
+      await waitFor(() => expect(screen.getByRole("button", { name: "BO1" })).toHaveClass("bg-indigo-600"));
+      expect(screen.getByRole("button", { name: "BO3" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "BO3" })).not.toHaveClass("bg-indigo-600");
+
+      const search = await startMatchAndReadSearch();
+      expect(search).toContain("format=Dandan");
+      expect(search).toContain("match=bo1");
+      expect(usePreferencesStore.getState().lastMatchType).toBe("Bo3");
+    });
+
+    it("G2: a format whose ceiling admits Bo3 leaves it enabled and navigates match=bo3", async () => {
+      act(() => {
+        usePreferencesStore.setState({ lastFormat: "Momir", lastPlayerCount: 2, lastMatchType: "Bo3" });
+      });
+      renderGameSetupPage();
+
+      await waitFor(() => expect(screen.getByRole("button", { name: "BO3" })).toBeEnabled());
+      expect(screen.getByRole("button", { name: "BO3" })).toHaveClass("bg-indigo-600");
+
+      const search = await startMatchAndReadSearch();
+      expect(search).toContain("format=Momir");
+      expect(search).toContain("match=bo3");
+    });
+  });
+
+  describe("combo detector preference", () => {
+    async function comboDetectorSegments() {
+      const label = (await screen.findByText("Combo Detector (experimental)")).closest("label");
+      if (!label) throw new Error("the combo detector segments sit inside a label");
+      return {
+        off: within(label).getByText("Off", { selector: "button" }),
+        interactive: within(label).getByText("Interactive", { selector: "button" }),
+      };
+    }
+
+    it("seeds from the remembered choice and carries it into the game URL", async () => {
+      act(() => {
+        usePreferencesStore.setState({
+          lastFormat: "Momir",
+          lastPlayerCount: 2,
+          lastLoopDetection: { type: "Interactive" },
+        });
+      });
+      renderGameSetupPage();
+
+      const { off, interactive } = await comboDetectorSegments();
+      expect(interactive).toHaveClass("bg-indigo-600");
+      expect(off).not.toHaveClass("bg-indigo-600");
+
+      const user = userEvent.setup();
+      await user.click(await screen.findByRole("button", { name: /^Start Match/ }));
+      expect((await screen.findByTestId("game-route")).textContent ?? "").toContain("loop=interactive");
+    });
+
+    it("persists each toggle, the last one written winning", async () => {
+      renderGameSetupPage();
+      const user = userEvent.setup();
+
+      await user.click((await comboDetectorSegments()).interactive);
+      expect(usePreferencesStore.getState().lastLoopDetection).toEqual({ type: "Interactive" });
+
+      await user.click((await comboDetectorSegments()).off);
+      expect(usePreferencesStore.getState().lastLoopDetection).toEqual({ type: "Off" });
+    });
+  });
+
+  describe("host-supplied pile", () => {
+    async function start(): Promise<string> {
+      const user = userEvent.setup();
+      await user.click(await screen.findByRole("button", { name: /^Start Match/ }));
+      return (await screen.findByTestId("game-route")).textContent ?? "";
+    }
+
+    async function pickFormat(label: string) {
+      const user = userEvent.setup();
+      await user.click(screen.getByRole("button", { name: /Format/i, expanded: false }));
+      await user.click(await screen.findByRole("button", { name: new RegExp(`^${label}`) }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    }
+
+    beforeEach(() => {
+      compat.evaluateDeckCompatibility.mockReset();
+      seedDeck("Pile A");
+    });
+
+    it("the default pile starts Dandan with no saved deck and no pile on the URL", async () => {
+      localStorage.removeItem(STORAGE_KEY_PREFIX + "Pile A");
+      renderGameSetupPage("/game-setup?format=Dandan");
+      expect(await screen.findByRole("combobox", { name: "Pile" })).toHaveValue("");
+      expect(screen.getByRole("button", { name: /^Start Match/ })).toBeEnabled();
+      const search = await start();
+      expect(search).toContain("format=Dandan");
+      expect(search).not.toContain("pile=");
+    });
+
+    it("a named pile the engine refuses blocks Start", async () => {
+      compat.evaluateDeckCompatibility.mockResolvedValue({
+        selected_format_compatible: false,
+        selected_format_reasons: ["Dandân deck must have exactly 80 cards (found 100)"],
+      });
+      renderGameSetupPage("/game-setup?format=Dandan");
+      await userEvent.setup().selectOptions(await screen.findByRole("combobox", { name: "Pile" }), "Pile A");
+      expect(await screen.findByText(/exactly 80 cards/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^Start Match/ })).toBeDisabled();
+    });
+
+    it("a named pile the engine accepts rides the URL", async () => {
+      compat.evaluateDeckCompatibility.mockResolvedValue({ selected_format_compatible: true, selected_format_reasons: [] });
+      renderGameSetupPage("/game-setup?format=Dandan");
+      await userEvent.setup().selectOptions(await screen.findByRole("combobox", { name: "Pile" }), "Pile A");
+      await waitFor(() => expect(screen.getByRole("button", { name: /^Start Match/ })).toBeEnabled());
+      expect(await start()).toContain("pile=Pile%20A");
+    });
+
+    it("changing format drops a named pile", async () => {
+      compat.evaluateDeckCompatibility.mockResolvedValue({ selected_format_compatible: true, selected_format_reasons: [] });
+      renderGameSetupPage("/game-setup?format=Dandan");
+      await userEvent.setup().selectOptions(await screen.findByRole("combobox", { name: "Pile" }), "Pile A");
+      await waitFor(() => expect(screen.getByRole("combobox", { name: "Pile" })).toHaveValue("Pile A"));
+      await pickFormat("Momir");
+      await pickFormat("Dand");
+      expect(await screen.findByRole("combobox", { name: "Pile" })).toHaveValue("");
+      expect(await start()).not.toContain("pile=");
+    });
+
+    it("Momir offers no pile and starts without one", async () => {
+      renderGameSetupPage("/game-setup?format=Momir");
+      await waitFor(() => expect(deckSupplyForFormat).toHaveBeenCalledWith("Momir"));
+      await act(async () => {});
+      expect(screen.queryByRole("combobox", { name: "Pile" })).toBeNull();
+      const search = await start();
+      expect(search).toContain("format=Momir");
+      expect(search).not.toContain("pile=");
+    });
+
+    it("Standard offers no pile", async () => {
+      setActiveDeck("Pile A");
+      renderGameSetupPage("/game-setup?format=Standard");
+      await waitFor(() => expect(deckSupplyForFormat).toHaveBeenCalledWith("Standard"));
+      await act(async () => {});
+      expect(screen.queryByRole("combobox", { name: "Pile" })).toBeNull();
+    });
+  });
+
+  describe("horde co-horde seat floor", () => {
+    async function start(): Promise<string> {
+      const user = userEvent.setup();
+      const startButton = await screen.findByRole("button", { name: /^Start Match/ });
+      await waitFor(() => expect(startButton).toBeEnabled());
+      await user.click(startButton);
+      return (await screen.findByTestId("game-route")).textContent ?? "";
+    }
+
+    function playerSlider(): HTMLInputElement {
+      return screen.getByRole("slider", { name: /players/i }) as HTMLInputElement;
+    }
+
+    beforeEach(() => {
+      seedDeck("Survivor");
+      setActiveDeck("Survivor");
+      act(() => {
+        usePreferencesStore.setState({ hordeChallengeDeck: "CybermanHorde" });
+      });
+    });
+
+    it("selecting Two Towers bumps the count to 3 and Start carries players=3", async () => {
+      renderGameSetupPage("/game-setup?format=Horde");
+      const twoTowers = await screen.findByRole("radio", { name: /LOTR: The Two Towers Horde/ });
+      expect(playerSlider().value).toBe("2");
+
+      await userEvent.setup().click(twoTowers);
+      await waitFor(() => expect(playerSlider().value).toBe("3"));
+      expect(playerSlider().min).toBe("3");
+
+      const search = await start();
+      expect(search).toContain("players=3");
+      expect(search).toContain("hordeDeck=LotrTwoTowersHorde");
+    });
+
+    it("entering Horde with a stored Two Towers pick starts at 3, not the stale 2", async () => {
+      act(() => {
+        usePreferencesStore.setState({ hordeChallengeDeck: "LotrTwoTowersHorde" });
+      });
+      renderGameSetupPage("/game-setup?format=Horde");
+      await screen.findByRole("radio", { name: /LOTR: The Two Towers Horde/ });
+      expect(playerSlider().value).toBe("3");
+    });
+
+    it("restoring a Horde session with a stored Two Towers pick bumps the stale count", async () => {
+      act(() => {
+        usePreferencesStore.setState({
+          lastFormat: "Horde",
+          lastPlayerCount: 2,
+          lastMatchType: "Bo1",
+          hordeChallengeDeck: "LotrTwoTowersHorde",
+        });
+      });
+      renderGameSetupPage();
+      await screen.findByRole("radio", { name: /LOTR: The Two Towers Horde/ });
+      expect(playerSlider().value).toBe("3");
+    });
+  });
+});

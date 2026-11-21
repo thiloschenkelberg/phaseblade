@@ -1,0 +1,103 @@
+import type { FormatConfig, MatchType, PlayerId } from "../adapter/types";
+import { notifyActiveGameChange } from "./activeGameChange";
+import { sameFullSessionKey } from "./fullSessionKey";
+
+export const WS_SESSION_STORAGE_KEY = "phase-ws-session";
+export const WS_SESSION_TTL_MS = 2 * 60 * 60 * 1000;
+
+export interface WsHostSessionData {
+  formatConfig: FormatConfig;
+  timerSeconds: number | null;
+  matchType: MatchType;
+}
+
+/** Exact server-issued identity for a resumable Full session. */
+export interface FullSessionKey {
+  game_code: string;
+  generation: number;
+}
+
+export interface WsSessionData {
+  gameCode: string;
+  playerId?: PlayerId;
+  playerToken: string;
+  fullKey: FullSessionKey;
+  serverUrl: string;
+  timestamp: number;
+  /** Pending terminal ACK routing must outlive playable reconnect expiry. */
+  terminalOnly?: true;
+  hostSession?: WsHostSessionData;
+  hostIsPublic?: boolean;
+}
+
+export function isWsSessionValid(session: WsSessionData): boolean {
+  return session.terminalOnly === true
+    || Date.now() - (session.timestamp ?? 0) < WS_SESSION_TTL_MS;
+}
+
+// The latest session the store refused; null once a write lands.
+let pageSession: WsSessionData | null = null;
+
+export function loadWsSession(): WsSessionData | null {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(WS_SESSION_STORAGE_KEY);
+  } catch {
+    // Kept out of the parse `try`, whose catch would drop the page copy.
+  }
+  try {
+    const session = pageSession ?? (raw ? (JSON.parse(raw) as WsSessionData) : null);
+    if (!session) return null;
+    if (
+      !isWsSessionValid(session)
+      || !session.fullKey
+      || session.fullKey.game_code !== session.gameCode
+      || !Number.isInteger(session.fullKey.generation)
+      || session.fullKey.generation < 1
+    ) {
+      clearWsSession();
+      return null;
+    }
+    return session;
+  } catch {
+    clearWsSession();
+    return null;
+  }
+}
+
+export type WsSessionIdentity = Pick<WsSessionData, "fullKey" | "serverUrl" | "playerToken">;
+
+export function matchesStoredWsSession(expected: WsSessionIdentity): boolean {
+  const current = loadWsSession();
+  return current !== null
+    && current.serverUrl === expected.serverUrl
+    && sameFullSessionKey(current.fullKey, expected.fullKey)
+    && current.playerToken === expected.playerToken;
+}
+
+// The online session decides what the resume list offers for an online game
+// (resume, retained result, or nothing), so every landed write notifies it.
+export function saveWsSession(session: WsSessionData, expected?: WsSessionIdentity): void {
+  if (expected && !matchesStoredWsSession(expected)) return;
+  try {
+    localStorage.setItem(WS_SESSION_STORAGE_KEY, JSON.stringify(session));
+    pageSession = null;
+  } catch {
+    // A blocked/quota-limited store keeps the session for this page only.
+    pageSession = session;
+  }
+  notifyActiveGameChange();
+}
+
+export function clearWsSession(expected?: WsSessionIdentity): void {
+  if (expected && !matchesStoredWsSession(expected)) return;
+  let held = pageSession !== null;
+  pageSession = null;
+  try {
+    held ||= localStorage.getItem(WS_SESSION_STORAGE_KEY) !== null;
+    localStorage.removeItem(WS_SESSION_STORAGE_KEY);
+  } catch {
+    // Nothing else can be done if the browser refuses storage access.
+  }
+  if (held) notifyActiveGameChange();
+}

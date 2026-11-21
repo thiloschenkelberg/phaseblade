@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/scryfall-fetch.sh"
+
+DATA_DIR="data/scryfall"
+CARDS_FILE="${SCRYFALL_DEFAULT_CARDS_FILE:-$DATA_DIR/default-cards.json}"
+OUTPUT="${SCRYFALL_PRINTINGS_OUTPUT:-client/public/scryfall-printings.json}"
+
+CATALOG="$SCRIPT_DIR/../crates/engine/data/basic-land-art-v1.json"
+VALIDATOR="$SCRIPT_DIR/validate-basic-land-art.sh"
+
+echo "=== Scryfall Printings Generation ==="
+
+if [ -f "$OUTPUT" ]; then
+  "$VALIDATOR" renderer "$CATALOG" "$OUTPUT"
+  echo "Skipping generation — $OUTPUT already exists (delete to regenerate)."
+  exit 0
+fi
+
+if [ ! -f "$CARDS_FILE" ]; then
+  echo "Downloading Scryfall default-cards bulk data..."
+  mkdir -p "$DATA_DIR"
+  scryfall_fetch_bulk default_cards "$CARDS_FILE"
+  echo "Downloaded $CARDS_FILE."
+fi
+
+echo "Generating $OUTPUT..."
+mkdir -p "$(dirname "$OUTPUT")"
+candidate=$(mktemp "${OUTPUT}.XXXXXX")
+trap 'rm -f -- "$candidate"' EXIT
+
+# Build a printings index keyed by oracle_id.
+#
+# Only cards with multiple printing rows are included. Each oracle_id maps
+# to an array of PrintingEntry objects
+# sorted by released_at descending (newest first).
+#
+# Face images: a face's own image_uris wins (DFCs), otherwise the card's
+# top-level image_uris (split, adventure, flip and other one-image layouts,
+# whose card_faces carry no image_uris), as in gen-scryfall-images.sh.
+#
+# Reversible cards omit root-level `oracle_id`; group by
+# `card_faces[0].oracle_id` instead (issue #2031).
+#
+# Non-playable layouts (token, emblem, art_series, etc.) are excluded.
+NON_PLAYABLE='["token","double_faced_token","emblem","art_series","vanguard","scheme","planar","augment","host"]'
+
+jq -c --argjson exclude "$NON_PLAYABLE" '
+  [.[] | . as $card |
+    (.oracle_id // .card_faces[0].oracle_id) as $oracle_id |
+    select($oracle_id != null) |
+    select(.layout as $l | $exclude | index($l) | not) |
+    select(.set != "plst") |
+    {
+      oracle_id: $oracle_id,
+      entry: {
+        id: .id,
+        set: .set,
+        set_name: .set_name,
+        collector_number: .collector_number,
+        released_at: .released_at,
+        border_color: .border_color,
+        frame_effects: (.frame_effects // []),
+        full_art: (.full_art // false),
+        faces: (if .card_faces then
+          [.card_faces[] | {
+            normal: (.image_uris.normal // $card.image_uris.normal),
+            art_crop: (.image_uris.art_crop // $card.image_uris.art_crop)
+          }]
+        else
+          [{normal: .image_uris.normal, art_crop: .image_uris.art_crop}]
+        end)
+      }
+    }
+  ] |
+  group_by(.oracle_id) |
+  [.[] | select(length > 1)] |
+  map({
+    key: .[0].oracle_id,
+    value: ([.[].entry] | sort_by(.released_at) | reverse)
+  }) |
+  from_entries
+' "$CARDS_FILE" > "$candidate"
+
+"$VALIDATOR" renderer "$CATALOG" "$candidate"
+chmod a+r "$candidate"
+mv -f -- "$candidate" "$OUTPUT"
+
+ENTRY_COUNT=$(jq 'length' "$OUTPUT")
+FILE_SIZE=$(du -h "$OUTPUT" | cut -f1)
+echo "Generated $OUTPUT ($FILE_SIZE, $ENTRY_COUNT oracle_ids with multiple artworks)"

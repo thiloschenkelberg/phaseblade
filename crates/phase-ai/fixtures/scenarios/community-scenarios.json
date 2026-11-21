@@ -1,0 +1,26 @@
+[
+  {
+    "id": "saheeli-copy-sacrifice",
+    "thread_id": "1512071639427186889",
+    "archive": "saheeli-copy-sacrifice.zip",
+    "expected_action_type": "PassPriority"
+  },
+  {
+    "id": "saheeli-legend-loop",
+    "thread_id": "1511770871323295934",
+    "archive": "saheeli-legend-loop.zip",
+    "expected_action_type": "PlayLand"
+  },
+  {
+    "id": "helix-pinnacle-x-spam",
+    "thread_id": "1510834912180047973",
+    "archive": "helix-pinnacle-x-spam.zip",
+    "expected_action_type": "ActivateAbility"
+  },
+  {
+    "id": "priority-failed-proposals",
+    "thread_id": "1535520247610871899",
+    "archive": "game-state-turn-22-2026-08-08T05-28-08-309Z.zip",
+    "expected_action_type": "PassPriority"
+  }
+]

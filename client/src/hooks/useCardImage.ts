@@ -1,0 +1,366 @@
+import { useEffect, useRef, useState } from "react";
+
+import type { CardPrinting, PrintedRef } from "../adapter/types.ts";
+import { matchSourcePrinting } from "../services/artSelection.ts";
+import { automaticArtCatalogVersion } from "../services/cardImageLookup.ts";
+import { createOwnerArtCatalogReader, deriveImageUrl, imageUrlSize } from "../services/scryfall.ts";
+import type { ImageSize, OwnerArtCatalogReader, OwnerArtAuthority } from "../services/scryfall.ts";
+import { cardCandidateGroups } from "../services/visualPacks/candidateKeys.ts";
+import { VisualPackRepository } from "../services/visualPacks/repository.ts";
+import type { VisualCandidateGroup } from "../services/visualPacks/repository.ts";
+import type { CardImageSource, ImageRungs } from "../services/visualPacks/types.ts";
+import { getEffectiveOffline, useEffectiveOffline } from "../stores/connectivityStore.ts";
+import { usePreferencesStore } from "../stores/preferencesStore.ts";
+import { nextImageSourceIndex } from "./imageSourceLadder.ts";
+import {
+  BoundedCache,
+  holdFailedCardArt,
+  useCardArtReload,
+  useCardImage as useLegacyCardImage,
+} from "./useLegacyCardImage.ts";
+
+export { BoundedCache, useCardBackImage, useLocaleArt } from "./useLegacyCardImage.ts";
+export type { SourcePrinting, UseCardBackImageResult } from "./useLegacyCardImage.ts";
+
+type LegacyOptions = NonNullable<Parameters<typeof useLegacyCardImage>[1]>;
+type ImageResult = ReturnType<typeof useLegacyCardImage>;
+/** What `useCardImage` returns: the registry's oracle id stays internal. */
+type CardImageResult = Omit<ImageResult, "failedArtOracleId">;
+
+type UseCardImageOptions = LegacyOptions & {
+  ownerPrinting?: CardPrinting | null;
+  /** Object-owned Oracle and face; never changes the legacy lookup request. */
+  ownerPrintedRef?: PrintedRef | null;
+  showOwnerPrintings?: boolean;
+};
+
+interface OwnerInput {
+  key: string;
+  cardName: string;
+  oracleId?: string;
+  faceName?: string;
+  faceIndex: number;
+  setCode: string;
+  collectorNumber: string;
+  size: ImageSize;
+  language: string;
+  offline: boolean;
+}
+
+interface OwnerPresentation {
+  key: string;
+  sources: CardImageSource[];
+  index: number;
+  failed: Set<string>;
+  remoteDone: boolean;
+  settled: boolean;
+  isRotated: boolean;
+  isFlip: boolean;
+}
+
+type OwnerOverlay = { image: ImageResult; failedSources: ReadonlySet<string> };
+
+// These instances never alias the normal hook's caches or repository.
+const ownerPresentations = new BoundedCache<string, OwnerPresentation>(256);
+let ownerRepository: VisualPackRepository | undefined;
+
+function ownerExactGroups(id: string, faceIndex: number, language: string, size: ImageSize): VisualCandidateGroup[] {
+  const build = (rung: ImageSize) => cardCandidateGroups({
+    englishPrintingId: id,
+    language: language === "en" ? undefined : language,
+    faceIndex,
+    variant: size === "art_crop" ? "art_crop" : "full_card",
+    rung,
+  });
+  const requested = build(size);
+  const small = size === "art_crop" ? [] : build("small");
+  const normal = size === "art_crop" ? [] : build("normal");
+  return requested.map((group, index) => ({
+    requested: group.keys,
+    ...(size === "art_crop" ? {} : { small: small[index]?.keys, normal: normal[index]?.keys }),
+  }));
+}
+
+function admittedPrinting(authority: OwnerArtAuthority, input: OwnerInput) {
+  return authority.oracleId && authority.printings
+    ? matchSourcePrinting(authority.printings, input)
+    : null;
+}
+
+function presentationResult(
+  presentation: OwnerPresentation,
+  advanceFailedSource: (src: string) => void,
+  reload: (() => void) | undefined,
+  failedArtOracleId: string | undefined,
+): ImageResult {
+  const source = presentation.sources[presentation.index] ?? null;
+  return {
+    src: source?.src ?? null,
+    source,
+    rungs: source?.kind === "fallback" ? undefined : source?.rungs,
+    isLoading: source?.kind === "fallback" && !presentation.remoteDone,
+    isRotated: presentation.isRotated,
+    isFlip: presentation.isFlip,
+    advanceFailedSource,
+    reload,
+    failedArtOracleId,
+  };
+}
+
+/**
+ * Revalidate generation/admission immediately before each overlay-initiated repository API call. A repository call initiated while admitted may finish its internal initialization, subscription, resolution and revision retry after admission is lost; those operations are not cancellable through the existing API. The overlay must start no further calls and must discard stale results before presentation, caching or publication.
+ */
+function useOwnerCardImageOverlay(input: OwnerInput | null, reload: (() => void) | undefined): OwnerOverlay | null {
+  const readerRef = useRef<OwnerArtCatalogReader | null>(null);
+  const latest = useRef(input);
+  latest.current = input;
+  const [presentation, setPresentation] = useState<OwnerPresentation | null>(null);
+  const advanceRef = useRef<(key: string, src: string) => void>(() => {});
+  const inputKey = input?.key ?? "";
+
+  // Read current authority on every eligible render; no backend access before membership.
+  let currentKey = "";
+  let warm: OwnerPresentation | undefined;
+  if (input) {
+    readerRef.current ??= createOwnerArtCatalogReader(() => latest.current !== null && !getEffectiveOffline());
+    const authority = readerRef.current.read(input);
+    const printing = admittedPrinting(authority, input);
+    if (printing) {
+      const revision = ownerRepository?.currentRevision() ?? "0";
+      currentKey = JSON.stringify([input.key, authority.key, printing.id, revision]);
+      const cached = ownerPresentations.get(currentKey);
+      if (cached?.settled) warm = cached;
+    }
+  }
+
+  useEffect(() => {
+    if (!inputKey) return;
+    const reader = readerRef.current!;
+    let disposed = false;
+    let generation = 0;
+    let sessionKey = "";
+    let unlistenRepository: (() => void) | undefined;
+    let selected = false;
+
+    const reconcile = () => {
+      const activeInput = latest.current;
+      if (disposed || !activeInput || activeInput.key !== inputKey) return;
+      const authority = reader.read(activeInput);
+      const printing = admittedPrinting(authority, activeInput);
+      if (!printing) {
+        if (sessionKey) reader.release();
+        generation += 1;
+        sessionKey = "";
+        unlistenRepository?.();
+        unlistenRepository = undefined;
+        advanceRef.current = () => {};
+        if (selected) {
+          selected = false;
+          setPresentation(null);
+        }
+        return;
+      }
+      const admitted = () => {
+        const current = latest.current;
+        if (disposed || !current || current.key !== inputKey) return false;
+        const snapshot = reader.read(current);
+        return snapshot.key === authority.key && admittedPrinting(snapshot, current)?.id === printing.id;
+      };
+      if (!admitted()) return;
+      ownerRepository ??= new VisualPackRepository();
+      const repository = ownerRepository;
+      if (!admitted()) return;
+      const key = JSON.stringify([activeInput.key, authority.key, printing.id, repository.currentRevision()]);
+      if (sessionKey === key) return;
+      sessionKey = key;
+      const captured = ++generation;
+      unlistenRepository?.();
+      unlistenRepository = undefined;
+      const current = () => captured === generation && admitted();
+      if (!current()) return;
+      unlistenRepository = repository.subscribe(reconcile);
+      const cached = ownerPresentations.get(key);
+      let state: OwnerPresentation = cached ? {
+        ...cached, failed: new Set(cached.failed),
+      } : {
+        key, sources: [], index: 0, failed: new Set(), remoteDone: activeInput.offline, settled: false,
+        isRotated: authority.isRotated, isFlip: authority.isFlip,
+      };
+      let remoteStarted = false;
+      const publish = (settled: boolean) => {
+        if (!current()) return;
+        state = { ...state, settled };
+        ownerPresentations.set(key, { ...state, failed: new Set(state.failed) });
+        selected = true;
+        setPresentation(state);
+      };
+      const groups = ownerExactGroups(printing.id, authority.faceIndex, activeInput.language, activeInput.size);
+      const continueRemote = async () => {
+        if (remoteStarted || state.remoteDone || !current()) return;
+        remoteStarted = true;
+        const src = reader.imageUrl(printing, authority.faceIndex, activeInput.size, activeInput.language);
+        let rungs: ImageRungs | undefined;
+        if (src && activeInput.size !== "art_crop" && imageUrlSize(src) !== null) {
+          rungs = { small: deriveImageUrl(src, "small"), normal: deriveImageUrl(src, "normal") };
+        }
+        if (!current()) return;
+        const result = await repository.resolve({
+          groups, rung: activeInput.size, allowRemote: true, remote: src ? { src, rungs } : null,
+        });
+        if (!current()) return;
+        state.sources = result.sources.filter((source) => !source.src || !state.failed.has(source.src));
+        state.index = 0;
+        state.remoteDone = true;
+        publish(true);
+      };
+      advanceRef.current = (failedKey, failedSrc) => {
+        if (!current() || failedKey !== key) return;
+        const next = nextImageSourceIndex(state.sources, state.index, state.failed, failedSrc);
+        if (next === null) return;
+        state.index = next;
+        if (state.sources[next]?.kind === "fallback" && !state.remoteDone) {
+          publish(false);
+          void continueRemote();
+        } else {
+          publish(true);
+        }
+      };
+      if (cached) {
+        publish(cached.settled);
+        if (!cached.settled) void continueRemote();
+      } else {
+        if (selected) {
+          selected = false;
+          setPresentation(null);
+        }
+        void (async () => {
+          if (!current()) return;
+          const result = await repository.resolve({ groups, rung: activeInput.size, allowRemote: false });
+          if (!current()) return;
+          state.sources = result.sources;
+          state.index = 0;
+          if (state.sources[0]?.kind === "installed" || activeInput.offline) {
+            publish(true);
+          } else {
+            await continueRemote();
+          }
+        })();
+      }
+      // Locale preparation is isolated too, and starts only after membership.
+      if (current()) void reader.prepareLocale(activeInput.language, activeInput.offline);
+    };
+
+    const unlistenReadiness = reader.subscribe(reconcile);
+    reconcile();
+    const activeInput = latest.current;
+    if (activeInput) void reader.prepare(activeInput);
+    return () => {
+      disposed = true;
+      generation += 1;
+      unlistenReadiness();
+      reader.release();
+      unlistenRepository?.();
+      advanceRef.current = () => {};
+    };
+  }, [inputKey]);
+
+  const selected = presentation?.key === currentKey ? presentation : warm;
+  if (!selected || !input) return null;
+  // An admitted printing's image URL is built from catalog data already in
+  // memory, so a ladder that ends with no art and no failed source has no image
+  // to load: terminal, and a reload could only land there again. Only a failed
+  // source makes owner art failed art, online or offline.
+  const recordedFailure = selected.failed.size > 0;
+  const showsFailedArt = recordedFailure && selected.remoteDone && !selected.sources[selected.index]?.src;
+  return {
+    image: presentationResult(
+      selected,
+      (src) => advanceRef.current(selected.key, src),
+      recordedFailure ? reload : undefined,
+      showsFailedArt ? input.oracleId : undefined,
+    ),
+    failedSources: selected.failed,
+  };
+}
+
+/**
+ * Normal rendering runs unchanged, including while owner art is pending or displayed.
+ * A usable exact image takes precedence. When automatic exact art is pending or
+ * exhausted, the normal result stays visible. Admitted owner art retains its exact
+ * overlay through exhaustion. Admission uses the carrier's identity
+ * (`ownerPrintedRef`, or the caller's `oracleId`).
+ */
+export function useCardImage(cardName: string, options?: UseCardImageOptions): CardImageResult {
+  let legacyOptions: Parameters<typeof useLegacyCardImage>[1] = options;
+  if (options && ("ownerPrinting" in options || "ownerPrintedRef" in options || "showOwnerPrintings" in options)) {
+    const { ownerPrinting: _owner, ownerPrintedRef: _ref, showOwnerPrintings: _show, ...ordinary } = options;
+    legacyOptions = ordinary;
+  }
+  const normal = useLegacyCardImage(cardName, legacyOptions);
+  const owner = options?.ownerPrinting;
+  const catalogVersion = automaticArtCatalogVersion(owner);
+  const eligible = typeof owner?.set_code === "string" && owner.set_code.length > 0
+    && typeof owner.collector_number === "string" && owner.collector_number.length > 0;
+  const enabled = usePreferencesStore((state) =>
+    eligible ? options?.showOwnerPrintings ?? state.showOwnerPrintings : false);
+  const offline = useEffectiveOffline();
+  const language = usePreferencesStore((state) => eligible && enabled ? state.language : "en");
+  const oracleId = options?.ownerPrintedRef?.oracle_id ?? options?.oracleId;
+  // The owner art's cache keeps its own failed sources, so its key carries the
+  // card's reload count: a reload of this card, from any surface, starts a fresh
+  // owner session instead of replaying the cached failure.
+  const ownerArt = useCardArtReload(eligible && enabled ? oracleId ?? "" : "");
+  let input: OwnerInput | null = null;
+  if (eligible && enabled && oracleId) {
+    const setCode = owner.set_code.toLowerCase();
+    const collectorNumber = owner.collector_number;
+    const faceName = options?.ownerPrintedRef?.face_name ?? options?.faceName;
+    const faceIndex = options?.faceIndex ?? 0;
+    const size = options?.size ?? "normal";
+    input = {
+      key: JSON.stringify([
+        cardName,
+        oracleId,
+        faceName,
+        faceIndex,
+        setCode,
+        collectorNumber,
+        catalogVersion,
+        size,
+        language,
+        offline,
+        ownerArt.count,
+      ]),
+      cardName, oracleId, faceName,
+      faceIndex, setCode, collectorNumber, size, language, offline,
+    };
+  }
+  const overlay = useOwnerCardImageOverlay(input, ownerArt.reload);
+  const failedOrdinarySrc = catalogVersion !== null && overlay
+    && !overlay.image.src && !overlay.image.isLoading
+    && normal.src && overlay.failedSources.has(normal.src)
+    ? normal.src
+    : null;
+  const advanceOrdinarySource = normal.advanceFailedSource;
+  useEffect(() => {
+    // A shared URL can stay on the same <img> across the handoff. The ordinary
+    // ladder records the failure even when the browser emits no further error.
+    if (failedOrdinarySrc) advanceOrdinarySource?.(failedOrdinarySrc);
+  }, [failedOrdinarySrc, advanceOrdinarySource]);
+
+  // Whether some surface of the card failed is the card's, read under the owner
+  // art's own oracle id, and another surface's failure is worth a reload too.
+  const result = overlay && (catalogVersion === null || overlay.image.src)
+    ? {
+        ...overlay.image,
+        cardArtFailed: ownerArt.failed,
+        reload: overlay.image.reload ?? (ownerArt.failed ? ownerArt.reload : undefined),
+      }
+    : normal;
+  // A surface counts toward `cardArtFailed` by what it shows: owner art that
+  // arrives over a failed default printing releases that failure. The oracle id
+  // only coordinates that count, so it stays out of the returned result.
+  const { failedArtOracleId, ...shown } = result;
+  useEffect(() => (failedArtOracleId ? holdFailedCardArt(failedArtOracleId) : undefined), [failedArtOracleId]);
+  return shown;
+}
