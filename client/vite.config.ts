@@ -1,6 +1,6 @@
 import { generateProtocolVersions, protocolGenerationPlugin } from "./protocol-generation";
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
@@ -30,6 +30,63 @@ function wasmEnvShim(): Plugin {
     },
     load(id) {
       if (id === VIRTUAL_ID) return "export default {};";
+    },
+  };
+}
+
+// Dev-only fallback when `src/wasm/engine_wasm.js` or `src/wasm/draft_wasm.js`
+// has not been built yet via `./scripts/build-wasm.sh`. Generates stub exports
+// from the checked-in `.d.ts` files so Vite can serve the UI and `/world`
+// 3D overworld immediately, while automatically using real WASM once built.
+function devWasmFallback(): Plugin {
+  const entries = [
+    {
+      specifier: "@wasm/engine",
+      js: path.resolve(__dirname, "src/wasm/engine_wasm.js"),
+      dts: path.resolve(__dirname, "src/wasm/engine_wasm.d.ts"),
+      virtualId: "\0dev-wasm-stub:engine",
+    },
+    {
+      specifier: "@wasm/draft",
+      js: path.resolve(__dirname, "src/wasm/draft_wasm.js"),
+      dts: path.resolve(__dirname, "src/wasm/draft_wasm.d.ts"),
+      virtualId: "\0dev-wasm-stub:draft",
+    },
+  ];
+  return {
+    name: "dev-wasm-fallback",
+    apply: "serve",
+    enforce: "pre",
+    resolveId(id) {
+      const entry = entries.find(
+        (e) => id === e.specifier || id === e.js.replace(/\.js$/, ""),
+      );
+      if (!entry || existsSync(entry.js)) return null;
+      return entry.virtualId;
+    },
+    load(id) {
+      const entry = entries.find((e) => id === e.virtualId);
+      if (!entry) return null;
+      const dts = existsSync(entry.dts) ? readFileSync(entry.dts, "utf-8") : "";
+      const fnNames = new Set<string>();
+      for (const m of dts.matchAll(/export function (\w+)/g)) {
+        if (m[1] !== "initSync") fnNames.add(m[1]);
+      }
+      const classNames = new Set<string>();
+      for (const m of dts.matchAll(/export class (\w+)/g)) {
+        classNames.add(m[1]);
+      }
+      const msg =
+        "WASM module not built yet. Run ./scripts/build-wasm.sh to enable MTG matches and drafts.";
+      return [
+        `export default async function init() { throw new Error(${JSON.stringify(msg)}); }`,
+        `export function initSync() { throw new Error(${JSON.stringify(msg)}); }`,
+        ...[...fnNames].map(
+          (name) =>
+            `export function ${name}() { throw new Error(${JSON.stringify(msg)}); }`,
+        ),
+        ...[...classNames].map((name) => `export class ${name} {}`),
+      ].join("\n");
     },
   };
 }
@@ -273,6 +330,7 @@ export default defineConfig(({ mode }) => {
   },
   plugins: [protocolGenerationPlugin(),
     wasmEnvShim(),
+    devWasmFallback(),
     externalEngineWasm(),
     trimManaFont(),
     offlineShellMarker(buildHash),
@@ -512,7 +570,7 @@ export default defineConfig(({ mode }) => {
   ],
   define: dataFileDefines(mode, buildHash),
   worker: {
-    plugins: () => [wasmEnvShim(), externalEngineWasm()],
+    plugins: () => [wasmEnvShim(), devWasmFallback(), externalEngineWasm()],
   },
   // Vite's host-check rejects requests with a Host header outside its
   // known list — required to allow the Caddy proxy at local.phase-rs.dev

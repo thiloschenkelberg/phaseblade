@@ -42,6 +42,7 @@ const ReplayPage = lazy(() => import("./pages/ReplayPage").then((m) => ({ defaul
 const OpenDesktopPage = lazy(() => import("./pages/OpenDesktopPage").then((m) => ({ default: m.OpenDesktopPage })));
 const TournamentLandingPage = lazy(() => import("./pages/TournamentLandingPage").then((m) => ({ default: m.TournamentLandingPage })));
 const TournamentPage = lazy(() => import("./pages/TournamentPage").then((m) => ({ default: m.TournamentPage })));
+const WorldPage = lazy(() => import("./pages/WorldPage").then((m) => ({ default: m.WorldPage })));
 
 function DevStrict({ children }: { children: ReactNode }) {
   if (!import.meta.env.DEV) return children;
@@ -147,6 +148,7 @@ function AppContent() {
             <Route path="/draft-pod" element={<DraftPodPage />} />
             <Route path="/draft-spectator" element={<DraftSpectatorPage />} />
           </Route>
+          <Route path="/world" element={<DevStrict><WorldPage /></DevStrict>} />
           <Route path="/game/:id" element={<GameRouteElement />} />
           <Route path="/replay" element={<ReplayPage />} />
           <Route path="/open-desktop" element={<OpenDesktopPage />} />

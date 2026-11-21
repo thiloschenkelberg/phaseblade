@@ -12,6 +12,7 @@ import { buildLegalAiDeckCatalog } from "../services/aiDeckCatalog";
 import { saveActiveGame, saveGame, useGameStore } from "../stores/gameStore";
 import { useCardDataStore } from "../stores/cardDataStore";
 import { usePreferencesStore } from "../stores/preferencesStore";
+import { STARTER_COMMANDERS, useRpgStore } from "../rpg/rpgStore";
 
 /**
  * Home route. The persistent app shell owns the scene + chrome; this page runs
@@ -25,6 +26,13 @@ export function MenuPage() {
   const cardStatus = useCardDataStore((s) => s.status);
   const lastFormat = usePreferencesStore((s) => s.lastFormat);
   const lastMatchType = usePreferencesStore((s) => s.lastMatchType);
+  const hasSave = useRpgStore((s) => s.hasSave);
+  const currentZone = useRpgStore((s) => s.currentZone);
+  const badges = useRpgStore((s) => s.badges);
+  const gold = useRpgStore((s) => s.gold);
+  const starterCommanderId = useRpgStore((s) => s.starterCommanderId);
+  const startNewAdventure = useRpgStore((s) => s.startNewAdventure);
+  const starter = STARTER_COMMANDERS.find((c) => c.id === starterCommanderId) ?? null;
   const deckPrewarmStarted = useRef(false);
   useAudioContext("menu");
 
@@ -63,6 +71,78 @@ export function MenuPage() {
   return (
     <div className="menu-scene relative flex min-h-screen flex-col overflow-hidden">
       <PreviewBadge />
+
+      <div className="mx-auto mt-6 w-full max-w-[1180px] px-7">
+        <div className="relative overflow-hidden rounded-2xl border border-amber-400/25 bg-[linear-gradient(135deg,rgba(15,23,42,0.92),rgba(30,41,59,0.85))] p-6 shadow-2xl">
+          <div className="flex flex-col justify-between gap-4 md:flex-row md:items-center">
+            <div>
+              <div className="text-[11px] font-bold uppercase tracking-[0.2em] text-amber-400">
+                3D Overworld RPG · MTG Duels
+              </div>
+              <h1 className="mt-1 font-display text-2xl font-bold tracking-tight text-white">
+                Phaseblade Adventure
+              </h1>
+              <p className="mt-1 max-w-2xl text-sm text-slate-300">
+                Start in Willowbrook Town, choose your starter Commander from the Professor, challenge Gym Leaders for badges, and duel across Magic formats.
+              </p>
+              {hasSave && (
+                <div className="mt-2.5 flex flex-wrap items-center gap-2 text-xs text-slate-300">
+                  <span className="rounded-md border border-emerald-400/30 bg-emerald-950/60 px-2 py-0.5 text-emerald-200">
+                    {currentZone}
+                  </span>
+                  <span className="rounded-md border border-sky-400/30 bg-sky-950/60 px-2 py-0.5 text-sky-200">
+                    {badges.length} / 8 Badges
+                  </span>
+                  <span className="rounded-md border border-amber-400/30 bg-amber-950/60 px-2 py-0.5 text-amber-200">
+                    {gold} G
+                  </span>
+                  {starter && (
+                    <span className="rounded-md border border-white/15 bg-white/5 px-2 py-0.5 text-slate-200">
+                      {starter.name}
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="flex shrink-0 flex-wrap items-center gap-2.5">
+              {hasSave ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => navigate("/world")}
+                    className="rounded-xl border border-amber-300/50 bg-amber-500 px-5 py-2.5 text-sm font-bold text-slate-950 shadow-lg transition-colors hover:bg-amber-400"
+                  >
+                    Continue Adventure
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      startNewAdventure();
+                      navigate("/world");
+                    }}
+                    className="rounded-xl border border-white/15 bg-slate-900/80 px-4 py-2.5 text-xs font-semibold text-slate-200 transition-colors hover:border-white/30 hover:bg-slate-800"
+                  >
+                    New Adventure
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => {
+                    startNewAdventure();
+                    navigate("/world");
+                  }}
+                  className="rounded-xl border border-amber-300/50 bg-amber-500 px-5 py-2.5 text-sm font-bold text-slate-950 shadow-lg transition-colors hover:bg-amber-400"
+                >
+                  Start Adventure
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
       <HomeDashboard />
 
       <div className="mx-auto flex w-full max-w-[1180px] flex-col items-center gap-4 px-7 pb-12">
