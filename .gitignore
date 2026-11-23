@@ -152,3 +152,6 @@ triage/dashboard.md
 # Changelog backfill drafts — review staging only, never committed. The
 # canonical changelog lives at client/public/changelog.json.
 scripts/changelog/backfill-drafts.json
+
+# Raw 2D concept art and source 3D assets (local only)
+assets-src/
